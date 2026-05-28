@@ -9,6 +9,9 @@ build/
 .pytest_cache/
 .ruff_cache/
 
+# Library — consumers resolve their own deps; we don't pin a lockfile.
+uv.lock
+
 # Environment
 .envrc
 .direnv/
