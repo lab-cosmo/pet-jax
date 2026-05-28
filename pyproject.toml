@@ -33,7 +33,7 @@ dependencies = [
     "flax>=0.8",
     "numpy>=1.26",
     "ase>=3.23",
-    "vesin>=0.3.2",
+    "vesin>=0.5",
     "marathon-train>=0.2.2",
 ]
 
