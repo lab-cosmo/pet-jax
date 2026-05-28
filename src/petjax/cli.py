@@ -29,17 +29,22 @@ from pathlib import Path
 
 HF_BASE = "https://huggingface.co/lab-cosmo/upet/resolve/main/models"
 
-PET_MAD_SHORTCUTS = {
-    "pet-mad-xs": f"{HF_BASE}/pet-mad-xs-v1.5.0.ckpt",
-    "pet-mad-s": f"{HF_BASE}/pet-mad-s-v1.5.0.ckpt",
-}
+DEFAULT_PET_MAD_VERSION = "1.5.0"
+PET_MAD_VARIANTS = ("pet-mad-xs", "pet-mad-s")
 
 
-def _resolve_source(source):
+def _pet_mad_url(variant, version):
+    """Hugging Face URL for a PET-MAD checkpoint at the given release version,
+    e.g. ``("pet-mad-xs", "1.5.0")`` → ``.../pet-mad-xs-v1.5.0.ckpt``."""
+    return f"{HF_BASE}/{variant}-v{version}.ckpt"
+
+
+def _resolve_source(source, pet_mad_version):
     """Map the user-supplied source to ``(kind, value)`` where ``kind`` is
-    ``"shortcut"``, ``"url"``, or ``"path"``."""
-    if source in PET_MAD_SHORTCUTS:
-        return "shortcut", PET_MAD_SHORTCUTS[source]
+    ``"shortcut"``, ``"url"``, or ``"path"``. ``pet_mad_version`` is consulted
+    only for shortcut sources."""
+    if source in PET_MAD_VARIANTS:
+        return "shortcut", _pet_mad_url(source, pet_mad_version)
     parsed = urllib.parse.urlparse(source)
     if parsed.scheme in ("http", "https"):
         return "url", source
@@ -85,9 +90,20 @@ def convert_main(argv=None):
         default=Path("checkpoints/.cache"),
         help="where to cache downloaded .ckpt files (ignored for local paths)",
     )
+    parser.add_argument(
+        "--version",
+        default=DEFAULT_PET_MAD_VERSION,
+        help=(
+            f"PET-MAD release version to fetch (default: {DEFAULT_PET_MAD_VERSION}). "
+            "Only applies to the pet-mad-xs / pet-mad-s shortcuts; ignored for URL "
+            "or local-path sources. The checkpoint format itself is validated "
+            "downstream in petjax.convert and will fail loudly on incompatible "
+            "releases."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    kind, value = _resolve_source(args.source)
+    kind, value = _resolve_source(args.source, args.version)
 
     if kind == "path":
         ckpt = value
