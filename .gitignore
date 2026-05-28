@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.tox/
+.pytest_cache/
+.ruff_cache/
+
+# Environment
+.envrc
+.direnv/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Runtime checkpoints at repo root (populated by `petjax-convert`); the leading
+# slash anchors this so it doesn't match tests/assets/checkpoints/.
+/checkpoints/
+
+# Local Claude Code overrides
+.claude/settings.local.json
+.claude/*.lock
+
+# Converted checkpoint artifacts (fetched on demand by `petjax-convert`).
+# Only the .xyz reference fixtures are checked in; the .msgpack is a build
+# artifact reproduced from the upstream metatrain .ckpt.
+tests/assets/checkpoints/pet-mad-xs/model.msgpack
+tests/assets/checkpoints/pet-mad-xs/metadata.yaml
+tests/assets/checkpoints/pet-mad-s/
+
+# Extended test assets (fetched/generated locally; CI uses test_mini only)
+tests/assets/test_s.xyz
+tests/assets/test_m.xyz
+tests/assets/test_l.xyz
+tests/assets/*.bak
+tests/assets/predictions/test_s_*.xyz
+tests/assets/predictions/test_m_*.xyz
+tests/assets/predictions/test_l_*.xyz

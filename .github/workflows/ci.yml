@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install tox
+        run: uv tool install --with tox-uv tox
+      - name: Lint (ruff)
+        run: tox -e lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install tox
+        run: uv tool install --with tox-uv tox
+      - name: Fetch + convert pet-mad-xs checkpoint
+        run: tox -e fetch-checkpoints
+      - name: Tests (pytest)
+        run: tox -e tests
