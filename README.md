@@ -8,16 +8,15 @@ A clean JAX/Flax reimplementation of the **uPET (Point-Edge Transformer)** famil
 
 ```
 src/petjax/
-  model.py        # UPET (Flax nn.Module) + transformer layer + attention
-  utils.py        # cutoff_bump, edge_displacements, safe_norm, cast_floats
-  structure.py    # Host-side build of the flat padded neighborlist
-  select.py       # Adaptive-cutoff machinery — truncate, determine_k_sel,
-                  #   get_adaptive_cutoffs, _pack_selected_to_flat
-  predict.py      # JIT'd forward + get_predict_fn factory (value_and_grad)
-  calculator.py   # UPETCalculator (ASE) with Verlet skin + overflow recovery
-  convert.py      # Checkpoint conversion: metatrain .ckpt -> Flax msgpack
-  cli.py          # `petjax-convert` console entry point
-  __init__.py     # Public API
+  __init__.py     # public API
+  model.py        # UPET (Flax nn.Module)
+  calculator.py   # UPETCalculator (ASE)
+  convert.py      # metatrain .ckpt → Flax msgpack
+  cli.py          # petjax-convert entrypoint
+  structure.py    # host-side neighborlist build
+  select.py       # in-JIT adaptive selection
+  predict.py      # in-JIT forward + autodiff
+  utils.py        # shared helpers
 ```
 
 ## Quick start
