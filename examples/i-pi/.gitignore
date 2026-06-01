@@ -1,0 +1,6 @@
+# Artifacts produced by running the example
+petjax-si.*
+*.log
+*.extxyz
+RESTART
+__pycache__/
