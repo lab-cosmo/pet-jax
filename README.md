@@ -19,12 +19,38 @@ src/petjax/
   utils.py        # shared helpers
 ```
 
+## Installation
+
+`pet-jax` needs Python ≥ 3.10. It is not on PyPI yet, so install it from the repository:
+
+```bash
+pip install "git+https://github.com/lab-cosmo/pet-jax"
+```
+
+This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `marathon-train`) — everything needed to load a checkpoint and run the calculator.
+
+Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra (`torch`, `metatomic-torch`, `metatrain`), which is **not** required for inference:
+
+```bash
+pip install "pet-jax[convert] @ git+https://github.com/lab-cosmo/pet-jax"
+```
+
+Or from a checkout, which is the easiest way to also get the examples and tests:
+
+```bash
+git clone https://github.com/lab-cosmo/pet-jax
+cd pet-jax
+pip install -e ".[convert]"   # drop [convert] for an inference-only install
+```
+
+Any environment manager works (`pip`, `uv`, `conda`, ...); the examples below use plain console scripts, and the `uv` + `tox` development workflow is in [Development](#development) (`uv sync --extra convert` for the editable install).
+
 ## Quick start
 
 ### Fetch a PET-MAD checkpoint
 
 ```bash
-uv run --extra convert petjax-convert pet-mad-xs --out checkpoints/pet-mad-xs
+petjax-convert pet-mad-xs --out checkpoints/pet-mad-xs
 ```
 
 This downloads the PET-MAD `.ckpt` from Hugging Face (`lab-cosmo/upet`) and converts it directly to `pet-jax`'s Flax msgpack layout — no TorchScript intermediate. The `convert` extra pulls in `torch`, `metatomic-torch`, and `metatrain` (needed only for conversion; not for inference).
@@ -169,7 +195,7 @@ Core (`pyproject.toml`):
 - `vesin` — fast neighbourlist construction
 - `marathon-train` — checkpoint I/O (msgpack/yaml) and bucket-size helpers
 
-Optional (`pip install pet-jax[convert]`):
+Optional (the `convert` extra — see [Installation](#installation)):
 
 - `torch`, `metatomic-torch`, `metatrain` — only needed when converting `metatrain` `.ckpt` files. Inference itself runs on the JAX stack alone.
 
