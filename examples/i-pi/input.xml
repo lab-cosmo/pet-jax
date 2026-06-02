@@ -1,0 +1,43 @@
+<simulation verbosity="medium">
+  <output prefix="petjax-si">
+    <properties stride="1" filename="out">
+      [ step, time{picosecond}, conserved{electronvolt},
+        temperature{kelvin}, potential{electronvolt},
+        pressure_md{bar}, volume{angstrom3} ]
+    </properties>
+    <trajectory filename="forces" stride="1" format="ase"> forces </trajectory>
+  </output>
+
+  <total_steps> 10 </total_steps>
+  <prng><seed> 12345 </seed></prng>
+
+  <!-- Unix domain socket at /tmp/ipi_petjax. The client connects with
+       `i-pi-py_driver -u -a petjax`. pbc='false' disables i-PI's position
+       wrapping; pet-jax builds its own neighbourlist (vesin + MIC) from the
+       cell, and PBC/stress are still active because the template carries
+       pbc="T T T". -->
+  <ffsocket mode='unix' name='petjax' pbc='false'>
+    <address> petjax </address>
+  </ffsocket>
+
+  <system>
+    <initialize nbeads="1">
+      <file mode="ase" units="angstrom"> si-diamond.xyz </file>
+      <velocities mode="thermal" units="kelvin"> 300.0 </velocities>
+    </initialize>
+    <forces>
+      <force forcefield='petjax'/>
+    </forces>
+    <motion mode="dynamics">
+      <dynamics mode="nvt">
+        <timestep units="femtosecond"> 1.0 </timestep>
+        <thermostat mode='langevin'>
+          <tau units="femtosecond"> 25 </tau>
+        </thermostat>
+      </dynamics>
+    </motion>
+    <ensemble>
+      <temperature units="kelvin"> 300.0 </temperature>
+    </ensemble>
+  </system>
+</simulation>

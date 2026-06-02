@@ -3,7 +3,7 @@ name = "pet-jax"
 version = "0.1.0"
 description = "Clean JAX/Flax implementation of uPET interatomic potentials"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Marcel Langer", email = "dev@marcel.science" }]
 keywords = [
