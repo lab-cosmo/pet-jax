@@ -5,6 +5,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+import sys
+import warnings
+
 from ase.calculators.calculator import BaseCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
@@ -37,9 +40,9 @@ class UPETCalculator(BaseCalculator):
         n_pair_bucket_strategy=None,
         k_sel_bucket_strategy=None,
         extra_neighbors=4,
-        k_sel_override=None,
         cutoff_override=None,
         add_offset=True,
+        debug=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -55,13 +58,19 @@ class UPETCalculator(BaseCalculator):
             k_sel_bucket_strategy if k_sel_bucket_strategy is not None else bucket_strategy
         )
         self._extra_neighbors = extra_neighbors
-        self._k_sel_override = k_sel_override
         self._add_offset = add_offset
+        self._debug = debug
+        # Perf-tuning numbers, refreshed each NL rebuild (None until first
+        # `calculate`). Always populated; `debug` only gates the stderr summary.
+        self.debug_stats = None
+        # Cached max selected adaptive cutoff from the last `determine_k_sel`;
+        # carried across rebuilds that reuse k_sel (which skip the sizing run).
+        self._max_selected_cutoff = None
 
         # cutoff_override narrows ONLY the vesin raw-NL query radius (to
         # cutoff_override + skin). The UPET model is untouched — probes, the
         # adaptive-cutoff layer and the cutoff bump all keep using the trained
-        # config["cutoff"]. A perf knob for when the trained cutoff is wider
+        # config["cutoff"]. A performance knob for when the trained cutoff is wider
         # than the radius adaptive selection actually reaches.
         #
         # CORRECTNESS RISK: the raw NL must still hold every pair the model
@@ -69,6 +78,9 @@ class UPETCalculator(BaseCalculator):
         # cutoff_override is below the largest one selected, surviving pairs are
         # silently dropped — and the adaptive-cutoff counts themselves are
         # starved. Both corrupt energy/forces with no error raised.
+        #
+        # `_check_cutoff_override` warns (per rebuild) once the measured reach
+        # exceeds cutoff_override — but it is a warning, not a guard.
         self._cutoff = (
             cutoff_override if cutoff_override is not None else metadata["config"]["cutoff"]
         )
@@ -84,8 +96,6 @@ class UPETCalculator(BaseCalculator):
         self._params = cast_floats(params, self._dtype)
 
         self._nl_cache = NeighborListCache(skin=skin)
-        # predict_fn is shape-agnostic — built once; it reads N_padded / k_sel
-        # off the input arrays and the JIT retraces per shape.
         self._predict_fn = get_predict_fn(
             self._model,
             stress=self._stress,
@@ -154,7 +164,8 @@ class UPETCalculator(BaseCalculator):
         return cast_floats(structure, self._dtype)
 
     def _build_structure(self, atoms, force_recompute_k_sel=False):
-        """Rebuild the raw NL and size k_sel; stamp the structure pytree.
+        """Rebuild the raw NL, size k_sel, and assemble the structure pytree
+        (with the ``k_sel_sizer`` carrier).
 
         Called by ``calculate`` only on a Verlet-cache miss (atom count /
         species / pbc change, or displacement past the skin) or an overflow
@@ -173,7 +184,7 @@ class UPETCalculator(BaseCalculator):
         ``self._predict_fn`` is shape-agnostic (built once in ``__init__``): it
         reads N_padded / k_sel off the input arrays, so a shape change just
         retraces it. k_sel reaches the JIT via the ``k_sel_sizer`` carrier
-        stamped into the structure here.
+        written into the structure here.
 
         ``extra_neighbors`` pads k_sel above ``k_sel_actual`` so a few new
         neighbours don't overflow every step (bucket promotion only kicks in at
@@ -200,12 +211,9 @@ class UPETCalculator(BaseCalculator):
             or n_pair_padded != self._n_pair_padded
         )
 
-        if self._k_sel_override is not None:
-            # Caller forced k_sel — skip determine_k_sel entirely. Overflow retry
-            # still protects against genuinely-too-small overrides.
-            k_sel_padded = self._k_sel_override
-        elif force_recompute_k_sel or shape_changed:
-            k_sel_actual = determine_k_sel(
+        k_sel_actual = None  # set only when determine_k_sel runs (debug stat)
+        if force_recompute_k_sel or shape_changed:
+            k_sel_actual, self._max_selected_cutoff = determine_k_sel(
                 structure,
                 self._model.get_probes(),
                 self._metadata["config"]["num_neighbors_adaptive"],
@@ -240,6 +248,87 @@ class UPETCalculator(BaseCalculator):
         # Composition shifts are constant w.r.t. positions; Python fp64 sum
         # added post-JIT. Species can only change via a rebuild, so here.
         self._shift_offset = sum(self._shifts[int(z)] for z in atoms.get_atomic_numbers())
+
+        self._record_debug(atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel)
+        self._check_cutoff_override()
+
+    def _record_debug(self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel):
+        """Refresh and maybe print ``self.debug_stats`` after a rebuild. The
+        padded sizes are read off ``self`` (just stamped by ``_build_structure``);
+        the rest are passed in as they aren't kept on ``self``."""
+        self.debug_stats = {
+            "n_atoms": len(atoms),
+            "N_padded": self._N_padded,
+            "n_pair_raw": int(structure["pair_mask"].sum()),
+            "n_pair_padded": self._n_pair_padded,
+            "k_sel_actual": k_sel_actual,  # None if reused (no sizing run)
+            "k_sel_padded": self._k_sel,
+            "extra_neighbors": self._extra_neighbors,
+            "recomputed_k_sel": k_sel_actual is not None,
+            "max_selected_cutoff": self._max_selected_cutoff,  # None until first sizing
+            "cutoff_raw_nl": self._cutoff,
+            "cutoff_trained": self._metadata["config"]["cutoff"],
+            "retrace": shape_changed,  # predict_fn retraces iff a shape changed
+            "overflow_retry": force_recompute_k_sel,
+        }
+        if self._debug:
+            self._print_debug(self.debug_stats)
+
+    def _check_cutoff_override(self):
+        """Warn if ``cutoff_override`` is smaller than the reach the adaptive
+        selection asks for.
+
+        ``max_selected_cutoff`` is the largest per-atom adaptive cutoff the
+        selection assigns (up to the trained cutoff). The raw NL only supplies
+        neighbours to ``cutoff_override + skin``; once that cutoff passes
+        ``cutoff_override`` the skin is spent as cutoff slack and real neighbours
+        are silently dropped, corrupting energy/forces. Only fires when an
+        override is active; the reach is read from the last sizing run."""
+        co = self._max_selected_cutoff
+        override_active = self._cutoff < self._metadata["config"]["cutoff"]
+        if co is None or not override_active or co <= self._cutoff:
+            return
+        raw_nl_radius = self._cutoff + self._skin
+        warnings.warn(
+            f"UPETCalculator: adaptive selection reaches {co:.2f} Å, exceeding "
+            f"cutoff_override={self._cutoff:.2f} Å (raw-NL radius "
+            f"{raw_nl_radius:.2f} Å incl. {self._skin:.2f} Å skin). The override "
+            f"is too small — it eats the Verlet skin and risks silently dropping "
+            f"pairs the model needs (corrupting energy/forces). Raise "
+            f"cutoff_override toward the trained "
+            f"{self._metadata['config']['cutoff']:.2f} Å, or unset it.",
+            stacklevel=2,
+        )
+
+    @staticmethod
+    def _print_debug(s):
+        def pct(used, total):
+            return f"{100.0 * (total - used) / total:.1f}% pad" if total else "n/a"
+
+        tag = "overflow-rebuild" if s["overflow_retry"] else "rebuild"
+        lines = [
+            f"[upet] {tag}: atoms {s['n_atoms']}/{s['N_padded']} "
+            f"({pct(s['n_atoms'], s['N_padded'])})",
+            f"[upet]   pairs {s['n_pair_raw']}/{s['n_pair_padded']} "
+            f"({pct(s['n_pair_raw'], s['n_pair_padded'])})",
+        ]
+        if s["recomputed_k_sel"]:
+            lines.append(
+                f"[upet]   k_sel {s['k_sel_actual']}->{s['k_sel_padded']} "
+                f"(recompute, +{s['extra_neighbors']} extra)"
+            )
+        else:
+            lines.append(f"[upet]   k_sel {s['k_sel_padded']} (reused)")
+        if s["max_selected_cutoff"] is not None:
+            override = "" if s["cutoff_raw_nl"] == s["cutoff_trained"] else " [override]"
+            lines.append(
+                f"[upet]   max_cutoff {s['max_selected_cutoff']:.2f} selected / "
+                f"{s['cutoff_raw_nl']:.2f} raw-NL{override} / "
+                f"{s['cutoff_trained']:.2f} trained"
+            )
+        if s["retrace"]:
+            lines.append("[upet]   shape changed -> predict_fn retrace")
+        print("\n".join(lines), file=sys.stderr)
 
     def _update_geometry(self, atoms):
         """Update positions and cell without rebuilding NL."""

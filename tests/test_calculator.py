@@ -4,6 +4,7 @@ import numpy as np
 import jax.numpy as jnp
 
 import copy
+import warnings
 
 import pytest
 from ase.io import read
@@ -225,7 +226,7 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
     # same way _select_and_predict does, to get valid model inputs.
     structure = to_structure(atoms, model.cutoff, metadata["species_to_index"], skin=0.5)
     N_padded = structure["positions"].shape[0]
-    k_sel = determine_k_sel(
+    k_sel, _ = determine_k_sel(
         structure,
         model.get_probes(),
         config["num_neighbors_adaptive"],
@@ -269,3 +270,31 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
     assert not np.array_equal(np.asarray(out_none), np.asarray(out_adaptive)), (
         "adaptive pair_cutoffs had no effect — test would be vacuous"
     )
+
+
+def test_debug_stats_and_cutoff_override_warning(model_data, mini_xyz):
+    """debug_stats is populated on a rebuild; a too-small cutoff_override warns."""
+    model, params, metadata = model_data
+    atoms = read(str(mini_xyz), index=0)
+    trained = metadata["config"]["cutoff"]
+
+    # No override: stats populated, no cutoff warning.
+    calc = UPETCalculator(model, params, metadata, skin=0.5)
+    atoms.calc = calc
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        atoms.get_potential_energy()
+    s = calc.debug_stats
+    assert s["n_atoms"] == len(atoms)
+    assert s["N_padded"] >= s["n_atoms"]
+    assert s["n_pair_padded"] >= s["n_pair_raw"] > 0
+    assert s["k_sel_padded"] >= s["k_sel_actual"] >= 1
+    assert 0 < s["max_selected_cutoff"] <= trained
+    assert not [w for w in rec if "adaptive selection reaches" in str(w.message)]
+
+    # Override well below the measured reach: warning fires.
+    too_small = s["max_selected_cutoff"] / 2
+    calc2 = UPETCalculator(model, params, metadata, skin=0.5, cutoff_override=too_small)
+    atoms.calc = calc2
+    with pytest.warns(UserWarning, match="adaptive selection reaches"):
+        atoms.get_potential_energy()

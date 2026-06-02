@@ -34,14 +34,11 @@ def to_structure(
     reused across structures of different sizes.
 
     Pairs come back grouped by center (``sorted=True``): ``_pack_selected_to_flat``
-    and the segment sums require ``i`` non-decreasing. vesin 0.5.7 sorts by
-    ``i`` only (within-center ``j`` order unspecified — fine, the model is
-    permutation-equivariant there), inside the build pass: faster than a
-    host-side ``np.argsort`` + gather at every size.
+    and the segment sums require ``i`` non-decreasing.
 
     Returns the structure dict. ``N_padded`` / ``n_pair_padded`` are read off
     ``structure["positions"].shape[0]`` / ``structure["centers"].shape[0]``;
-    ``k_sel_sizer`` is stamped in by the calculator after ``determine_k_sel``.
+    ``k_sel_sizer`` is put in by the calculator after ``determine_k_sel``.
     """
     if n_pair_bucket_strategy is None:
         n_pair_bucket_strategy = bucket_strategy

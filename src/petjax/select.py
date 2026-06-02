@@ -63,23 +63,27 @@ def truncate(structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=
 
 def determine_k_sel(structure, probes, num_neighbors_adaptive, cutoff_width):
     """Trial adaptive cutoff to size k_sel. Runs the sizing kernel on CPU (the
-    structure dict is moved with one ``jax.device_put``), returns a host int.
-    Kept off the GPU to avoid contention with the forward and to read out the
-    int without a device→host sync.
+    structure dict is moved with one ``jax.device_put``). Kept off the GPU to
+    avoid contention with the forward and to read the result back without a
+    device→host sync.
 
     ``jax.devices("cpu")`` is resolved lazily here — *not* at module import —
     so a process that only imports ``petjax`` (e.g. a grain pool worker doing
-    preprocessing) never triggers a JAX backend init at import time. The
-    cheap repeated lookup is amortised by ``determine_k_sel`` running at most
-    once per NL rebuild.
+    preprocessing) never triggers a JAX backend init at import time. The cheap
+    repeated lookup is amortised by ``determine_k_sel`` running at most once per
+    NL rebuild.
+
+    Returns ``(k_sel, max_cutoff)``: the host-int k_sel and the largest selected
+    adaptive cutoff (host float) — the selection's "real reach", for tuning
+    ``cutoff_override``.
     """
     cpu = jax.devices("cpu")[0]
     cpu_structure = jax.device_put(structure, cpu)
     cpu_probes = jax.device_put(probes, cpu)
-    max_count = _k_sel_kernel(
+    max_count, max_cutoff = _k_sel_kernel(
         cpu_structure, cpu_probes, cutoff_width, num_neighbors_adaptive
     )
-    return max(int(max_count), 1)
+    return max(int(max_count), 1), float(max_cutoff)
 
 
 # jit on the inner k_sel kernel is fine in steady state: in MD the static arg
@@ -88,14 +92,19 @@ def determine_k_sel(structure, probes, num_neighbors_adaptive, cutoff_width):
 # Calculator reused on different-sized structures) re-compile.
 @partial(jax.jit, static_argnames=("num_neighbors_adaptive",))
 def _k_sel_kernel(structure, probes, cutoff_width, num_neighbors_adaptive):
-    _, _, selected = _selection(structure, probes, cutoff_width, num_neighbors_adaptive)
+    _, pair_cutoffs, selected = _selection(
+        structure, probes, cutoff_width, num_neighbors_adaptive
+    )
     counts = jax.ops.segment_sum(
         selected.astype(int),
         structure["centers"],
         num_segments=structure["positions"].shape[0],
         indices_are_sorted=True,
     )
-    return counts.max()
+    # Largest adaptive cutoff among selected pairs — the real reach of the
+    # selection. 0.0 if nothing is selected (degenerate: isolated atom).
+    max_cutoff = jnp.max(jnp.where(selected, pair_cutoffs, 0.0))
+    return counts.max(), max_cutoff
 
 
 # -- adaptive per-atom cutoffs --
