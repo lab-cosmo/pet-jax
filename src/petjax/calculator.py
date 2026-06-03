@@ -40,6 +40,7 @@ class UPETCalculator(BaseCalculator):
         n_pair_bucket_strategy=None,
         k_sel_bucket_strategy=None,
         extra_neighbors=4,
+        num_neighbors_adaptive=None,
         cutoff_override=None,
         add_offset=True,
         debug=False,
@@ -58,6 +59,18 @@ class UPETCalculator(BaseCalculator):
             k_sel_bucket_strategy if k_sel_bucket_strategy is not None else bucket_strategy
         )
         self._extra_neighbors = extra_neighbors
+        # num_neighbors_adaptive is the per-atom neighbour target the adaptive
+        # cutoff selects for. None keeps the trained checkpoint value; overriding
+        # it (models are robust to this) trades a larger k_sel — modestly more
+        # per-step compute — for accuracy. Threaded as ONE value to both selection
+        # consumers: k_sel sizing here (determine_k_sel) and the in-JIT forward
+        # (via get_predict_fn). They must agree — a forward that selects past the
+        # k_sel sized for a smaller target overflows unrecoverably.
+        self._num_neighbors_adaptive = (
+            num_neighbors_adaptive
+            if num_neighbors_adaptive is not None
+            else metadata["config"]["num_neighbors_adaptive"]
+        )
         self._add_offset = add_offset
         self._debug = debug
         # Perf-tuning numbers, refreshed each NL rebuild (None until first
@@ -100,6 +113,7 @@ class UPETCalculator(BaseCalculator):
             self._model,
             stress=self._stress,
             no_shadow=self._no_shadow,
+            num_neighbors_adaptive=self._num_neighbors_adaptive,
         )
         self._N_padded = None
         self._n_pair_padded = None
@@ -216,7 +230,7 @@ class UPETCalculator(BaseCalculator):
             k_sel_actual, self._max_selected_cutoff = determine_k_sel(
                 structure,
                 self._model.get_probes(),
-                self._metadata["config"]["num_neighbors_adaptive"],
+                self._num_neighbors_adaptive,
                 self._metadata["config"]["cutoff_width"],
             )
             # T = k_sel edge tokens + 1 central-atom token. Bucket T (an even
