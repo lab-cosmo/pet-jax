@@ -59,13 +59,8 @@ class UPETCalculator(BaseCalculator):
             k_sel_bucket_strategy if k_sel_bucket_strategy is not None else bucket_strategy
         )
         self._extra_neighbors = extra_neighbors
-        # num_neighbors_adaptive is the per-atom neighbour target the adaptive
-        # cutoff selects for. None keeps the trained checkpoint value; overriding
-        # it (models are robust to this) trades a larger k_sel — modestly more
-        # per-step compute — for accuracy. Threaded as ONE value to both selection
-        # consumers: k_sel sizing here (determine_k_sel) and the in-JIT forward
-        # (via get_predict_fn). They must agree — a forward that selects past the
-        # k_sel sized for a smaller target overflows unrecoverably.
+        # Per-atom adaptive-selection target; None keeps the trained value. Fed
+        # to both consumers (k_sel sizing and the forward), which must agree.
         self._num_neighbors_adaptive = (
             num_neighbors_adaptive
             if num_neighbors_adaptive is not None
@@ -263,10 +258,14 @@ class UPETCalculator(BaseCalculator):
         # added post-JIT. Species can only change via a rebuild, so here.
         self._shift_offset = sum(self._shifts[int(z)] for z in atoms.get_atomic_numbers())
 
-        self._record_debug(atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel)
+        self._record_debug(
+            atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
+        )
         self._check_cutoff_override()
 
-    def _record_debug(self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel):
+    def _record_debug(
+        self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
+    ):
         """Refresh and maybe print ``self.debug_stats`` after a rebuild. The
         padded sizes are read off ``self`` (just stamped by ``_build_structure``);
         the rest are passed in as they aren't kept on ``self``."""
