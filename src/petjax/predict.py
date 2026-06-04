@@ -17,7 +17,7 @@ from .select import truncate
 # -- predict_fn factory --
 
 
-def get_predict_fn(model, stress=True, no_shadow=False):
+def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=None):
     """Build a JIT-compiled ``predict_fn(params, structure) -> dict``.
 
     Shape-agnostic: shapes are read off the input arrays (``positions.shape[0]``
@@ -25,14 +25,18 @@ def get_predict_fn(model, stress=True, no_shadow=False):
     so the same closure serves any params and a training-side
     ``value_and_grad(loss, argnums=0)(params, batch)`` works without rebuild.
 
-    The model carries its own metadata: ``num_neighbors_adaptive``,
-    ``cutoff_width``, and ``energy_scale`` are read off ``model``. Energy
-    returned already includes ``model.energy_scale``; composition shifts are
-    the caller's responsibility (applied post-JIT in fp64 by
-    ``UPETCalculator``). See ``_select_and_predict`` for ``no_shadow``.
+    The model carries its own metadata: ``cutoff_width`` and ``energy_scale``
+    are read off ``model``. ``num_neighbors_adaptive`` (the per-atom selection
+    target) defaults to ``model.num_neighbors_adaptive`` but can be overridden
+    by the caller — the value is closured into the forward, so the k_sel sizing
+    on the calculator side must be passed the same value. Energy returned
+    already includes ``model.energy_scale``; composition shifts are the caller's
+    responsibility (applied post-JIT in fp64 by ``UPETCalculator``). See
+    ``_select_and_predict`` for ``no_shadow``.
     """
     probes = model.get_probes()
-    num_neighbors_adaptive = model.num_neighbors_adaptive
+    if num_neighbors_adaptive is None:
+        num_neighbors_adaptive = model.num_neighbors_adaptive
     cutoff_width = model.cutoff_width
 
     def energy_fn(params, structure, epsilon=None):

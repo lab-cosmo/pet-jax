@@ -40,6 +40,7 @@ class UPETCalculator(BaseCalculator):
         n_pair_bucket_strategy=None,
         k_sel_bucket_strategy=None,
         extra_neighbors=4,
+        num_neighbors_adaptive=None,
         cutoff_override=None,
         add_offset=True,
         debug=False,
@@ -58,6 +59,13 @@ class UPETCalculator(BaseCalculator):
             k_sel_bucket_strategy if k_sel_bucket_strategy is not None else bucket_strategy
         )
         self._extra_neighbors = extra_neighbors
+        # Per-atom adaptive-selection target; None keeps the trained value. Fed
+        # to both consumers (k_sel sizing and the forward), which must agree.
+        self._num_neighbors_adaptive = (
+            num_neighbors_adaptive
+            if num_neighbors_adaptive is not None
+            else metadata["config"]["num_neighbors_adaptive"]
+        )
         self._add_offset = add_offset
         self._debug = debug
         # Perf-tuning numbers, refreshed each NL rebuild (None until first
@@ -100,6 +108,7 @@ class UPETCalculator(BaseCalculator):
             self._model,
             stress=self._stress,
             no_shadow=self._no_shadow,
+            num_neighbors_adaptive=self._num_neighbors_adaptive,
         )
         self._N_padded = None
         self._n_pair_padded = None
@@ -216,7 +225,7 @@ class UPETCalculator(BaseCalculator):
             k_sel_actual, self._max_selected_cutoff = determine_k_sel(
                 structure,
                 self._model.get_probes(),
-                self._metadata["config"]["num_neighbors_adaptive"],
+                self._num_neighbors_adaptive,
                 self._metadata["config"]["cutoff_width"],
             )
             # T = k_sel edge tokens + 1 central-atom token. Bucket T (an even
@@ -249,10 +258,14 @@ class UPETCalculator(BaseCalculator):
         # added post-JIT. Species can only change via a rebuild, so here.
         self._shift_offset = sum(self._shifts[int(z)] for z in atoms.get_atomic_numbers())
 
-        self._record_debug(atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel)
+        self._record_debug(
+            atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
+        )
         self._check_cutoff_override()
 
-    def _record_debug(self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel):
+    def _record_debug(
+        self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
+    ):
         """Refresh and maybe print ``self.debug_stats`` after a rebuild. The
         padded sizes are read off ``self`` (just stamped by ``_build_structure``);
         the rest are passed in as they aren't kept on ``self``."""
