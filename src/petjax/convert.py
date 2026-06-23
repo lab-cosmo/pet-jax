@@ -75,6 +75,7 @@ def convert_checkpoint(ckpt_path, output_dir):
     ckpt = torch.load(str(ckpt_path), weights_only=False, map_location="cpu")
 
     pet_ckpt = _unwrap_pet_checkpoint(ckpt)
+    _check_single_readout(pet_ckpt["best_model_state_dict"])
     meta = _extract_metadata(pet_ckpt)
 
     params = _unflatten(_convert_state_dict(pet_ckpt["best_model_state_dict"]))
@@ -136,6 +137,30 @@ def _unwrap_pet_checkpoint(ckpt):
         )
 
     return inner
+
+
+def _check_single_readout(state_dict):
+    """Enforce pet-jax's ``num_readout_layers == 1`` invariant.
+
+    pet-jax's ``UPET`` applies a single readout to the *final* GNN layer's
+    features (``node_heads_0`` / ``edge_heads_0`` / ``node_last_0`` /
+    ``edge_last_0``). Upstream PET instead loops over ``num_readout_layers``
+    heads and sums their per-layer contributions; that count is 1 only for the
+    feedforward featurizer (which ``REQUIRED_HYPERS`` already pins). Assert it
+    here directly so a multi-readout checkpoint fails loudly rather than
+    silently dropping every head past index 0.
+    """
+    indices = set()
+    for key in state_dict:
+        match = re.match(r"node_heads\.energy\.(\d+)\.", key)
+        if match:
+            indices.add(int(match.group(1)))
+    if indices != {0}:
+        raise ValueError(
+            f"pet-jax implements num_readout_layers == 1 (a single readout from "
+            f"the final GNN layer); checkpoint exposes readout-head indices "
+            f"{sorted(indices)}. Only the feedforward featurizer is supported."
+        )
 
 
 def _extract_metadata(pet_ckpt):
