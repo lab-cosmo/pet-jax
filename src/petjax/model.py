@@ -149,10 +149,8 @@ class UPET(nn.Module):
         # Weighted edge sum per atom
         edge_contrib = (edge_out * cutoffs).reshape(N, n).sum(axis=1)
 
-        # Single readout from the final GNN layer. Upstream PET sums one
-        # (node + edge) term per readout layer, but PET-MAD's feedforward
-        # featurizer fixes num_readout_layers == 1 (enforced in convert.py),
-        # so this lone term is the whole sum.
+        # Single readout: num_readout_layers == 1 (feedforward; see convert.py),
+        # not a sum over per-layer heads.
         predictions = node_out + edge_contrib
 
         return predictions * atom_mask * self.energy_scale

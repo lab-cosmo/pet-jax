@@ -140,15 +140,9 @@ def _unwrap_pet_checkpoint(ckpt):
 
 
 def _check_single_readout(state_dict):
-    """Enforce pet-jax's ``num_readout_layers == 1`` invariant.
-
-    pet-jax's ``UPET`` applies a single readout to the *final* GNN layer's
-    features (``node_heads_0`` / ``edge_heads_0`` / ``node_last_0`` /
-    ``edge_last_0``). Upstream PET instead loops over ``num_readout_layers``
-    heads and sums their per-layer contributions; that count is 1 only for the
-    feedforward featurizer (which ``REQUIRED_HYPERS`` already pins). Assert it
-    here directly so a multi-readout checkpoint fails loudly rather than
-    silently dropping every head past index 0.
+    """Reject multi-readout checkpoints: ``UPET`` consumes only readout head 0
+    (``num_readout_layers == 1``, which the feedforward featurizer guarantees),
+    so a residual-featurizer ckpt would silently lose every head past index 0.
     """
     indices = set()
     for key in state_dict:
