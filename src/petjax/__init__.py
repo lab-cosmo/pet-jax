@@ -2,7 +2,7 @@
 
 from .calculator import UPETCalculator
 from .convert import convert_checkpoint, load_checkpoint
-from .model import UPET
+from .model import UPET, Backbone, Energy
 from .predict import get_predict_fn
 from .select import get_adaptive_cutoffs, truncate
 from .structure import to_structure
@@ -10,6 +10,8 @@ from .utils import cutoff_bump
 
 __all__ = [
     "UPET",
+    "Backbone",
+    "Energy",
     "UPETCalculator",
     "cutoff_bump",
     "get_adaptive_cutoffs",

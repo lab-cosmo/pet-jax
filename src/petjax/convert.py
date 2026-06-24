@@ -222,9 +222,13 @@ _SKIP_PREFIXES = (
     "long_range_featurizer.",
 )
 
+# Readout-head params nest under energy_head/, the rest under backbone/
+# (UPET = Backbone + Energy).
+_HEAD_PREFIXES = ("node_heads_", "node_last_", "edge_heads_", "edge_last_")
+
 
 def _convert_state_dict(state_dict):
-    """Raw PyTorch state dict -> flat Flax param dict."""
+    """Raw PyTorch state dict -> flat Flax param dict (keys scoped by module)."""
     import torch
 
     out = {}
@@ -237,8 +241,15 @@ def _convert_state_dict(state_dict):
         new_key = _rename_key(key)
         np_value = value.cpu().numpy()
         new_key, np_value = _finalize_key(new_key, np_value)
-        out[new_key] = jnp.array(np_value)
+        out[_scope_key(new_key)] = jnp.array(np_value)
     return out
+
+
+def _scope_key(key):
+    """Nest a flat key under its module scope: ``energy_head`` for readout
+    heads, ``backbone`` for everything else."""
+    scope = "energy_head" if key.startswith(_HEAD_PREFIXES) else "backbone"
+    return f"{scope}.{key}"
 
 
 def _rename_key(key):
