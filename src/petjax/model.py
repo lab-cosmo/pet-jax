@@ -198,11 +198,15 @@ class Energy(nn.Module):
         n = edge.shape[0] // N
 
         # Node head
-        node_h = masked(MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask)
+        node_h = masked(
+            MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask
+        )
         node_contrib = masked(nn.Dense(1, name="node_last_0"), node_h, atom_mask)[:, 0]
 
         # Edge head
-        edge_h = masked(MLP2(self.d_head, self.d_head, name="edge_heads_0"), edge, pair_mask)
+        edge_h = masked(
+            MLP2(self.d_head, self.d_head, name="edge_heads_0"), edge, pair_mask
+        )
         edge_out = masked(nn.Dense(1, name="edge_last_0"), edge_h, pair_mask)[:, 0]
 
         # Weighted edge sum per atom
