@@ -75,6 +75,7 @@ def convert_checkpoint(ckpt_path, output_dir):
     ckpt = torch.load(str(ckpt_path), weights_only=False, map_location="cpu")
 
     pet_ckpt = _unwrap_pet_checkpoint(ckpt)
+    _check_single_readout(pet_ckpt["best_model_state_dict"])
     meta = _extract_metadata(pet_ckpt)
 
     params = _unflatten(_convert_state_dict(pet_ckpt["best_model_state_dict"]))
@@ -136,6 +137,24 @@ def _unwrap_pet_checkpoint(ckpt):
         )
 
     return inner
+
+
+def _check_single_readout(state_dict):
+    """Reject multi-readout checkpoints: ``UPET`` consumes only readout head 0
+    (``num_readout_layers == 1``, which the feedforward featurizer guarantees),
+    so a residual-featurizer ckpt would silently lose every head past index 0.
+    """
+    indices = set()
+    for key in state_dict:
+        match = re.match(r"node_heads\.energy\.(\d+)\.", key)
+        if match:
+            indices.add(int(match.group(1)))
+    if indices != {0}:
+        raise ValueError(
+            f"pet-jax implements num_readout_layers == 1 (a single readout from "
+            f"the final GNN layer); checkpoint exposes readout-head indices "
+            f"{sorted(indices)}. Only the feedforward featurizer is supported."
+        )
 
 
 def _extract_metadata(pet_ckpt):

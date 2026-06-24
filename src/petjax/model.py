@@ -68,8 +68,6 @@ class UPET(nn.Module):
         edge_embed = nn.Embed(self.num_species, d_pet, name="edge_embedder")
         messages = edge_embed(species)[neighbors] * pair_mask[..., None]
 
-        predictions = jnp.zeros(N)
-
         # Node embedding (feedforward: persists across layers)
         node_embed = nn.Embed(self.num_species, d_node, name="node_embedders_0")
         node = node_embed(species)[:, None, :] * atom_mask[:, None, None]
@@ -150,7 +148,10 @@ class UPET(nn.Module):
 
         # Weighted edge sum per atom
         edge_contrib = (edge_out * cutoffs).reshape(N, n).sum(axis=1)
-        predictions = predictions + node_out + edge_contrib
+
+        # Single readout: num_readout_layers == 1 (feedforward; see convert.py),
+        # not a sum over per-layer heads.
+        predictions = node_out + edge_contrib
 
         return predictions * atom_mask * self.energy_scale
 
