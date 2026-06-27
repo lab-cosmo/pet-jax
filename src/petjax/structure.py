@@ -14,7 +14,6 @@ from marathon.utils import next_size
 def to_structure(
     atoms,
     cutoff,
-    species_to_index,
     skin=0.5,
     bucket_strategy="multiples",
     n_atoms_bucket_strategy=None,
@@ -105,7 +104,7 @@ def to_structure(
     reverse[:n_pair_raw] = reverse_sparse.astype(int_dtype)
 
     species = np.zeros(N_padded, dtype=int_dtype)
-    species[:n_atoms] = [species_to_index[int(z)] for z in atoms.get_atomic_numbers()]
+    species[:n_atoms] = atoms.get_atomic_numbers()  # embeddings index by atomic number
 
     atom_mask = np.zeros(N_padded, dtype=bool)
     atom_mask[:n_atoms] = True

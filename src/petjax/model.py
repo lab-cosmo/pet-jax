@@ -28,7 +28,7 @@ class UPET(nn.Module):
     cutoff_width: float = 0.5
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
-    num_species: int = 103
+    max_atomic_number: int = 118
 
     def get_probes(self):
         return jnp.arange(0.5, self.cutoff, self.cutoff_width / 4)
@@ -54,7 +54,7 @@ class UPET(nn.Module):
             num_gnn_layers=self.num_gnn_layers,
             cutoff=self.cutoff,
             cutoff_width=self.cutoff_width,
-            num_species=self.num_species,
+            max_atomic_number=self.max_atomic_number,
             attention_temperature=self.attention_temperature,
             name="backbone",
         )(R_ij, centers, neighbors, species, reverse, pair_mask, atom_mask, pair_cutoffs)
@@ -82,7 +82,7 @@ class Backbone(nn.Module):
     num_gnn_layers: int = 2
     cutoff: float = 7.5
     cutoff_width: float = 0.5
-    num_species: int = 103
+    max_atomic_number: int = 118
     attention_temperature: float = 1.0
 
     @nn.compact
@@ -116,12 +116,13 @@ class Backbone(nn.Module):
         cutoffs_tokens = jnp.concatenate([central, cutoffs.reshape(N, n)], axis=1)
         mask = jnp.concatenate([atom_mask[:, None], pair_mask.reshape(N, n)], axis=1)
 
-        # Initial edge features
-        edge_embed = nn.Embed(self.num_species, d_pet, name="edge_embedder")
+        # Initial edge features. Species embeddings are indexed directly by
+        # atomic number Z (table has max_atomic_number + 1 rows; row 0 unused).
+        edge_embed = nn.Embed(self.max_atomic_number + 1, d_pet, name="edge_embedder")
         messages = edge_embed(species)[neighbors] * pair_mask[..., None]
 
         # Node embedding (feedforward: persists across layers)
-        node_embed = nn.Embed(self.num_species, d_node, name="node_embedders_0")
+        node_embed = nn.Embed(self.max_atomic_number + 1, d_node, name="node_embedders_0")
         node = node_embed(species)[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
@@ -144,7 +145,7 @@ class Backbone(nn.Module):
                 )
             else:
                 neighbor_embed = nn.Embed(
-                    self.num_species,
+                    self.max_atomic_number + 1,
                     d_pet,
                     name=f"gnn_layers_{layer_idx}_neighbor_embed",
                 )

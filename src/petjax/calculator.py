@@ -92,7 +92,6 @@ class UPETCalculator(BaseCalculator):
         self._cutoff = (
             cutoff_override if cutoff_override is not None else metadata["config"]["cutoff"]
         )
-        self._species_to_index = metadata["species_to_index"]
 
         if default_dtype == "float64":
             jax.config.update("jax_enable_x64", True)
@@ -117,6 +116,10 @@ class UPETCalculator(BaseCalculator):
         self._shift_offset = 0.0
 
         self._shifts = {int(z): float(v) for z, v in metadata["shifts"].items()}
+        # Species the model knows (composition covers every trained element).
+        # Embeddings index by Z directly and JAX gather clamps out-of-range
+        # silently, so unsupported elements must be rejected explicitly.
+        self._valid_species = set(self._shifts)
 
         if not stress:
             self.implemented_properties = ["energy", "forces"]
@@ -201,10 +204,17 @@ class UPETCalculator(BaseCalculator):
         ``overflow=True`` and ``calculate`` retries here with
         ``force_recompute_k_sel=True``.
         """
+        unknown = sorted(
+            {int(z) for z in atoms.get_atomic_numbers()} - self._valid_species
+        )
+        if unknown:
+            raise ValueError(
+                f"UPETCalculator: structure has atomic numbers {unknown} the model "
+                f"was not trained on (known: {sorted(self._valid_species)})."
+            )
         structure = to_structure(
             atoms,
             self._cutoff,
-            self._species_to_index,
             skin=self._skin,
             bucket_strategy=self._bucket_strategy,
             n_atoms_bucket_strategy=self._n_atoms_bucket_strategy,

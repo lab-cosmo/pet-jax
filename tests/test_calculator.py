@@ -224,7 +224,7 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
 
     # Build the flat NL and the packed [N_padded, k_sel] selected layout the
     # same way _select_and_predict does, to get valid model inputs.
-    structure = to_structure(atoms, model.cutoff, metadata["species_to_index"], skin=0.5)
+    structure = to_structure(atoms, model.cutoff, skin=0.5)
     N_padded = structure["positions"].shape[0]
     k_sel, _ = determine_k_sel(
         structure,

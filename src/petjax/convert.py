@@ -11,7 +11,7 @@ Other versions fail hard — use ``mtt upgrade`` or fetch a newer release.
 
 Writes:
     {output_dir}/model.msgpack    -- Flax parameter tree
-    {output_dir}/metadata.yaml    -- config, shifts, species_to_index
+    {output_dir}/metadata.yaml    -- config (incl. max_atomic_number), shifts
 """
 
 import numpy as np
@@ -79,6 +79,9 @@ def convert_checkpoint(ckpt_path, output_dir):
     meta = _extract_metadata(pet_ckpt)
 
     flat = _convert_state_dict(pet_ckpt["best_model_state_dict"])
+    _scatter_species_embeddings(
+        flat, meta["atomic_types"], meta["config"]["max_atomic_number"] + 1
+    )
     # energy_scale lives in the param tree, not metadata.
     flat["energy_scale"] = jnp.array([meta["energy_scale"]], dtype=jnp.float32)
     params = _unflatten(flat)
@@ -87,14 +90,13 @@ def convert_checkpoint(ckpt_path, output_dir):
     metadata = {
         "config": meta["config"],
         "shifts": meta["shifts"],
-        "species_to_index": meta["species_to_index"],
     }
     write_yaml(output_dir / "metadata.yaml", metadata)
 
     print(f"Saved to {output_dir}/")
     print(f"  config: {meta['config']}")
     print(f"  energy_scale: {meta['energy_scale']:.6f}")
-    print(f"  num atomic types: {len(meta['species_to_index'])}")
+    print(f"  num atomic types: {len(meta['atomic_types'])}")
     return params, metadata
 
 
@@ -180,8 +182,7 @@ def _extract_metadata(pet_ckpt):
     config = {k: hypers[k] for k in CONFIG_KEYS}
 
     atomic_types = list(model_data["dataset_info"].atomic_types)
-    species_to_index = {int(z): i for i, z in enumerate(atomic_types)}
-    config["num_species"] = len(atomic_types)
+    config["max_atomic_number"] = max(int(z) for z in atomic_types)
 
     state_dict = pet_ckpt["best_model_state_dict"]
 
@@ -198,7 +199,6 @@ def _extract_metadata(pet_ckpt):
     return {
         "config": config,
         "atomic_types": atomic_types,
-        "species_to_index": species_to_index,
         "energy_scale": energy_scale,
         "shifts": shifts,
     }
@@ -338,6 +338,20 @@ def _finalize_key(new_key, np_value):
         new_key = re.sub(regex, sub, new_key)
 
     return new_key, np_value
+
+
+def _scatter_species_embeddings(flat, atomic_types, n_rows):
+    """Re-index species embedding rows from metatrain's contiguous order to
+    atomic-number rows: trained row ``i`` -> row ``Z = atomic_types[i]``.
+    Untrained rows stay zero (never indexed; the calculator rejects unknown Z).
+    """
+    rows = np.asarray([int(z) for z in atomic_types])
+    for key in list(flat):
+        if key.endswith(".embedding"):
+            table = np.asarray(flat[key])
+            scattered = np.zeros((n_rows, table.shape[1]), dtype=table.dtype)
+            scattered[rows] = table
+            flat[key] = jnp.array(scattered)
 
 
 def _unflatten(flat):
