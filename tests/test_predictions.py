@@ -209,3 +209,42 @@ def test_extended_forces(extended_combo):
 def test_extended_stress(extended_combo):
     calc, ref, structures = extended_combo
     _assert_stress(calc, structures, ref)
+
+
+# -- non-conservative heads --
+
+
+def test_direct_heads_track_conservative(pet_mad_xs_checkpoint, mini_xyz):
+    """The direct (non-conservative) force/stress heads load and behave: energy
+    is unchanged, outputs are well-formed, and direct forces correlate strongly
+    with the conservative (autodiff) forces over the rattled mini set."""
+    structures = read(str(mini_xyz), index=":")
+    cons = UPETCalculator.from_checkpoint(str(pet_mad_xs_checkpoint), stress=True)
+    direct = UPETCalculator.from_checkpoint(
+        str(pet_mad_xs_checkpoint), direct_forces=True, direct_stress=True, stress=True
+    )
+
+    f_cons, f_direct = [], []
+    for i, atoms in enumerate(structures):
+        atoms = atoms.copy()
+        atoms.rattle(0.15, seed=i)  # raise force magnitudes for a clean comparison
+
+        a = atoms.copy()
+        a.calc = cons
+        e_c, fc = a.get_potential_energy(), a.get_forces()
+
+        b = atoms.copy()
+        b.calc = direct
+        e_d, fd = b.get_potential_energy(), b.get_forces()
+
+        assert np.isclose(e_c, e_d, atol=1e-4)  # direct heads don't touch energy
+        assert fd.shape == fc.shape and np.all(np.isfinite(fd))
+        if atoms.pbc.any():
+            sd = b.get_stress()
+            assert sd.shape == (6,) and np.all(np.isfinite(sd))
+
+        f_cons.append(fc.ravel())
+        f_direct.append(fd.ravel())
+
+    corr = np.corrcoef(np.concatenate(f_cons), np.concatenate(f_direct))[0, 1]
+    assert corr > 0.97, f"direct vs conservative force corr = {corr:.4f}"

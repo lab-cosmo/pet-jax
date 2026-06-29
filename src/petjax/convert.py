@@ -79,11 +79,20 @@ def convert_checkpoint(ckpt_path, output_dir):
     meta = _extract_metadata(pet_ckpt)
 
     flat = _convert_state_dict(pet_ckpt["best_model_state_dict"])
-    _scatter_species_embeddings(
-        flat, meta["atomic_types"], meta["config"]["max_atomic_number"] + 1
-    )
-    # energy_scale lives in the param tree, not metadata.
+    n_rows = meta["config"]["max_atomic_number"] + 1
+    _scatter_species_embeddings(flat, meta["atomic_types"], n_rows)
+
+    # Scales ride in the parameter tree (read via self.param in UPET), not in
+    # metadata. force_scale is per-species, scattered to Z rows like the
+    # embeddings; energy/stress scales are scalars.
+    rows = np.asarray([int(z) for z in meta["atomic_types"]])
     flat["energy_scale"] = jnp.array([meta["energy_scale"]], dtype=jnp.float32)
+    if meta["force_scale"] is not None:
+        force_scale = np.zeros(n_rows, dtype=np.float32)
+        force_scale[rows] = meta["force_scale"]
+        flat["force_scale"] = jnp.array(force_scale)
+    if meta["stress_scale"] is not None:
+        flat["stress_scale"] = jnp.array([meta["stress_scale"]], dtype=jnp.float32)
     params = _unflatten(flat)
 
     write_msgpack(output_dir / "model.msgpack", params)
@@ -189,6 +198,22 @@ def _extract_metadata(pet_ckpt):
     scaler = parse_metatensor_buffer(state_dict["scaler.energy_scaler_buffer"])
     energy_scale = float(scaler["blocks/0/values.npy"].item())
 
+    # Non-conservative scales (present only on direct-capable checkpoints).
+    # Forces: one std per trained species (aligned with ``atomic_types``).
+    # Stress: a single scalar.
+    force_scale = None
+    if "scaler.non_conservative_forces_scaler_buffer" in state_dict:
+        fbuf = parse_metatensor_buffer(
+            state_dict["scaler.non_conservative_forces_scaler_buffer"]
+        )
+        force_scale = fbuf["blocks/0/values.npy"].flatten()
+    stress_scale = None
+    if "scaler.non_conservative_stress_scaler_buffer" in state_dict:
+        sbuf = parse_metatensor_buffer(
+            state_dict["scaler.non_conservative_stress_scaler_buffer"]
+        )
+        stress_scale = float(sbuf["blocks/0/values.npy"].item())
+
     comp = parse_metatensor_buffer(
         state_dict["additive_models.0.energy_composition_buffer"]
     )
@@ -200,6 +225,8 @@ def _extract_metadata(pet_ckpt):
         "config": config,
         "atomic_types": atomic_types,
         "energy_scale": energy_scale,
+        "force_scale": force_scale,
+        "stress_scale": stress_scale,
         "shifts": shifts,
     }
 
@@ -237,21 +264,34 @@ def _convert_state_dict(state_dict):
     for key, value in state_dict.items():
         if not isinstance(value, torch.Tensor):
             continue
-        if key.startswith(_SKIP_PREFIXES) or "non_conservative" in key:
+        if key.startswith(_SKIP_PREFIXES):
             continue
 
         new_key = _rename_key(key)
         np_value = value.cpu().numpy()
         new_key, np_value = _finalize_key(new_key, np_value)
-        out[_scope_key(new_key)] = jnp.array(np_value)
+        out[_scope_key(new_key, key)] = jnp.array(np_value)
     return out
 
 
-def _scope_key(key):
-    """Nest a flat key under its module scope: ``energy_head`` for readout
-    heads, ``backbone`` for everything else."""
-    scope = "energy_head" if key.startswith(_HEAD_PREFIXES) else "backbone"
-    return f"{scope}.{key}"
+# Readout target name (in the source key) -> Flax head-module scope.
+_HEAD_SCOPES = (
+    ("non_conservative_forces", "forces_head"),
+    ("non_conservative_stress", "stress_head"),
+    ("energy", "energy_head"),
+)
+
+
+def _scope_key(key, orig_key):
+    """Nest a flat key under its module scope: a per-target head module for
+    readout heads (``energy_head`` / ``forces_head`` / ``stress_head``),
+    ``backbone`` for everything else."""
+    if not key.startswith(_HEAD_PREFIXES):
+        return f"backbone.{key}"
+    for tag, scope in _HEAD_SCOPES:
+        if f".{tag}." in orig_key:
+            return f"{scope}.{key}"
+    return f"energy_head.{key}"
 
 
 def _rename_key(key):
@@ -279,22 +319,15 @@ def _rename_key(key):
     new_key = new_key.replace(".center_mlp.w_out.", ".center_mlp_out.")
 
     if new_key.endswith((".weight", ".bias")):
-        for prefix, replacement in (
-            ("node_heads.energy.", "node_heads_"),
-            ("edge_heads.energy.", "edge_heads_"),
-        ):
-            if new_key.startswith(prefix):
-                parts = new_key.split(".")
-                new_key = f"{replacement}{parts[2]}.{'.'.join(parts[3:])}"
-                break
-        for prefix, replacement in (
-            ("node_last_layers.energy.", "node_last_"),
-            ("edge_last_layers.energy.", "edge_last_"),
-        ):
-            if new_key.startswith(prefix):
-                parts = new_key.split(".")
-                new_key = f"{replacement}{parts[2]}.{'.'.join(parts[4:])}"
-                break
+        parts = new_key.split(".")
+        # Readout heads, any target name (energy / non_conservative_forces / ...):
+        #   <head>.<target>.<readout>.<dense>.<w|b> -> <head>_<readout>.<dense>.<w|b>
+        if parts[0] in ("node_heads", "edge_heads"):
+            new_key = f"{parts[0]}_{parts[2]}." + ".".join(parts[3:])
+        #   <head>_layers.<target>.<readout>.<target>___0.<w|b> -> <short>_<readout>.<w|b>
+        elif parts[0] in ("node_last_layers", "edge_last_layers"):
+            short = parts[0].replace("_layers", "")
+            new_key = f"{short}_{parts[2]}." + ".".join(parts[4:])
 
     return new_key
 

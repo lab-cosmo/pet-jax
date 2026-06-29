@@ -120,6 +120,7 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 - **Stress** returned by the calculator is in ASE's Voigt convention (eV/Å³); internally the virial is the strain derivative `dU/dε` in eV.
 - **Scaling/shifting**: raw model output is multiplied by `energy_scale` inside JIT (at params dtype). Per-element composition shifts are added post-JIT on the calculator side in Python fp64; they contribute zero to forces.
 - **Adaptive cutoff**: per-atom, recomputed inside the autograd graph each step (required for force correctness).
+- **Non-conservative forces/stress**: PET-MAD checkpoints also carry direct force/stress heads. Pass `direct_forces=True` / `direct_stress=True` to `from_checkpoint` to read forces/stress straight from those heads (skipping autodiff — cheaper, no double-backward) instead of differentiating the energy. The default stays conservative (autodiff). Direct stress reproduces the reference exactly; direct forces track it closely but, as a per-atom readout, are not bit-exact (the conservative path is).
 
 ## Checkpoint format
 
