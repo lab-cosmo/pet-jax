@@ -160,6 +160,11 @@ class UPETCalculator(BaseCalculator):
         if self._add_offset:
             energy += self._shift_offset
         forces = np.array(results["forces"][:n_real], dtype=np.float64)
+        if self._model.direct_forces:
+            # Non-conservative forces: subtract the per-structure mean to remove
+            # the spurious net force the direct head leaves (matching metatrain's
+            # calculator). Inference-only — predict stays raw for training.
+            forces = forces - forces.mean(axis=0)
 
         self.results = {"energy": energy, "forces": forces}
 
