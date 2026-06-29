@@ -239,6 +239,7 @@ def test_direct_heads_track_conservative(pet_mad_xs_checkpoint, mini_xyz):
 
         assert np.isclose(e_c, e_d, atol=1e-4)  # direct heads don't touch energy
         assert fd.shape == fc.shape and np.all(np.isfinite(fd))
+        assert np.abs(fd.sum(axis=0)).max() < 1e-3  # net force removed (no drift)
         if atoms.pbc.any():
             sd = b.get_stress()
             assert sd.shape == (6,) and np.all(np.isfinite(sd))

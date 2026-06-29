@@ -130,7 +130,12 @@ def _select_and_predict(
     if isinstance(out, dict):
         energy = jnp.sum(out["energy"])
         if "forces" in out:
-            aux["forces"] = out["forces"]
+            # Remove the spurious net force: the direct head's raw per-atom
+            # predictions don't sum to zero, so subtract the per-structure mean
+            # (matching metatrain's calculator). Conservative forces already do.
+            f = out["forces"]
+            mask = truncated["atom_mask"][:, None]
+            aux["forces"] = (f - (f * mask).sum(0) / mask.sum()) * mask
         if "stress" in out:
             aux["stress"] = jnp.sum(out["stress"], axis=0)
         return energy, aux
