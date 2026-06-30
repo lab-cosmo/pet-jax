@@ -30,7 +30,7 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     ``model.num_neighbors_adaptive`` but can be overridden by the caller — the
     value is closured into the forward, so the k_sel sizing on the calculator
     side must be passed the same value. Energy returned already includes the
-    energy scale (a loaded parameter); composition shifts are the caller's
+    energy scale; composition shifts are the caller's
     responsibility (applied post-JIT in fp64 by ``UPETCalculator``). See
     ``_select_and_predict`` for ``no_shadow``.
     """
@@ -108,7 +108,7 @@ def _select_and_predict(
     post-JIT by the caller in fp64. ``no_shadow=True`` cuts gradients through
     the adaptive-cutoff function while leaving its values in the forward pass.
 
-    The model's per-atom output is already scaled by the energy-scale parameter
+    The model's per-atom output is already scaled by the energy scale
     and masked by ``atom_mask`` — we just sum.
     """
     if epsilon is not None:

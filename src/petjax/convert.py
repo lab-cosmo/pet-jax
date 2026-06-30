@@ -10,7 +10,7 @@ Hugging Face (``lab-cosmo/upet``):
 Other versions fail hard — use ``mtt upgrade`` or fetch a newer release.
 
 Writes:
-    {output_dir}/model.msgpack    -- Flax parameter tree (incl. energy_scale)
+    {output_dir}/model.msgpack    -- Flax parameter tree
     {output_dir}/metadata.yaml    -- config, shifts, species_to_index
 """
 
@@ -79,8 +79,7 @@ def convert_checkpoint(ckpt_path, output_dir):
     meta = _extract_metadata(pet_ckpt)
 
     flat = _convert_state_dict(pet_ckpt["best_model_state_dict"])
-    # Energy scale rides in the parameter tree (read via self.param in UPET),
-    # not in metadata.
+    # energy_scale lives in the param tree, not metadata.
     flat["energy_scale"] = jnp.array([meta["energy_scale"]], dtype=jnp.float32)
     params = _unflatten(flat)
 

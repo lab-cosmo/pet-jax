@@ -63,7 +63,6 @@ class UPET(nn.Module):
             node, edge, cutoffs, pair_mask, atom_mask
         )
 
-        # Energy scale: a loaded parameter, applied in params dtype.
         energy_scale = self.param("energy_scale", nn.initializers.ones, (1,))
         return predictions * atom_mask * energy_scale
 

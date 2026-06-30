@@ -118,7 +118,7 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 
 - **Energy** is total energy (eV), not per-atom.
 - **Stress** returned by the calculator is in ASE's Voigt convention (eV/Å³); internally the virial is the strain derivative `dU/dε` in eV.
-- **Scaling/shifting**: raw model output is multiplied by `energy_scale` inside JIT (at params dtype); the scale is a parameter in `model.msgpack`. Per-element composition shifts are added post-JIT on the calculator side in Python fp64; they contribute zero to forces and live in `metadata.yaml`.
+- **Scaling/shifting**: raw model output is multiplied by `energy_scale` inside JIT (at params dtype). Per-element composition shifts are added post-JIT on the calculator side in Python fp64; they contribute zero to forces.
 - **Adaptive cutoff**: per-atom, recomputed inside the autograd graph each step (required for force correctness).
 
 ## Checkpoint format
@@ -127,7 +127,7 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 
 ```
 <ckpt_dir>/
-  model.msgpack    # Flax parameter tree (nested dict of arrays), incl. energy_scale
+  model.msgpack    # Flax parameter tree (nested dict of arrays)
   metadata.yaml    # config (architecture hypers), shifts, species_to_index
 ```
 
