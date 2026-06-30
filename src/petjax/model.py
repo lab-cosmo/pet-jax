@@ -71,10 +71,8 @@ class UPET(nn.Module):
         if not (self.direct_forces or self.direct_stress):
             return energy
 
-        # Non-conservative heads: direct per-atom force/stress readouts, each
-        # un-normalized by its own loaded scale (forces: per-species, indexed
-        # by Z; stress: scalar). The predict/calculator side sums stress over
-        # atoms and divides by volume; forces stay per-atom.
+        # Non-conservative heads: raw per-atom force/stress, scaled by their
+        # loaded scales (forces per-species by Z; stress scalar).
         out = {"energy": energy}
         if self.direct_forces:
             forces = DirectForces(d_head=self.d_head, name="forces_head")(
@@ -243,9 +241,7 @@ class Energy(nn.Module):
 
 class DirectForces(nn.Module):
     """Non-conservative force readout: node + cutoff-weighted edge
-    contributions -> per-atom ``[N, 3]``. Mirrors ``Energy`` with a 3-vector
-    head; the per-species scale is applied by the caller (``UPET``).
-    """
+    contributions -> per-atom ``[N, 3]``. Scale applied by ``UPET``."""
 
     d_head: int = 128
 
@@ -269,10 +265,8 @@ class DirectForces(nn.Module):
 
 
 class DirectStress(nn.Module):
-    """Non-conservative stress readout: per-atom rank-2 Cartesian tensor
-    ``[N, 3, 3]``, symmetrized (metatrain convention). The scalar scale, sum
-    over atoms, and division by volume happen on the predict/calculator side.
-    """
+    """Non-conservative stress readout: per-atom symmetrized ``[N, 3, 3]``.
+    Scale, sum over atoms, and volume division happen downstream."""
 
     d_head: int = 128
 

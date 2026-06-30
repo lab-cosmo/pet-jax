@@ -82,9 +82,8 @@ def convert_checkpoint(ckpt_path, output_dir):
     n_rows = meta["config"]["max_atomic_number"] + 1
     _scatter_species_embeddings(flat, meta["atomic_types"], n_rows)
 
-    # Scales ride in the parameter tree (read via self.param in UPET), not in
-    # metadata. force_scale is per-species, scattered to Z rows like the
-    # embeddings; energy/stress scales are scalars.
+    # Scales live in the parameter tree, not metadata. force_scale is
+    # per-species (scattered to Z rows); energy/stress scales are scalars.
     rows = np.asarray([int(z) for z in meta["atomic_types"]])
     flat["energy_scale"] = jnp.array([meta["energy_scale"]], dtype=jnp.float32)
     if meta["force_scale"] is not None:
@@ -198,9 +197,8 @@ def _extract_metadata(pet_ckpt):
     scaler = parse_metatensor_buffer(state_dict["scaler.energy_scaler_buffer"])
     energy_scale = float(scaler["blocks/0/values.npy"].item())
 
-    # Non-conservative scales (present only on direct-capable checkpoints).
-    # Forces: one std per trained species (aligned with ``atomic_types``).
-    # Stress: a single scalar.
+    # Non-conservative scales (direct-capable checkpoints only): force is one
+    # std per trained species, stress a scalar.
     force_scale = None
     if "scaler.non_conservative_forces_scaler_buffer" in state_dict:
         fbuf = parse_metatensor_buffer(

@@ -130,9 +130,7 @@ def _select_and_predict(
     if isinstance(out, dict):
         energy = jnp.sum(out["energy"])
         if "forces" in out:
-            # Raw per-atom head output (does not sum to zero); the net-force
-            # (drift) removal is an inference-only correction applied calculator
-            # -side, so predict stays faithful for a training value_and_grad.
+            # Raw per-atom output; net-force removal is applied calculator-side.
             aux["forces"] = out["forces"]
         if "stress" in out:
             aux["stress"] = jnp.sum(out["stress"], axis=0)
