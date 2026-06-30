@@ -12,8 +12,9 @@ from .utils import cutoff_bump, safe_norm
 class UPET(nn.Module):
     """UPET: Point-Edge Transformer for interatomic potentials.
 
-    Hardcoded architecture choices from PET-MAD v1.5.0+:
-    RMSNorm, SwiGLU, PreLN, feedforward featurizer.
+    A `Backbone` (node/edge features) followed by an `Energy` (readout).
+    Hardcoded architecture choices from PET-MAD v1.5.0+: RMSNorm, SwiGLU,
+    PreLN, feedforward featurizer.
     """
 
     d_pet: int = 128
@@ -45,6 +46,57 @@ class UPET(nn.Module):
         atom_mask,
         pair_cutoffs=None,
     ):
+        node, edge, cutoffs = Backbone(
+            d_pet=self.d_pet,
+            d_node=self.d_node,
+            d_feedforward=self.d_feedforward,
+            num_heads=self.num_heads,
+            num_attention_layers=self.num_attention_layers,
+            num_gnn_layers=self.num_gnn_layers,
+            cutoff=self.cutoff,
+            cutoff_width=self.cutoff_width,
+            num_species=self.num_species,
+            attention_temperature=self.attention_temperature,
+            name="backbone",
+        )(R_ij, centers, neighbors, species, reverse, pair_mask, atom_mask, pair_cutoffs)
+
+        predictions = Energy(d_head=self.d_head, name="energy_head")(
+            node, edge, cutoffs, pair_mask, atom_mask
+        )
+
+        return predictions * atom_mask * self.energy_scale
+
+
+class Backbone(nn.Module):
+    """PET core: embeddings + GNN/transformer layers -> (node, edge, cutoffs).
+
+    Returns per-atom node features `[N, d_node]`, per-pair edge features
+    (messages) `[P, d_pet]`, and per-pair cutoff factors `[P]`.
+    """
+
+    d_pet: int = 128
+    d_node: int = 512
+    d_feedforward: int = 256
+    num_heads: int = 8
+    num_attention_layers: int = 1
+    num_gnn_layers: int = 2
+    cutoff: float = 7.5
+    cutoff_width: float = 0.5
+    num_species: int = 103
+    attention_temperature: float = 1.0
+
+    @nn.compact
+    def __call__(
+        self,
+        R_ij,
+        centers,
+        neighbors,
+        species,
+        reverse,
+        pair_mask,
+        atom_mask,
+        pair_cutoffs=None,
+    ):
         d_pet = self.d_pet
         d_node = self.d_node
         P = R_ij.shape[0]
@@ -53,8 +105,8 @@ class UPET(nn.Module):
 
         r_ij = safe_norm(R_ij, axis=-1)
 
-        # Per-edge cutoff factor (used at readout below, and at attention
-        # after prepending the central-token slot)
+        # Per-edge cutoff factor (used at readout, and at attention after
+        # prepending the central-token slot)
         cutoff = pair_cutoffs if pair_cutoffs is not None else self.cutoff
         cutoffs = cutoff_bump(r_ij, cutoff, self.cutoff_width) * pair_mask
 
@@ -119,7 +171,7 @@ class UPET(nn.Module):
                     name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
                 )(node, edge, cutoffs_tokens, mask)
 
-            # Message passing (feedforward)
+            # Message passing (feedforward mixing)
             edge_flat = edge.reshape(P, d_pet)
             reversed_flat = edge_flat[reverse]
             combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
@@ -128,32 +180,38 @@ class UPET(nn.Module):
             combined = combined * pair_mask[..., None]
             messages = messages + edge_flat + combined
 
-        edge_for_readout = messages.reshape(N, n, d_pet)
+        node = node[:, 0, :] * atom_mask[:, None]
+        return node, messages, cutoffs
+
+
+class Energy(nn.Module):
+    """Energy readout: node + cutoff-weighted edge contributions -> per-atom E.
+
+    Single readout of final features, following current uPET hypers.
+    """
+
+    d_head: int = 128
+
+    @nn.compact
+    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask):
+        N = node.shape[0]
+        n = edge.shape[0] // N
 
         # Node head
         node_h = masked(
-            MLP2(self.d_head, self.d_head, name="node_heads_0"),
-            node[:, 0, :],
-            atom_mask,
+            MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask
         )
-        node_out = masked(nn.Dense(1, name="node_last_0"), node_h, atom_mask)[:, 0]
+        node_contrib = masked(nn.Dense(1, name="node_last_0"), node_h, atom_mask)[:, 0]
 
         # Edge head
         edge_h = masked(
-            MLP2(self.d_head, self.d_head, name="edge_heads_0"),
-            edge_for_readout.reshape(P, d_pet),
-            pair_mask,
+            MLP2(self.d_head, self.d_head, name="edge_heads_0"), edge, pair_mask
         )
         edge_out = masked(nn.Dense(1, name="edge_last_0"), edge_h, pair_mask)[:, 0]
 
         # Weighted edge sum per atom
         edge_contrib = (edge_out * cutoffs).reshape(N, n).sum(axis=1)
-
-        # Single readout: num_readout_layers == 1 (feedforward; see convert.py),
-        # not a sum over per-layer heads.
-        predictions = node_out + edge_contrib
-
-        return predictions * atom_mask * self.energy_scale
+        return node_contrib + edge_contrib
 
 
 # -- transformer block --
@@ -242,7 +300,7 @@ class Attention(nn.Module):
         return nn.Dense(F, name="out")(out)
 
 
-# -- small helpers --
+# -- building blocks --
 
 
 class MLP(nn.Module):
