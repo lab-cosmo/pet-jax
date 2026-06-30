@@ -92,7 +92,6 @@ class UPETCalculator(BaseCalculator):
         self._cutoff = (
             cutoff_override if cutoff_override is not None else metadata["config"]["cutoff"]
         )
-        self._species_to_index = metadata["species_to_index"]
 
         if default_dtype == "float64":
             jax.config.update("jax_enable_x64", True)
@@ -204,7 +203,6 @@ class UPETCalculator(BaseCalculator):
         structure = to_structure(
             atoms,
             self._cutoff,
-            self._species_to_index,
             skin=self._skin,
             bucket_strategy=self._bucket_strategy,
             n_atoms_bucket_strategy=self._n_atoms_bucket_strategy,
@@ -255,8 +253,18 @@ class UPETCalculator(BaseCalculator):
         self._nl_cache.save_reference(atoms, max_cell_shift=max_shift)
 
         # Composition shifts are constant w.r.t. positions; Python fp64 sum
-        # added post-JIT. Species can only change via a rebuild, so here.
-        self._shift_offset = sum(self._shifts[int(z)] for z in atoms.get_atomic_numbers())
+        # added post-JIT. Species can only change via a rebuild, so here. The
+        # KeyError doubles as the guard for untrained elements — this runs before
+        # the forward, where an out-of-range Z embedding would clamp silently.
+        try:
+            self._shift_offset = sum(
+                self._shifts[int(z)] for z in atoms.get_atomic_numbers()
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"UPETCalculator: structure contains atomic number {exc.args[0]}, "
+                f"which the model was not trained on."
+            ) from exc
 
         self._record_debug(
             atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
