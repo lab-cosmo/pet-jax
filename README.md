@@ -128,7 +128,7 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 ```
 <ckpt_dir>/
   model.msgpack    # Flax parameter tree (nested dict of arrays)
-  metadata.yaml    # config (architecture hypers, incl. max_atomic_number), shifts
+  metadata.yaml    # config (architecture hypers), shifts
 ```
 
 Use `UPETCalculator.from_checkpoint("<ckpt_dir>")` to load. Conversion from the upstream `metatrain` `.ckpt` format goes through `petjax-convert`, which reads the LLPR-wrapped PET-MAD checkpoint directly (no TorchScript intermediate). Checkpoint format is pinned to PET-MAD v1.5.0 (outer `llpr` v3 / inner `pet` v11); other versions are rejected — run `mtt upgrade` on the source to migrate.

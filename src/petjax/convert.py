@@ -11,7 +11,7 @@ Other versions fail hard — use ``mtt upgrade`` or fetch a newer release.
 
 Writes:
     {output_dir}/model.msgpack    -- Flax parameter tree
-    {output_dir}/metadata.yaml    -- config (incl. max_atomic_number), shifts
+    {output_dir}/metadata.yaml    -- config, shifts
 """
 
 import numpy as np

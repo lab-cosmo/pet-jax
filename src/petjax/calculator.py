@@ -116,9 +116,6 @@ class UPETCalculator(BaseCalculator):
         self._shift_offset = 0.0
 
         self._shifts = {int(z): float(v) for z, v in metadata["shifts"].items()}
-        # Embeddings index by Z and JAX gather clamps out-of-range silently, so
-        # unsupported species must be rejected explicitly (shifts cover all).
-        self._valid_species = set(self._shifts)
 
         if not stress:
             self.implemented_properties = ["energy", "forces"]
@@ -203,14 +200,6 @@ class UPETCalculator(BaseCalculator):
         ``overflow=True`` and ``calculate`` retries here with
         ``force_recompute_k_sel=True``.
         """
-        unknown = sorted(
-            {int(z) for z in atoms.get_atomic_numbers()} - self._valid_species
-        )
-        if unknown:
-            raise ValueError(
-                f"UPETCalculator: structure has atomic numbers {unknown} the model "
-                f"was not trained on (known: {sorted(self._valid_species)})."
-            )
         structure = to_structure(
             atoms,
             self._cutoff,
@@ -264,8 +253,18 @@ class UPETCalculator(BaseCalculator):
         self._nl_cache.save_reference(atoms, max_cell_shift=max_shift)
 
         # Composition shifts are constant w.r.t. positions; Python fp64 sum
-        # added post-JIT. Species can only change via a rebuild, so here.
-        self._shift_offset = sum(self._shifts[int(z)] for z in atoms.get_atomic_numbers())
+        # added post-JIT. Species can only change via a rebuild, so here. The
+        # KeyError doubles as the guard for untrained elements — this runs before
+        # the forward, where an out-of-range Z embedding would clamp silently.
+        try:
+            self._shift_offset = sum(
+                self._shifts[int(z)] for z in atoms.get_atomic_numbers()
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"UPETCalculator: structure contains atomic number {exc.args[0]}, "
+                f"which the model was not trained on."
+            ) from exc
 
         self._record_debug(
             atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
