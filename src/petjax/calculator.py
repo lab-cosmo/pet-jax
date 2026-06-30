@@ -127,7 +127,7 @@ class UPETCalculator(BaseCalculator):
         from .model import UPET
 
         params, metadata = load_checkpoint(folder)
-        model = UPET(**metadata["config"], energy_scale=metadata["energy_scale"])
+        model = UPET(**metadata["config"])
         return cls(model, params, metadata, **kwargs)
 
     def calculate(self, atoms=None, properties=None, system_changes=None, **kwargs):

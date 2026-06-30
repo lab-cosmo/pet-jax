@@ -20,7 +20,7 @@ from petjax.structure import to_structure
 def model_data(pet_mad_xs_checkpoint):
     params, metadata = load_checkpoint(pet_mad_xs_checkpoint)
     config = metadata["config"]
-    model = UPET(**config, energy_scale=metadata["energy_scale"])
+    model = UPET(**config)
     return model, params, metadata
 
 

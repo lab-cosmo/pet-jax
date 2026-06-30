@@ -29,7 +29,6 @@ class UPET(nn.Module):
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
     num_species: int = 103
-    energy_scale: float = 1.0
 
     def get_probes(self):
         return jnp.arange(0.5, self.cutoff, self.cutoff_width / 4)
@@ -64,7 +63,8 @@ class UPET(nn.Module):
             node, edge, cutoffs, pair_mask, atom_mask
         )
 
-        return predictions * atom_mask * self.energy_scale
+        energy_scale = self.param("energy_scale", nn.initializers.ones, (1,))
+        return predictions * atom_mask * energy_scale
 
 
 class Backbone(nn.Module):

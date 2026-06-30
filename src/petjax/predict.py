@@ -25,12 +25,12 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     so the same closure serves any params and a training-side
     ``value_and_grad(loss, argnums=0)(params, batch)`` works without rebuild.
 
-    The model carries its own metadata: ``cutoff_width`` and ``energy_scale``
-    are read off ``model``. ``num_neighbors_adaptive`` (the per-atom selection
-    target) defaults to ``model.num_neighbors_adaptive`` but can be overridden
-    by the caller — the value is closured into the forward, so the k_sel sizing
-    on the calculator side must be passed the same value. Energy returned
-    already includes ``model.energy_scale``; composition shifts are the caller's
+    The model carries its own metadata: ``cutoff_width`` is read off ``model``.
+    ``num_neighbors_adaptive`` (the per-atom selection target) defaults to
+    ``model.num_neighbors_adaptive`` but can be overridden by the caller — the
+    value is closured into the forward, so the k_sel sizing on the calculator
+    side must be passed the same value. Energy returned already includes the
+    energy scale; composition shifts are the caller's
     responsibility (applied post-JIT in fp64 by ``UPETCalculator``). See
     ``_select_and_predict`` for ``no_shadow``.
     """
@@ -108,7 +108,7 @@ def _select_and_predict(
     post-JIT by the caller in fp64. ``no_shadow=True`` cuts gradients through
     the adaptive-cutoff function while leaving its values in the forward pass.
 
-    The model's per-atom output is already scaled by ``model.energy_scale``
+    The model's per-atom output is already scaled by the energy scale
     and masked by ``atom_mask`` — we just sum.
     """
     if epsilon is not None:
