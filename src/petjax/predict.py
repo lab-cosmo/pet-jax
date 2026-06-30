@@ -3,10 +3,11 @@
 Given a structure dict, ``get_predict_fn`` returns a JIT'd ``predict_fn(
 params, structure) -> {energy, forces, stress, overflow}`` — the only
 ``@jax.jit`` site in this module. ``params`` is a runtime argument, not
-closured; forces are read off ``grad["positions"]``; stress comes from
-differentiating w.r.t. the strain argument. The same closure serves any
-params, and the training form ``value_and_grad(loss, argnums=0)(params,
-batch)`` comes for free.
+closured. Forces/stress come from autodiff of the energy (forces off
+``grad["positions"]``, stress off the strain argument), or straight from the
+model's non-conservative heads when enabled — autodiff is skipped for
+whichever output a head serves. The training form ``value_and_grad(loss,
+argnums=0)(params, batch)`` comes for free.
 """
 
 import jax
@@ -39,6 +40,12 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
         num_neighbors_adaptive = model.num_neighbors_adaptive
     cutoff_width = model.cutoff_width
 
+    # Which outputs need autodiff vs. come straight from a non-conservative head.
+    direct_forces = bool(model.direct_forces)
+    direct_stress = bool(model.direct_stress) and stress
+    ad_forces = not direct_forces  # forces via d/d positions
+    ad_stress = stress and not direct_stress  # stress via d/d strain
+
     def energy_fn(params, structure, epsilon=None):
         return _select_and_predict(
             model,
@@ -51,40 +58,39 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
             no_shadow=no_shadow,
         )
 
-    if stress:
+    def strained_energy_fn(p, s, eps):
+        return energy_fn(p, s, epsilon=eps)
 
-        @jax.jit
-        def predict_fn(params, structure):
-            def e_fn(p, s, eps):
-                return energy_fn(p, s, epsilon=eps)
-
-            (energy, overflow), (grad_structure, virial) = jax.value_and_grad(
-                e_fn, argnums=(1, 2), has_aux=True, allow_int=True
+    @jax.jit
+    def predict_fn(params, structure):
+        atom_mask = structure["atom_mask"][..., None]
+        if ad_forces and ad_stress:
+            (energy, aux), (grad_structure, virial) = jax.value_and_grad(
+                strained_energy_fn, argnums=(1, 2), has_aux=True, allow_int=True
             )(params, structure, jnp.zeros((3, 3)))
-            forces = -grad_structure["positions"] * structure["atom_mask"][..., None]
-            return {
-                "energy": energy,
-                "forces": forces,
-                "stress": virial,
-                "overflow": overflow,
-            }
-
-    else:
-
-        @jax.jit
-        def predict_fn(params, structure):
-            def e_fn(p, s):
-                return energy_fn(p, s)
-
-            (energy, overflow), grad_structure = jax.value_and_grad(
-                e_fn, argnums=1, has_aux=True, allow_int=True
+            forces = -grad_structure["positions"] * atom_mask
+            stress_out = virial
+        elif ad_forces:  # AD forces; direct (or no) stress
+            (energy, aux), grad_structure = jax.value_and_grad(
+                energy_fn, argnums=1, has_aux=True, allow_int=True
             )(params, structure)
-            forces = -grad_structure["positions"] * structure["atom_mask"][..., None]
-            return {
-                "energy": energy,
-                "forces": forces,
-                "overflow": overflow,
-            }
+            forces = -grad_structure["positions"] * atom_mask
+            stress_out = aux.get("stress")
+        elif ad_stress:  # direct forces; AD stress
+            (energy, aux), virial = jax.value_and_grad(
+                strained_energy_fn, argnums=2, has_aux=True, allow_int=True
+            )(params, structure, jnp.zeros((3, 3)))
+            forces = aux["forces"]
+            stress_out = virial
+        else:  # both direct — no autodiff
+            energy, aux = energy_fn(params, structure)
+            forces = aux["forces"]
+            stress_out = aux.get("stress")
+
+        result = {"energy": energy, "forces": forces, "overflow": aux["overflow"]}
+        if stress:
+            result["stress"] = stress_out
+        return result
 
     return predict_fn
 
@@ -102,13 +108,15 @@ def _select_and_predict(
     epsilon=None,
     no_shadow=False,
 ):
-    """Thin: (optional) strain → truncate → model → sum.
+    """Thin: (optional) strain → truncate → model → (energy, aux).
 
-    Returns ``(total_energy, overflow)``; composition shifts are applied
+    Returns ``(total_energy, aux)`` where ``aux`` always carries ``overflow``
+    and, for a direct-head model, the per-call ``forces`` (``[N, 3]``) and
+    ``stress`` (``[3, 3]``, summed over atoms). Composition shifts are applied
     post-JIT by the caller in fp64. ``no_shadow=True`` cuts gradients through
     the adaptive-cutoff function while leaving its values in the forward pass.
 
-    The model's per-atom output is already scaled by the energy scale
+    The model's per-atom outputs are already scaled
     and masked by ``atom_mask`` — we just sum.
     """
     if epsilon is not None:
@@ -117,8 +125,17 @@ def _select_and_predict(
     truncated, overflow = truncate(
         structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=no_shadow
     )
-    per_atom = model.apply(params, **truncated)
-    return jnp.sum(per_atom), overflow
+    out = model.apply(params, **truncated)
+    aux = {"overflow": overflow}
+    if isinstance(out, dict):
+        energy = jnp.sum(out["energy"])
+        if "forces" in out:
+            # Raw per-atom output; net-force removal is applied calculator-side.
+            aux["forces"] = out["forces"]
+        if "stress" in out:
+            aux["stress"] = jnp.sum(out["stress"], axis=0)
+        return energy, aux
+    return jnp.sum(out), aux
 
 
 def apply_strain(structure, epsilon):

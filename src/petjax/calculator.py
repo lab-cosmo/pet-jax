@@ -121,12 +121,16 @@ class UPETCalculator(BaseCalculator):
             self.implemented_properties = ["energy", "forces"]
 
     @classmethod
-    def from_checkpoint(cls, folder, **kwargs):
+    def from_checkpoint(cls, folder, direct_forces=False, direct_stress=False, **kwargs):
         from .convert import load_checkpoint
         from .model import UPET
 
         params, metadata = load_checkpoint(folder)
-        model = UPET(**metadata["config"])
+        model = UPET(
+            **metadata["config"],
+            direct_forces=direct_forces,
+            direct_stress=direct_stress,
+        )
         return cls(model, params, metadata, **kwargs)
 
     def calculate(self, atoms=None, properties=None, system_changes=None, **kwargs):
@@ -156,6 +160,9 @@ class UPETCalculator(BaseCalculator):
         if self._add_offset:
             energy += self._shift_offset
         forces = np.array(results["forces"][:n_real], dtype=np.float64)
+        if self._model.direct_forces:
+            # Direct forces: remove the spurious net force (per-structure mean).
+            forces = forces - forces.mean(axis=0)
 
         self.results = {"energy": energy, "forces": forces}
 

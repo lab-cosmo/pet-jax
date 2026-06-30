@@ -66,6 +66,14 @@ def mini_predictions_xs():
 
 
 @pytest.fixture(scope="session")
+def mini_predictions_xs_direct():
+    path = ASSETS / "predictions" / "test_mini_pet-mad-xs_direct.xyz"
+    if not path.exists():
+        pytest.skip("mini direct reference predictions missing (git-lfs pull?)")
+    return path
+
+
+@pytest.fixture(scope="session")
 def pet_mad_xs_checkpoint():
     path = ASSETS / "checkpoints" / "pet-mad-xs"
     if not (path / "model.msgpack").exists():

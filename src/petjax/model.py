@@ -29,6 +29,8 @@ class UPET(nn.Module):
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
     max_atomic_number: int = 118
+    direct_forces: bool = False
+    direct_stress: bool = False
 
     def get_probes(self):
         return jnp.arange(0.5, self.cutoff, self.cutoff_width / 4)
@@ -64,7 +66,29 @@ class UPET(nn.Module):
         )
 
         energy_scale = self.param("energy_scale", nn.initializers.ones, (1,))
-        return predictions * atom_mask * energy_scale
+        energy = predictions * atom_mask * energy_scale
+
+        if not (self.direct_forces or self.direct_stress):
+            return energy
+
+        # Non-conservative heads: raw per-atom force/stress, scaled by their
+        # loaded scales (forces per-species by Z; stress scalar).
+        out = {"energy": energy}
+        if self.direct_forces:
+            forces = DirectForces(d_head=self.d_head, name="forces_head")(
+                node, edge, cutoffs, pair_mask, atom_mask
+            )
+            force_scale = self.param(
+                "force_scale", nn.initializers.ones, (self.max_atomic_number + 1,)
+            )
+            out["forces"] = forces * force_scale[species][:, None] * atom_mask[:, None]
+        if self.direct_stress:
+            stress = DirectStress(d_head=self.d_head, name="stress_head")(
+                node, edge, cutoffs, pair_mask, atom_mask
+            )
+            stress_scale = self.param("stress_scale", nn.initializers.ones, (1,))
+            out["stress"] = stress * stress_scale * atom_mask[:, None, None]
+        return out
 
 
 class Backbone(nn.Module):
@@ -213,6 +237,57 @@ class Energy(nn.Module):
         # Weighted edge sum per atom
         edge_contrib = (edge_out * cutoffs).reshape(N, n).sum(axis=1)
         return node_contrib + edge_contrib
+
+
+class DirectForces(nn.Module):
+    """Non-conservative force readout: node + cutoff-weighted edge
+    contributions -> per-atom ``[N, 3]``. Scale applied by ``UPET``."""
+
+    d_head: int = 128
+
+    @nn.compact
+    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask):
+        N = node.shape[0]
+        n = edge.shape[0] // N
+
+        node_h = masked(
+            MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask
+        )
+        node_out = masked(nn.Dense(3, name="node_last_0"), node_h, atom_mask)
+
+        edge_h = masked(
+            MLP2(self.d_head, self.d_head, name="edge_heads_0"), edge, pair_mask
+        )
+        edge_out = masked(nn.Dense(3, name="edge_last_0"), edge_h, pair_mask)
+
+        edge_contrib = (edge_out * cutoffs[:, None]).reshape(N, n, 3).sum(axis=1)
+        return node_out + edge_contrib
+
+
+class DirectStress(nn.Module):
+    """Non-conservative stress readout: per-atom symmetrized ``[N, 3, 3]``.
+    Scale, sum over atoms, and volume division happen downstream."""
+
+    d_head: int = 128
+
+    @nn.compact
+    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask):
+        N = node.shape[0]
+        n = edge.shape[0] // N
+
+        node_h = masked(
+            MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask
+        )
+        node_out = masked(nn.Dense(9, name="node_last_0"), node_h, atom_mask)
+
+        edge_h = masked(
+            MLP2(self.d_head, self.d_head, name="edge_heads_0"), edge, pair_mask
+        )
+        edge_out = masked(nn.Dense(9, name="edge_last_0"), edge_h, pair_mask)
+
+        edge_contrib = (edge_out * cutoffs[:, None]).reshape(N, n, 9).sum(axis=1)
+        per_atom = (node_out + edge_contrib).reshape(N, 3, 3)
+        return 0.5 * (per_atom + jnp.swapaxes(per_atom, 1, 2))
 
 
 # -- transformer block --

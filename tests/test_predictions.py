@@ -209,3 +209,31 @@ def test_extended_forces(extended_combo):
 def test_extended_stress(extended_combo):
     calc, ref, structures = extended_combo
     _assert_stress(calc, structures, ref)
+
+
+# -- non-conservative heads --
+
+
+@pytest.fixture(scope="module")
+def direct_calc(pet_mad_xs_checkpoint):
+    return UPETCalculator.from_checkpoint(
+        str(pet_mad_xs_checkpoint), direct_forces=True, direct_stress=True, stress=True
+    )
+
+
+def test_mini_direct_energy(direct_calc, mini_xyz, mini_predictions_xs_direct):
+    structures = read(str(mini_xyz), index=":")
+    ref = load_reference(mini_predictions_xs_direct)
+    _assert_energies(direct_calc, structures, ref)
+
+
+def test_mini_direct_forces(direct_calc, mini_xyz, mini_predictions_xs_direct):
+    structures = read(str(mini_xyz), index=":")
+    ref = load_reference(mini_predictions_xs_direct)
+    _assert_forces(direct_calc, structures, ref)
+
+
+def test_mini_direct_stress(direct_calc, mini_xyz, mini_predictions_xs_direct):
+    structures = read(str(mini_xyz), index=":")
+    ref = load_reference(mini_predictions_xs_direct)
+    _assert_stress(direct_calc, structures, ref)
