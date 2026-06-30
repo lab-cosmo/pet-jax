@@ -34,6 +34,7 @@ class UPETCalculator(BaseCalculator):
         skin=0.5,
         stress=True,
         default_dtype="float32",
+        matmul_precision="high",
         no_shadow=False,
         bucket_strategy="multiples",
         n_atoms_bucket_strategy=None,
@@ -96,6 +97,12 @@ class UPETCalculator(BaseCalculator):
         if default_dtype == "float64":
             jax.config.update("jax_enable_x64", True)
         self._dtype = jnp.float64 if default_dtype == "float64" else jnp.float32
+
+        # fp32 matmul accumulation on accelerators; "high" for NVE energy
+        # conservation (no-op on CPU). None leaves the global config alone.
+        self._matmul_precision = matmul_precision
+        if matmul_precision is not None:
+            jax.config.update("jax_default_matmul_precision", matmul_precision)
 
         # Cast params to the requested dtype so fp64 callers don't silently
         # run mixed-precision (fp32 weights × fp64 activations) with a PET-MAD
