@@ -116,8 +116,8 @@ class Backbone(nn.Module):
         cutoffs_tokens = jnp.concatenate([central, cutoffs.reshape(N, n)], axis=1)
         mask = jnp.concatenate([atom_mask[:, None], pair_mask.reshape(N, n)], axis=1)
 
-        # Initial edge features. Species embeddings are indexed directly by
-        # atomic number Z (table has max_atomic_number + 1 rows; row 0 unused).
+        # Initial edge features; species embeddings index by atomic number Z
+        # (table size max_atomic_number + 1, row 0 unused).
         edge_embed = nn.Embed(self.max_atomic_number + 1, d_pet, name="edge_embedder")
         messages = edge_embed(species)[neighbors] * pair_mask[..., None]
 

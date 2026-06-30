@@ -341,10 +341,8 @@ def _finalize_key(new_key, np_value):
 
 
 def _scatter_species_embeddings(flat, atomic_types, n_rows):
-    """Re-index species embedding rows from metatrain's contiguous order to
-    atomic-number rows: trained row ``i`` -> row ``Z = atomic_types[i]``.
-    Untrained rows stay zero (never indexed; the calculator rejects unknown Z).
-    """
+    """Re-index embedding rows to atomic number: trained row ``i`` -> row
+    ``Z = atomic_types[i]``. Untrained rows stay zero."""
     rows = np.asarray([int(z) for z in atomic_types])
     for key in list(flat):
         if key.endswith(".embedding"):

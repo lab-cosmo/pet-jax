@@ -116,9 +116,8 @@ class UPETCalculator(BaseCalculator):
         self._shift_offset = 0.0
 
         self._shifts = {int(z): float(v) for z, v in metadata["shifts"].items()}
-        # Species the model knows (composition covers every trained element).
-        # Embeddings index by Z directly and JAX gather clamps out-of-range
-        # silently, so unsupported elements must be rejected explicitly.
+        # Embeddings index by Z and JAX gather clamps out-of-range silently, so
+        # unsupported species must be rejected explicitly (shifts cover all).
         self._valid_species = set(self._shifts)
 
         if not stress:
