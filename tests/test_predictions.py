@@ -214,38 +214,26 @@ def test_extended_stress(extended_combo):
 # -- non-conservative heads --
 
 
-def test_direct_heads_track_conservative(pet_mad_xs_checkpoint, mini_xyz):
-    """The direct (non-conservative) force/stress heads load and behave: energy
-    is unchanged, outputs are well-formed, and direct forces correlate strongly
-    with the conservative (autodiff) forces over the rattled mini set."""
-    structures = read(str(mini_xyz), index=":")
-    cons = UPETCalculator.from_checkpoint(str(pet_mad_xs_checkpoint), stress=True)
-    direct = UPETCalculator.from_checkpoint(
+@pytest.fixture(scope="module")
+def direct_calc(pet_mad_xs_checkpoint):
+    return UPETCalculator.from_checkpoint(
         str(pet_mad_xs_checkpoint), direct_forces=True, direct_stress=True, stress=True
     )
 
-    f_cons, f_direct = [], []
-    for i, atoms in enumerate(structures):
-        atoms = atoms.copy()
-        atoms.rattle(0.15, seed=i)  # raise force magnitudes for a clean comparison
 
-        a = atoms.copy()
-        a.calc = cons
-        e_c, fc = a.get_potential_energy(), a.get_forces()
+def test_mini_direct_energy(direct_calc, mini_xyz, mini_predictions_xs_direct):
+    structures = read(str(mini_xyz), index=":")
+    ref = load_reference(mini_predictions_xs_direct)
+    _assert_energies(direct_calc, structures, ref)
 
-        b = atoms.copy()
-        b.calc = direct
-        e_d, fd = b.get_potential_energy(), b.get_forces()
 
-        assert np.isclose(e_c, e_d, atol=1e-4)  # direct heads don't touch energy
-        assert fd.shape == fc.shape and np.all(np.isfinite(fd))
-        assert np.abs(fd.sum(axis=0)).max() < 1e-3  # net force removed (no drift)
-        if atoms.pbc.any():
-            sd = b.get_stress()
-            assert sd.shape == (6,) and np.all(np.isfinite(sd))
+def test_mini_direct_forces(direct_calc, mini_xyz, mini_predictions_xs_direct):
+    structures = read(str(mini_xyz), index=":")
+    ref = load_reference(mini_predictions_xs_direct)
+    _assert_forces(direct_calc, structures, ref)
 
-        f_cons.append(fc.ravel())
-        f_direct.append(fd.ravel())
 
-    corr = np.corrcoef(np.concatenate(f_cons), np.concatenate(f_direct))[0, 1]
-    assert corr > 0.97, f"direct vs conservative force corr = {corr:.4f}"
+def test_mini_direct_stress(direct_calc, mini_xyz, mini_predictions_xs_direct):
+    structures = read(str(mini_xyz), index=":")
+    ref = load_reference(mini_predictions_xs_direct)
+    _assert_stress(direct_calc, structures, ref)
