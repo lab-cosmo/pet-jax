@@ -380,15 +380,16 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    """2-layer MLP with SiLU activation."""
+    """N-layer MLP: SiLU after each hidden layer, no activation on the last."""
 
     features: tuple
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.features[0])(x)
-        x = jax.nn.silu(x)
-        x = nn.Dense(self.features[1])(x)
+        for f in self.features[:-1]:
+            x = nn.Dense(f)(x)
+            x = jax.nn.silu(x)
+        x = nn.Dense(self.features[-1])(x)
         return x
 
 
