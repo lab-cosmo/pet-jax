@@ -4,6 +4,12 @@ Given a structure dict (from ``structure.to_structure``), produce a
 ``truncated`` dict keyed to ``UPET.__call__``'s parameters so the model
 forward is ``model.apply(params, **truncated)``.
 
+``truncate`` splits at the displacement boundary: it derives ``R_ij`` via
+``edge_displacements`` (single structure, one cell) and delegates to
+``truncate_edges``, the layout-agnostic selection+pack core. Consumers with
+precomputed per-edge displacements — e.g. training pipelines batching several
+structures, where no single cell exists — call ``truncate_edges`` directly.
+
 Two distinct JIT contexts touch this module:
   - ``_k_sel_kernel`` (``@jax.jit``, the sizing path) — CPU-pinned by
     ``determine_k_sel``, runs once per NL-rebuild.
@@ -25,35 +31,84 @@ from .utils import cutoff_bump, edge_displacements, safe_norm
 
 
 def truncate(structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=False):
-    """Run the adaptive cutoff selection, pack survivors into the rectangular
-    ``[N_padded * k_sel]`` layout, return the truncated dict keyed to
-    ``UPET.__call__``'s parameter names (so the forward is
-    ``model.apply(params, **truncated)``).
-    """
-    centers = structure["centers"]
-    others = structure["others"]
-    reverse_pair = structure["reverse"]
-    N_padded = structure["positions"].shape[0]
-    k_sel = structure["k_sel_sizer"].shape[-1]
+    """Adaptive selection + pack for a single-structure dict: derive ``R_ij``
+    from ``(positions, cell_shifts, cell)``, read ``k_sel`` off the
+    ``k_sel_sizer`` carrier, delegate to ``truncate_edges``."""
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+    return truncate_edges(
+        R_ij,
+        structure["centers"],
+        structure["others"],
+        structure["reverse"],
+        structure["pair_mask"],
+        structure["species"],
+        structure["atom_mask"],
+        structure["k_sel_sizer"].shape[-1],
+        probes,
+        cutoff_width,
+        num_neighbors_adaptive,
+        no_shadow=no_shadow,
+    )
 
-    R_ij_flat, pair_cutoffs_flat, selected = _selection(
-        structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=no_shadow
+
+def truncate_edges(
+    R_ij,
+    centers,
+    others,
+    reverse,
+    pair_mask,
+    species,
+    atom_mask,
+    k_sel,
+    probes,
+    cutoff_width,
+    num_neighbors_adaptive,
+    no_shadow=False,
+):
+    """Adaptive cutoff selection on a flat NL with precomputed displacements:
+    pack survivors into the rectangular ``[N * k_sel]`` layout, return the
+    truncated dict keyed to ``UPET.__call__``'s parameter names (so the forward
+    is ``model.apply(params, **truncated)``).
+
+    Layout-agnostic: works on a single structure or on several concatenated
+    ones (atoms sample-contiguous, padding at the tail), since the selection
+    couples pairs only through their center/other atoms. Requires ``centers``
+    non-decreasing; ``k_sel`` must be a static int under jit.
+    """
+    N = species.shape[0]
+
+    pair_cutoffs, selected = _select_edges(
+        R_ij,
+        centers,
+        others,
+        pair_mask,
+        N,
+        probes,
+        cutoff_width,
+        num_neighbors_adaptive,
+        no_shadow=no_shadow,
     )
     slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
-        selected, centers, N_padded, k_sel
+        selected, centers, N, k_sel
     )
 
     # Reverse map in P_sel space. Under overflow a pair can fit while its
     # reverse does not; then slot[reverse] = P_sel - 1 (the masked sentinel).
     truncated = {
-        "R_ij": R_ij_flat[sel_to_pair],
+        "R_ij": R_ij[sel_to_pair],
         "centers": centers[sel_to_pair],
         "neighbors": others[sel_to_pair],
-        "species": structure["species"],
-        "reverse": slot[reverse_pair[sel_to_pair]],
+        "species": species,
+        "reverse": slot[reverse[sel_to_pair]],
         "pair_mask": pair_mask_sel,
-        "atom_mask": structure["atom_mask"],
-        "pair_cutoffs": pair_cutoffs_flat[sel_to_pair],
+        "atom_mask": atom_mask,
+        "pair_cutoffs": pair_cutoffs[sel_to_pair],
     }
     return truncated, overflow
 
@@ -92,8 +147,22 @@ def determine_k_sel(structure, probes, num_neighbors_adaptive, cutoff_width):
 # Calculator reused on different-sized structures) re-compile.
 @partial(jax.jit, static_argnames=("num_neighbors_adaptive",))
 def _k_sel_kernel(structure, probes, cutoff_width, num_neighbors_adaptive):
-    _, pair_cutoffs, selected = _selection(
-        structure, probes, cutoff_width, num_neighbors_adaptive
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+    pair_cutoffs, selected = _select_edges(
+        R_ij,
+        structure["centers"],
+        structure["others"],
+        structure["pair_mask"],
+        structure["positions"].shape[0],
+        probes,
+        cutoff_width,
+        num_neighbors_adaptive,
     )
     counts = jax.ops.segment_sum(
         selected.astype(int),
@@ -139,30 +208,31 @@ def get_adaptive_cutoffs(
     return w @ probes
 
 
-# -- selection mask: displacements, adaptive cutoffs, r_ij <= pair_cutoff --
+# -- selection mask: adaptive cutoffs, r_ij <= pair_cutoff --
 
 
-def _selection(structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=False):
-    """Shared selection: consumed by ``_k_sel_kernel`` (sizing) and ``truncate``
-    (forward). Returns ``(R_ij, pair_cutoffs, selected)``."""
-    positions = structure["positions"]
-    centers = structure["centers"]
-    others = structure["others"]
-    pair_mask = structure["pair_mask"]
-    N_padded = positions.shape[0]
-
-    R_ij = edge_displacements(
-        positions, centers, others, structure["cell_shifts"], structure["cell"]
-    )
+def _select_edges(
+    R_ij,
+    centers,
+    others,
+    pair_mask,
+    num_atoms,
+    probes,
+    cutoff_width,
+    num_neighbors_adaptive,
+    no_shadow=False,
+):
+    """Shared selection core: consumed by ``_k_sel_kernel`` (sizing) and
+    ``truncate_edges`` (forward). Returns ``(pair_cutoffs, selected)``."""
     r_ij = safe_norm(R_ij, axis=-1)
     atomic_cutoffs = get_adaptive_cutoffs(
-        centers, r_ij, pair_mask, num_neighbors_adaptive, N_padded, probes, cutoff_width
+        centers, r_ij, pair_mask, num_neighbors_adaptive, num_atoms, probes, cutoff_width
     )
     if no_shadow:
         atomic_cutoffs = jax.lax.stop_gradient(atomic_cutoffs)
     pair_cutoffs = (atomic_cutoffs[centers] + atomic_cutoffs[others]) / 2
     selected = (r_ij <= pair_cutoffs) & pair_mask
-    return R_ij, pair_cutoffs, selected
+    return pair_cutoffs, selected
 
 
 # -- pack flat selection into the [N_padded * k_sel] rectangular layout --
