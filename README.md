@@ -97,6 +97,8 @@ The subtlety here is that since the cutoffs depend on the position of atoms *out
 
 The solution to this is a two-phase design: Outside of `jax`, we compute the initial big neighborlist and determine the final number, `k_sel`, of neighbors. We can round `k_sel` to something larger to avoid recompiles. We also have to pad the initial big neighborlist to a fixed shape, but this is easy to achieve. Inside `jax` (i.e., the `jax.jit` boundary), we then re-run the procedure and pack into `k_sel`, which we already know ahead of time due to step one. If we exceed `k_sel`, we return an `overflow` signal to tell the calculator that `k_sel` needs to be recomputed.
 
+Two additional entry points serve external training pipelines (e.g. `iris`): `pack_edges` is the selection-free sibling of `truncate_edges` — fixed-width packing of an NL already trimmed upstream (hard-capped neighbor counts; the model then applies its plain scalar-cutoff bump via `pair_cutoffs=None`) — and `UPET.__call__(..., return_features=True)` additionally returns the backbone's node embedding so composite models (e.g. long-range extensions) can build on it without re-running the backbone.
+
 For the design rationale and more details, see [`src/petjax/README.md`](src/petjax/README.md).
 
 ## Performance knobs

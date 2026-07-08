@@ -16,6 +16,7 @@ The top-level README explains the 2-phase split (outside JIT = build + size; ins
 
 - Adaptive per-atom cutoffs are recomputed inside the autograd graph every step. They depend on neighbour positions, so they must contribute to `dE/dpositions` — otherwise forces are wrong.
 - `truncate` splits at the displacement boundary: `edge_displacements` (single structure, one cell) feeds `truncate_edges`, the layout-agnostic selection+pack core. External consumers with precomputed per-edge displacements — training pipelines batching several structures, where no single cell exists — call `truncate_edges` directly (public API); it requires `centers` non-decreasing and a static `k_sel`.
+- `pack_edges` is the selection-free sibling of `truncate_edges`: it packs every unmasked pair to a fixed width `k` and emits `pair_cutoffs=None` (plain scalar-cutoff bump in the model). For NLs trimmed upstream to ≤ `k` per center (hard-capped training); its `overflow` flag is the tripwire for an untrimmed input. It reuses `_pack_selected_to_flat` — the packing core is shared, never duplicated.
 - Selection uses `vmap(boolean_mask_indices)`, a JIT-compatible `array[mask]` adapted from [GLP](https://github.com/sirmarcel/glp), so shapes stay fixed across selections.
 - The reverse-pair map is built via the index chain `raw_to_sel[reverse_raw[sel_to_raw]]`, not by search-by-value. The latter is ambiguous when an atom is its own neighbour through multiple periodic images.
 - `value_and_grad(..., argnums=(positions, strain))` gives forces and the virial stress in one pass. Composition shifts (linear in atomic numbers) are added post-JIT in Python fp64 so they contribute zero to forces with no precision loss.
@@ -31,7 +32,7 @@ The only `@jax.jit` sites in the package are `select._k_sel_kernel` (CPU-pinned,
 
 ## Key invariant
 
-The PET forward math in `model.py` is unchanged from the upstream `metatrain` design — all the new machinery (selection, packing, overflow, calculator) wraps it from the outside. Anything that touches the math in `src/petjax/model.py` should be a parity bug fix, not a feature. Features belong in the wrapping code.
+The PET forward math in `model.py` is unchanged from the upstream `metatrain` design — all the new machinery (selection, packing, overflow, calculator) wraps it from the outside. Anything that touches the math in `src/petjax/model.py` should be a parity bug fix, not a feature. Features belong in the wrapping code. (`UPET.__call__`'s `return_features` flag is the one sanctioned plumbing exception: it exposes the existing backbone node embedding for composite models without changing any math — outputs are bitwise identical either way, pinned in `tests/test_model.py`.)
 
 `UPET` is split into two Flax submodules: `Backbone` (embeddings + GNN/transformer layers → `(node, edge, cutoffs)` features) and `Energy` (the readout). `UPET` composes them. Consequence: the parameter tree nests under `backbone/…` and `energy_head/…` rather than flat at the top level, and `convert.py` scopes keys accordingly (`_scope_key`).
 

@@ -9,6 +9,8 @@ forward is ``model.apply(params, **truncated)``.
 ``truncate_edges``, the layout-agnostic selection+pack core. Consumers with
 precomputed per-edge displacements — e.g. training pipelines batching several
 structures, where no single cell exists — call ``truncate_edges`` directly.
+``pack_edges`` is the selection-free sibling: fixed-width packing of every
+unmasked pair, for NLs already trimmed upstream (e.g. a kNN pass).
 
 Two distinct JIT contexts touch this module:
   - ``_k_sel_kernel`` (``@jax.jit``, the sizing path) — CPU-pinned by
@@ -109,6 +111,34 @@ def truncate_edges(
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,
         "pair_cutoffs": pair_cutoffs[sel_to_pair],
+    }
+    return truncated, overflow
+
+
+def pack_edges(R_ij, centers, others, reverse, pair_mask, species, atom_mask, k):
+    """Fixed-width pack on a flat NL with precomputed displacements — no
+    selection: every unmasked pair goes into the rectangular ``[N * k]``
+    layout. Returns the truncated dict keyed like ``truncate_edges``'s, with
+    ``pair_cutoffs=None`` (the model applies its plain scalar-cutoff bump).
+
+    ``overflow`` is True iff a center holds more than ``k`` unmasked pairs —
+    that pair is silently dropped, so trim upstream to ``<= k`` per center.
+    Same layout requirements as ``truncate_edges``: ``centers``
+    non-decreasing, ``k`` a static int under jit.
+    """
+    N = species.shape[0]
+    slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
+        pair_mask, centers, N, k
+    )
+    truncated = {
+        "R_ij": R_ij[sel_to_pair],
+        "centers": centers[sel_to_pair],
+        "neighbors": others[sel_to_pair],
+        "species": species,
+        "reverse": slot[reverse[sel_to_pair]],
+        "pair_mask": pair_mask_sel,
+        "atom_mask": atom_mask,
+        "pair_cutoffs": None,
     }
     return truncated, overflow
 
