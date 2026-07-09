@@ -15,6 +15,7 @@ The top-level README explains the 2-phase split (outside JIT = build + size; ins
 **Inside JIT** — `select.truncate` + `model.UPET`, composed by `predict.get_predict_fn`
 
 - Adaptive per-atom cutoffs are recomputed inside the autograd graph every step. They depend on neighbour positions, so they must contribute to `dE/dpositions` — otherwise forces are wrong.
+- `truncate` splits at the displacement boundary: `edge_displacements` (single structure, one cell) feeds `truncate_edges`, the layout-agnostic selection+pack core. External consumers with precomputed per-edge displacements — training pipelines batching several structures, where no single cell exists — call `truncate_edges` directly (public API); it requires `centers` non-decreasing and a static `k_sel`.
 - Selection uses `vmap(boolean_mask_indices)`, a JIT-compatible `array[mask]` adapted from [GLP](https://github.com/sirmarcel/glp), so shapes stay fixed across selections.
 - The reverse-pair map is built via the index chain `raw_to_sel[reverse_raw[sel_to_raw]]`, not by search-by-value. The latter is ambiguous when an atom is its own neighbour through multiple periodic images.
 - `value_and_grad(..., argnums=(positions, strain))` gives forces and the virial stress in one pass. Composition shifts (linear in atomic numbers) are added post-JIT in Python fp64 so they contribute zero to forces with no precision loss.

@@ -12,8 +12,9 @@ from ase.io import read
 from petjax import UPETCalculator
 from petjax.convert import load_checkpoint
 from petjax.model import UPET
-from petjax.select import _pack_selected_to_flat, _selection, determine_k_sel
+from petjax.select import determine_k_sel, truncate_edges
 from petjax.structure import to_structure
+from petjax.utils import edge_displacements
 
 
 @pytest.fixture(scope="module")
@@ -222,8 +223,8 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
     config = metadata["config"]
     atoms = read(str(mini_xyz), index=0)
 
-    # Build the flat NL and the packed [N_padded, k_sel] selected layout the
-    # same way _select_and_predict does, to get valid model inputs.
+    # Build the flat NL and the packed [N_padded, k_sel] selected layout via
+    # the public truncate_edges seam, to get valid model inputs.
     structure = to_structure(atoms, model.cutoff, skin=0.5)
     N_padded = structure["positions"].shape[0]
     k_sel, _ = determine_k_sel(
@@ -232,32 +233,33 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
         config["num_neighbors_adaptive"],
         config["cutoff_width"],
     )
-    R_ij_flat, pair_cutoffs_flat, selected = _selection(
-        structure,
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+    truncated, _ = truncate_edges(
+        R_ij,
+        structure["centers"],
+        structure["others"],
+        structure["reverse"],
+        structure["pair_mask"],
+        structure["species"],
+        structure["atom_mask"],
+        k_sel,
         model.get_probes(),
         config["cutoff_width"],
         config["num_neighbors_adaptive"],
     )
-    slot, sel_to_pair, pair_mask_sel, _ = _pack_selected_to_flat(
-        selected, structure["centers"], N_padded, k_sel
-    )
-    sel_to_pair = np.asarray(sel_to_pair)
-    model_args = (
-        R_ij_flat[sel_to_pair],
-        structure["centers"][sel_to_pair],
-        structure["others"][sel_to_pair],
-        structure["species"],
-        slot[structure["reverse"][sel_to_pair]],
-        pair_mask_sel,
-        structure["atom_mask"],
-    )
-    pair_cutoffs_sel = pair_cutoffs_flat[sel_to_pair]
+    pair_cutoffs_sel = truncated.pop("pair_cutoffs")
 
-    out_none = model.apply(params, *model_args)  # pair_cutoffs defaults to None
+    out_none = model.apply(params, **truncated)  # pair_cutoffs defaults to None
     out_static = model.apply(
-        params, *model_args, jnp.full_like(pair_cutoffs_sel, model.cutoff)
+        params, **truncated, pair_cutoffs=jnp.full_like(pair_cutoffs_sel, model.cutoff)
     )
-    out_adaptive = model.apply(params, *model_args, pair_cutoffs_sel)
+    out_adaptive = model.apply(params, **truncated, pair_cutoffs=pair_cutoffs_sel)
 
     # Runs, right shape, finite.
     assert out_none.shape == (N_padded,)
