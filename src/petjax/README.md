@@ -32,9 +32,9 @@ The only `@jax.jit` sites in the package are `select._k_sel_kernel` (CPU-pinned,
 
 ## Key invariant
 
-The PET forward math in `model.py` is unchanged from the upstream `metatrain` design — all the new machinery (selection, packing, overflow, calculator) wraps it from the outside. Anything that touches the math in `src/petjax/model.py` should be a parity bug fix, not a feature. Features belong in the wrapping code. (`UPET.__call__`'s `return_features` flag is the one sanctioned plumbing exception: it exposes the existing backbone node embedding for composite models without changing any math — outputs are bitwise identical either way, pinned in `tests/test_model.py`.)
+The PET forward math in `model.py` is unchanged from the upstream `metatrain` design — all the new machinery (selection, packing, overflow, calculator) wraps it from the outside. Anything that touches the math in `src/petjax/model.py` should be a parity bug fix, not a feature. Features belong in the wrapping code.
 
-`UPET` is split into two Flax submodules: `Backbone` (embeddings + GNN/transformer layers → `(node, edge, cutoffs)` features) and `Energy` (the readout). `UPET` composes them. Consequence: the parameter tree nests under `backbone/…` and `energy_head/…` rather than flat at the top level, and `convert.py` scopes keys accordingly (`_scope_key`).
+`UPET` is split into two Flax submodules: `Backbone` (embeddings + GNN/transformer layers → `(node, edge, cutoffs)` features) and `Energy` (the readout). `UPET` composes them. Consequence: the parameter tree nests under `backbone/…` and `energy_head/…` rather than flat at the top level, and `convert.py` scopes keys accordingly (`_scope_key`). Downstream models needing more than `UPET`'s outputs (e.g. the node embedding) recompose these exported pieces under the same scope names instead of switching `UPET`'s behavior — parameter trees stay checkpoint-compatible by construction.
 
 Shape stability is best-effort, not enforced: shapes tend to be stable or grow within a relaxation/MD run (bucket granularity absorbs small fluctuations), but a rebuild can land on a smaller bucket if local density drops, triggering a re-JIT at the new size.
 

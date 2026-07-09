@@ -46,7 +46,6 @@ class UPET(nn.Module):
         pair_mask,
         atom_mask,
         pair_cutoffs=None,
-        return_features=False,
     ):
         node, edge, cutoffs = Backbone(
             d_pet=self.d_pet,
@@ -70,7 +69,7 @@ class UPET(nn.Module):
         energy = predictions * atom_mask * energy_scale
 
         if not (self.direct_forces or self.direct_stress):
-            return (energy, node) if return_features else energy
+            return energy
 
         # Non-conservative heads: raw per-atom force/stress, scaled by their
         # loaded scales (forces per-species by Z; stress scalar).
@@ -89,7 +88,7 @@ class UPET(nn.Module):
             )
             stress_scale = self.param("stress_scale", nn.initializers.ones, (1,))
             out["stress"] = stress * stress_scale * atom_mask[:, None, None]
-        return (out, node) if return_features else out
+        return out
 
 
 class Backbone(nn.Module):
