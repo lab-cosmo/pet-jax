@@ -5,6 +5,8 @@ Convert a metatrain PET ``.ckpt`` into pet-jax's ``model.msgpack`` +
 
     * a known PET-MAD shortcut (``pet-mad-xs``, ``pet-mad-s``) — fetched from
       Hugging Face;
+    * a full published model name from ``lab-cosmo/upet`` (e.g.
+      ``pet-omat-xs-v1.0.0``) — fetched from Hugging Face;
     * a URL to a ``.ckpt`` file — downloaded then converted;
     * a local path to a ``.ckpt`` file — converted in place.
 
@@ -20,17 +22,22 @@ or, for an ephemeral environment, run via uv:
 """
 
 import argparse
+import re
 import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# -- PET-MAD shortcuts (the publicly available checkpoints on Hugging Face) --
+# -- Hugging Face shortcuts (the publicly available checkpoints) --
 
 HF_BASE = "https://huggingface.co/lab-cosmo/upet/resolve/main/models"
 
 DEFAULT_PET_MAD_VERSION = "1.5.0"
 PET_MAD_VARIANTS = ("pet-mad-xs", "pet-mad-s")
+
+# Full published model name, e.g. "pet-omat-xs-v1.0.0" — anything in the
+# `models/` folder of lab-cosmo/upet.
+_HF_MODEL_NAME = re.compile(r"pet-[a-z]+-[a-z]+-v[\d.]+")
 
 
 def _pet_mad_url(variant, version):
@@ -42,9 +49,11 @@ def _pet_mad_url(variant, version):
 def _resolve_source(source, pet_mad_version):
     """Map the user-supplied source to ``(kind, value)`` where ``kind`` is
     ``"shortcut"``, ``"url"``, or ``"path"``. ``pet_mad_version`` is consulted
-    only for shortcut sources."""
+    only for the PET-MAD shortcuts; full model names carry their own version."""
     if source in PET_MAD_VARIANTS:
         return "shortcut", _pet_mad_url(source, pet_mad_version)
+    if _HF_MODEL_NAME.fullmatch(source):
+        return "shortcut", f"{HF_BASE}/{source}.ckpt"
     parsed = urllib.parse.urlparse(source)
     if parsed.scheme in ("http", "https"):
         return "url", source
@@ -70,13 +79,17 @@ def convert_main(argv=None):
         prog="petjax-convert",
         description=(
             "Convert a metatrain PET .ckpt into pet-jax's Flax msgpack layout. "
-            "SOURCE may be a PET-MAD shortcut (pet-mad-xs, pet-mad-s), an http(s) "
-            "URL to a .ckpt, or a local path."
+            "SOURCE may be a PET-MAD shortcut (pet-mad-xs, pet-mad-s), a full "
+            "published model name (e.g. pet-omat-xs-v1.0.0), an http(s) URL to "
+            "a .ckpt, or a local path."
         ),
     )
     parser.add_argument(
         "source",
-        help="pet-mad-xs / pet-mad-s, an http(s) URL, or a local .ckpt path",
+        help=(
+            "pet-mad-xs / pet-mad-s, a full lab-cosmo/upet model name "
+            "(pet-omat-xs-v1.0.0, ...), an http(s) URL, or a local .ckpt path"
+        ),
     )
     parser.add_argument(
         "--out",
