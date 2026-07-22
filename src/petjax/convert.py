@@ -111,10 +111,10 @@ def convert_checkpoint(ckpt_path, output_dir):
 def load_checkpoint(checkpoint_dir):
     """Load a pet-jax checkpoint (``model.msgpack`` + ``metadata.yaml``).
 
-    Configs written before the adaptive-selection width existed are upgraded
+    Configs written before the adaptive-selection hypers existed are upgraded
     in place, mirroring metatrain's own checkpoint migration: absent
-    ``cutoff_width_adaptive`` means the shared ``cutoff_width`` (the v13→v14
-    upgrade rule).
+    ``adaptive_cutoff_method`` means "grid" (ckpt v11→v12 rule), absent
+    ``cutoff_width_adaptive`` means the shared ``cutoff_width`` (v13→v14 rule).
     """
     from marathon.io import read_msgpack, read_yaml
 
@@ -122,6 +122,7 @@ def load_checkpoint(checkpoint_dir):
     params = read_msgpack(checkpoint_dir / "model.msgpack")
     metadata = read_yaml(checkpoint_dir / "metadata.yaml")
     config = metadata["config"]
+    config.setdefault("adaptive_cutoff_method", "grid")
     config.setdefault("cutoff_width_adaptive", config["cutoff_width"])
     return params, metadata
 
@@ -194,17 +195,18 @@ def _extract_metadata(pet_ckpt):
             "pet-jax does not implement long-range corrections; checkpoint has "
             "long_range.enable=True."
         )
-    # metatrain ckpt v12+ can declare the Newton-bisection "solver" selection;
-    # pet-jax implements only the probe-grid method (all v11 checkpoints trained
-    # with it, so an absent key means "grid" — metatrain's v11→v12 upgrade rule).
-    method = hypers.get("adaptive_cutoff_method", "grid")
-    if method.lower() != "grid":
+    # metatrain ckpt v12 split the adaptive-selection algorithm into
+    # "grid"/"solver"; all v11 checkpoints trained with grid, so an absent key
+    # means grid (metatrain's own v11→v12 upgrade rule).
+    method = hypers.get("adaptive_cutoff_method", "grid").lower()
+    if method not in ("grid", "solver"):
         raise ValueError(
-            f"pet-jax implements only the 'grid' adaptive-cutoff method; "
-            f"checkpoint has adaptive_cutoff_method={method!r}."
+            f"unknown adaptive_cutoff_method {method!r} in checkpoint; "
+            f"pet-jax implements 'grid' and 'solver'."
         )
 
     config = {k: hypers[k] for k in CONFIG_KEYS}
+    config["adaptive_cutoff_method"] = method
     # metatrain split the adaptive-selection taper width off cutoff_width at
     # ckpt v14; older checkpoints (incl. the pinned v11) predate the split and
     # used cutoff_width in both roles — same fallback as metatrain's v13→v14

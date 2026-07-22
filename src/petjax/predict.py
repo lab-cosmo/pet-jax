@@ -27,8 +27,8 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     ``value_and_grad(loss, argnums=0)(params, batch)`` works without rebuild.
 
     The model carries its own metadata: the adaptive-selection hypers
-    (``cutoff``, ``cutoff_width_adaptive``) are read off ``model`` and closured
-    as trace-time constants.
+    (``cutoff``, ``cutoff_width_adaptive``, ``adaptive_cutoff_method``) are
+    read off ``model`` and closured as trace-time constants.
     ``num_neighbors_adaptive`` (the per-atom selection target) defaults to
     ``model.num_neighbors_adaptive`` but can be overridden by the caller — the
     value is closured into the forward, so the k_sel sizing on the calculator
@@ -40,6 +40,7 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     if num_neighbors_adaptive is None:
         num_neighbors_adaptive = model.num_neighbors_adaptive
     cutoff_width_adaptive = model.cutoff_width_adaptive
+    adaptive_cutoff_method = model.adaptive_cutoff_method
     cutoff = model.cutoff
 
     # Which outputs need autodiff vs. come straight from a non-conservative head.
@@ -56,6 +57,7 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
             num_neighbors_adaptive,
             cutoff,
             cutoff_width_adaptive,
+            adaptive_cutoff_method,
             epsilon=epsilon,
             no_shadow=no_shadow,
         )
@@ -107,6 +109,7 @@ def _select_and_predict(
     num_neighbors_adaptive,
     cutoff,
     cutoff_width_adaptive,
+    adaptive_cutoff_method,
     epsilon=None,
     no_shadow=False,
 ):
@@ -129,6 +132,7 @@ def _select_and_predict(
         num_neighbors_adaptive,
         cutoff,
         cutoff_width_adaptive,
+        method=adaptive_cutoff_method,
         no_shadow=no_shadow,
     )
     out = model.apply(params, **truncated)
