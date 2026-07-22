@@ -26,7 +26,9 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     so the same closure serves any params and a training-side
     ``value_and_grad(loss, argnums=0)(params, batch)`` works without rebuild.
 
-    The model carries its own metadata: ``cutoff_width`` is read off ``model``.
+    The model carries its own metadata: the adaptive-selection hypers
+    (``cutoff``, ``cutoff_width_adaptive``) are read off ``model`` and closured
+    as trace-time constants.
     ``num_neighbors_adaptive`` (the per-atom selection target) defaults to
     ``model.num_neighbors_adaptive`` but can be overridden by the caller — the
     value is closured into the forward, so the k_sel sizing on the calculator
@@ -35,10 +37,10 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     responsibility (applied post-JIT in fp64 by ``UPETCalculator``). See
     ``_select_and_predict`` for ``no_shadow``.
     """
-    probes = model.get_probes()
     if num_neighbors_adaptive is None:
         num_neighbors_adaptive = model.num_neighbors_adaptive
-    cutoff_width = model.cutoff_width
+    cutoff_width_adaptive = model.cutoff_width_adaptive
+    cutoff = model.cutoff
 
     # Which outputs need autodiff vs. come straight from a non-conservative head.
     direct_forces = bool(model.direct_forces)
@@ -51,9 +53,9 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
             model,
             params,
             structure,
-            probes,
             num_neighbors_adaptive,
-            cutoff_width,
+            cutoff,
+            cutoff_width_adaptive,
             epsilon=epsilon,
             no_shadow=no_shadow,
         )
@@ -102,9 +104,9 @@ def _select_and_predict(
     model,
     params,
     structure,
-    probes,
     num_neighbors_adaptive,
-    cutoff_width,
+    cutoff,
+    cutoff_width_adaptive,
     epsilon=None,
     no_shadow=False,
 ):
@@ -123,7 +125,11 @@ def _select_and_predict(
         structure = apply_strain(structure, epsilon)
 
     truncated, overflow = truncate(
-        structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=no_shadow
+        structure,
+        num_neighbors_adaptive,
+        cutoff,
+        cutoff_width_adaptive,
+        no_shadow=no_shadow,
     )
     out = model.apply(params, **truncated)
     aux = {"overflow": overflow}
