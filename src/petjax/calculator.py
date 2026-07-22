@@ -77,8 +77,8 @@ class UPETCalculator(BaseCalculator):
         self._max_selected_cutoff = None
 
         # cutoff_override narrows ONLY the vesin raw-NL query radius (to
-        # cutoff_override + skin). The UPET model is untouched — probes, the
-        # adaptive-cutoff layer and the cutoff bump all keep using the trained
+        # cutoff_override + skin). The UPET model is untouched — the
+        # adaptive-cutoff selection and the cutoff bump all keep using the trained
         # config["cutoff"]. A performance knob for when the trained cutoff is wider
         # than the radius adaptive selection actually reaches.
         #
@@ -234,11 +234,13 @@ class UPETCalculator(BaseCalculator):
 
         k_sel_actual = None  # set only when determine_k_sel runs (debug stat)
         if force_recompute_k_sel or shape_changed:
+            # The trained self._model.cutoff, NOT self._cutoff: cutoff_override
+            # narrows only the raw-NL radius, never the selection's reach.
             k_sel_actual, self._max_selected_cutoff = determine_k_sel(
                 structure,
-                self._model.get_probes(),
                 self._num_neighbors_adaptive,
-                self._metadata["config"]["cutoff_width"],
+                self._model.cutoff,
+                self._model.cutoff_width_adaptive,
             )
             # T = k_sel edge tokens + 1 central-atom token. Bucket T (an even
             # T keeps attention on XLA's fused fast path); k_sel = T - 1.

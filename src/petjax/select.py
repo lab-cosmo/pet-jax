@@ -32,7 +32,13 @@ from .utils import cutoff_bump, edge_displacements, safe_norm
 # -- truncate: structure -> (truncated dict, overflow) — the per-step entry --
 
 
-def truncate(structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=False):
+def truncate(
+    structure,
+    num_neighbors_adaptive,
+    cutoff,
+    cutoff_width_adaptive,
+    no_shadow=False,
+):
     """Adaptive selection + pack for a single-structure dict: derive ``R_ij``
     from ``(positions, cell_shifts, cell)``, read ``k_sel`` off the
     ``k_sel_sizer`` carrier, delegate to ``truncate_edges``."""
@@ -52,9 +58,9 @@ def truncate(structure, probes, cutoff_width, num_neighbors_adaptive, no_shadow=
         structure["species"],
         structure["atom_mask"],
         structure["k_sel_sizer"].shape[-1],
-        probes,
-        cutoff_width,
         num_neighbors_adaptive,
+        cutoff,
+        cutoff_width_adaptive,
         no_shadow=no_shadow,
     )
 
@@ -68,15 +74,20 @@ def truncate_edges(
     species,
     atom_mask,
     k_sel,
-    probes,
-    cutoff_width,
     num_neighbors_adaptive,
+    cutoff,
+    cutoff_width_adaptive,
     no_shadow=False,
 ):
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
     truncated dict keyed to ``UPET.__call__``'s parameter names (so the forward
     is ``model.apply(params, **truncated)``).
+
+    ``cutoff`` is the trained maximum cutoff and ``cutoff_width_adaptive`` the
+    selection taper width only — the final ``cutoff_bump`` taper inside the
+    model runs on ``cutoff_width``. Both are Python floats (trace-time
+    constants).
 
     Layout-agnostic: works on a single structure or on several concatenated
     ones (atoms sample-contiguous, padding at the tail), since the selection
@@ -91,9 +102,9 @@ def truncate_edges(
         others,
         pair_mask,
         N,
-        probes,
-        cutoff_width,
         num_neighbors_adaptive,
+        cutoff,
+        cutoff_width_adaptive,
         no_shadow=no_shadow,
     )
     slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
@@ -146,7 +157,7 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, species, atom_mask, k)
 # -- k_sel sizing: CPU-pinned standalone jit kernel; called via determine_k_sel --
 
 
-def determine_k_sel(structure, probes, num_neighbors_adaptive, cutoff_width):
+def determine_k_sel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive):
     """Trial adaptive cutoff to size k_sel. Runs the sizing kernel on CPU (the
     structure dict is moved with one ``jax.device_put``). Kept off the GPU to
     avoid contention with the forward and to read the result back without a
@@ -164,19 +175,22 @@ def determine_k_sel(structure, probes, num_neighbors_adaptive, cutoff_width):
     """
     cpu = jax.devices("cpu")[0]
     cpu_structure = jax.device_put(structure, cpu)
-    cpu_probes = jax.device_put(probes, cpu)
     max_count, max_cutoff = _k_sel_kernel(
-        cpu_structure, cpu_probes, cutoff_width, num_neighbors_adaptive
+        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive
     )
     return max(int(max_count), 1), float(max_cutoff)
 
 
-# jit on the inner k_sel kernel is fine in steady state: in MD the static arg
-# num_neighbors_adaptive and the input shapes are constant across steps, so the
-# kernel compiles once per Calculator and is reused. Across-shape calls (e.g. a
-# Calculator reused on different-sized structures) re-compile.
-@partial(jax.jit, static_argnames=("num_neighbors_adaptive",))
-def _k_sel_kernel(structure, probes, cutoff_width, num_neighbors_adaptive):
+# jit on the inner k_sel kernel is fine in steady state: everything but the
+# structure is a per-model constant (hence static args — the probe grid is
+# built from cutoff / width at trace time), so the kernel compiles once per
+# Calculator and is reused. Across-shape calls (e.g. a Calculator reused on
+# different-sized structures) re-compile.
+@partial(
+    jax.jit,
+    static_argnames=("num_neighbors_adaptive", "cutoff", "cutoff_width_adaptive"),
+)
+def _k_sel_kernel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive):
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],
@@ -190,9 +204,9 @@ def _k_sel_kernel(structure, probes, cutoff_width, num_neighbors_adaptive):
         structure["others"],
         structure["pair_mask"],
         structure["positions"].shape[0],
-        probes,
-        cutoff_width,
         num_neighbors_adaptive,
+        cutoff,
+        cutoff_width_adaptive,
     )
     counts = jax.ops.segment_sum(
         selected.astype(int),
@@ -210,9 +224,14 @@ def _k_sel_kernel(structure, probes, cutoff_width, num_neighbors_adaptive):
 
 
 def get_adaptive_cutoffs(
-    centers, r_ij, pair_mask, num_neighbors, num_atoms, probes, cutoff_width
+    centers, r_ij, pair_mask, num_neighbors, num_atoms, cutoff, cutoff_width
 ):
-    """Compute per-atom adaptive cutoffs via probe-based Gaussian selection."""
+    """Compute per-atom adaptive cutoffs via probe-based Gaussian selection.
+    ``cutoff_width`` here is the checkpoint's ``cutoff_width_adaptive``, which
+    also sets the probe spacing — not the final-taper ``cutoff_width``. The
+    probe grid is built here from the (static) ``cutoff`` / ``cutoff_width``,
+    as upstream does; 0.5 is upstream's minimum probe cutoff."""
+    probes = jnp.arange(0.5, cutoff, cutoff_width / 4)
     num_probes = probes.shape[0]
 
     weights = cutoff_bump(r_ij[None, :], probes[:, None], cutoff_width) * pair_mask[None, :]
@@ -247,16 +266,22 @@ def _select_edges(
     others,
     pair_mask,
     num_atoms,
-    probes,
-    cutoff_width,
     num_neighbors_adaptive,
+    cutoff,
+    cutoff_width_adaptive,
     no_shadow=False,
 ):
     """Shared selection core: consumed by ``_k_sel_kernel`` (sizing) and
     ``truncate_edges`` (forward). Returns ``(pair_cutoffs, selected)``."""
     r_ij = safe_norm(R_ij, axis=-1)
     atomic_cutoffs = get_adaptive_cutoffs(
-        centers, r_ij, pair_mask, num_neighbors_adaptive, num_atoms, probes, cutoff_width
+        centers,
+        r_ij,
+        pair_mask,
+        num_neighbors_adaptive,
+        num_atoms,
+        cutoff,
+        cutoff_width_adaptive,
     )
     if no_shadow:
         atomic_cutoffs = jax.lax.stop_gradient(atomic_cutoffs)

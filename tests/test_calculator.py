@@ -12,7 +12,7 @@ from ase.io import read
 from petjax import UPETCalculator
 from petjax.convert import load_checkpoint
 from petjax.model import UPET
-from petjax.select import determine_k_sel, truncate_edges
+from petjax.select import determine_k_sel, get_adaptive_cutoffs, truncate_edges
 from petjax.structure import to_structure
 from petjax.utils import edge_displacements
 
@@ -229,9 +229,9 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
     N_padded = structure["positions"].shape[0]
     k_sel, _ = determine_k_sel(
         structure,
-        model.get_probes(),
         config["num_neighbors_adaptive"],
-        config["cutoff_width"],
+        model.cutoff,
+        model.cutoff_width_adaptive,
     )
     R_ij = edge_displacements(
         structure["positions"],
@@ -249,9 +249,9 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
         structure["species"],
         structure["atom_mask"],
         k_sel,
-        model.get_probes(),
-        config["cutoff_width"],
         config["num_neighbors_adaptive"],
+        model.cutoff,
+        model.cutoff_width_adaptive,
     )
     pair_cutoffs_sel = truncated.pop("pair_cutoffs")
 
@@ -272,6 +272,58 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
     assert not np.array_equal(np.asarray(out_none), np.asarray(out_adaptive)), (
         "adaptive pair_cutoffs had no effect — test would be vacuous"
     )
+
+
+def test_load_checkpoint_upgrades_legacy_config(pet_mad_xs_checkpoint):
+    """The test asset predates the adaptive-selection width; ``load_checkpoint``
+    must fill it following metatrain's own migration rule (adaptive width :=
+    shared ``cutoff_width``)."""
+    _, metadata = load_checkpoint(pet_mad_xs_checkpoint)
+    config = metadata["config"]
+    assert config["cutoff_width_adaptive"] == config["cutoff_width"]
+
+
+def test_cutoff_width_adaptive_threads_through(model_data, mini_xyz):
+    """Regression for #14: the adaptive selection must run at
+    ``cutoff_width_adaptive``, not the final-taper ``cutoff_width``.
+
+    A distinct adaptive width must shift the per-atom cutoffs (and hence the
+    prediction) end-to-end through the calculator (k_sel sizing and the in-JIT
+    selection), while restating the loaded config's value changes nothing.
+    """
+    model, params, metadata = model_data
+    atoms = read(str(mini_xyz), index=0)
+
+    def energy_with(width_adaptive):
+        config = {**metadata["config"], "cutoff_width_adaptive": width_adaptive}
+        calc = UPETCalculator(UPET(**config), params, metadata, skin=0.5, stress=False)
+        atoms.calc = calc
+        return atoms.get_potential_energy()
+
+    loaded_width = metadata["config"]["cutoff_width_adaptive"]
+
+    calc = UPETCalculator(model, params, metadata, skin=0.5, stress=False)
+    atoms.calc = calc
+    e_loaded = atoms.get_potential_energy()
+
+    assert energy_with(loaded_width) == e_loaded, "restated width must be bit-identical"
+    assert energy_with(2.0 * loaded_width) != e_loaded, (
+        "adaptive width had no effect — not threaded through?"
+    )
+
+
+def test_grid_selection_reproduces_issue_14_table():
+    """Pin the numbers from issue #14's evidence table: single-atom environment,
+    40 neighbors evenly spaced 2.0–7.5 Å, target 16. The selection width shifts
+    the per-atom cutoff from 4.299 Å (width 1) to 4.684 Å (width 2)."""
+    r_ij = jnp.linspace(2.0, 7.5, 40)
+    centers = jnp.zeros(40, dtype=int)
+    mask = jnp.ones(40, dtype=bool)
+
+    cut_w1 = get_adaptive_cutoffs(centers, r_ij, mask, 16, 1, 7.5, 1.0)
+    cut_w2 = get_adaptive_cutoffs(centers, r_ij, mask, 16, 1, 7.5, 2.0)
+    np.testing.assert_allclose(float(cut_w1[0]), 4.299, atol=2e-3)
+    np.testing.assert_allclose(float(cut_w2[0]), 4.684, atol=2e-3)
 
 
 def test_debug_stats_and_cutoff_override_warning(model_data, mini_xyz):

@@ -26,14 +26,16 @@ class UPET(nn.Module):
     num_gnn_layers: int = 2
     cutoff: float = 7.5
     cutoff_width: float = 0.5
+    # Taper width inside the adaptive neighbor selection — distinct from the
+    # final-taper cutoff_width since metatrain ckpt v14. Checkpoint configs
+    # predating the split are filled in by load_checkpoint (adaptive :=
+    # cutoff_width, upstream's own migration rule).
+    cutoff_width_adaptive: float = 0.5
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
     max_atomic_number: int = 118
     direct_forces: bool = False
     direct_stress: bool = False
-
-    def get_probes(self):
-        return jnp.arange(0.5, self.cutoff, self.cutoff_width / 4)
 
     @nn.compact
     def __call__(
