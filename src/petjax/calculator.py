@@ -241,6 +241,7 @@ class UPETCalculator(BaseCalculator):
                 self._num_neighbors_adaptive,
                 self._model.cutoff,
                 self._model.cutoff_width_adaptive,
+                method=self._model.adaptive_cutoff_method,
             )
             # T = k_sel edge tokens + 1 central-atom token. Bucket T (an even
             # T keeps attention on XLA's fused fast path); k_sel = T - 1.

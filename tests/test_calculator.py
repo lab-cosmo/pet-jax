@@ -12,7 +12,13 @@ from ase.io import read
 from petjax import UPETCalculator
 from petjax.convert import load_checkpoint
 from petjax.model import UPET
-from petjax.select import determine_k_sel, get_adaptive_cutoffs, truncate_edges
+from petjax.select import (
+    _n_total,
+    determine_k_sel,
+    get_adaptive_cutoffs,
+    get_adaptive_cutoffs_solver,
+    truncate_edges,
+)
 from petjax.structure import to_structure
 from petjax.utils import edge_displacements
 
@@ -275,11 +281,12 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
 
 
 def test_load_checkpoint_upgrades_legacy_config(pet_mad_xs_checkpoint):
-    """The test asset predates the adaptive-selection width; ``load_checkpoint``
-    must fill it following metatrain's own migration rule (adaptive width :=
-    shared ``cutoff_width``)."""
+    """The test asset predates the adaptive-selection hypers; ``load_checkpoint``
+    must fill them following metatrain's own migration rules (grid method,
+    adaptive width := shared ``cutoff_width``)."""
     _, metadata = load_checkpoint(pet_mad_xs_checkpoint)
     config = metadata["config"]
+    assert config["adaptive_cutoff_method"] == "grid"
     assert config["cutoff_width_adaptive"] == config["cutoff_width"]
 
 
@@ -324,6 +331,80 @@ def test_grid_selection_reproduces_issue_14_table():
     cut_w2 = get_adaptive_cutoffs(centers, r_ij, mask, 16, 1, 7.5, 2.0)
     np.testing.assert_allclose(float(cut_w1[0]), 4.299, atol=2e-3)
     np.testing.assert_allclose(float(cut_w2[0]), 4.684, atol=2e-3)
+
+
+def test_solver_finds_root_and_attaches_gradients():
+    """The solver's per-atom cutoffs must be roots of the smoothed neighbor
+    count (``n_total(r) = target``) wherever unclamped, with masked padded
+    pairs excluded, and gradients must flow to the distances through the
+    implicit-function-theorem step (finite, nonzero)."""
+    import jax
+
+    rng = np.random.RandomState(7)
+    counts = [40, 25, 8, 60]
+    num_atoms = len(counts)
+    cutoff, width, target = 7.5, 1.0, 16
+    centers = jnp.array(np.concatenate([np.full(c, i) for i, c in enumerate(counts)]))
+    r_ij = jnp.array(np.sort(rng.uniform(0.8, cutoff, size=int(np.sum(counts)))))
+    # Append masked padded pairs — they must not shift anything.
+    pad = 17
+    centers_p = jnp.concatenate([centers, jnp.full(pad, num_atoms - 1)])
+    r_p = jnp.concatenate([r_ij, jnp.full(pad, 1e-7)])
+    mask_p = jnp.concatenate([jnp.ones(r_ij.shape[0], bool), jnp.zeros(pad, bool)])
+
+    def solve(c, d, m):
+        return get_adaptive_cutoffs_solver(c, d, m, target, num_atoms, cutoff, width)
+
+    cuts = solve(centers, r_ij, jnp.ones(r_ij.shape[0], bool))
+    cuts_padded = solve(centers_p, r_p, mask_p)
+    np.testing.assert_allclose(np.asarray(cuts), np.asarray(cuts_padded), atol=1e-6)
+
+    residual = (
+        _n_total(
+            cuts,
+            r_ij,
+            centers,
+            jnp.ones(r_ij.shape[0], bool),
+            num_atoms,
+            width,
+            1 / cutoff,
+            target,
+        )
+        - target
+    )
+    unclamped = (np.asarray(cuts) > cutoff / 16 + 1e-6) & (np.asarray(cuts) < cutoff - 1e-6)
+    assert unclamped.any(), "test env produced no unclamped atoms — vacuous"
+    np.testing.assert_allclose(np.asarray(residual)[unclamped], 0.0, atol=1e-4)
+
+    grad = jax.grad(lambda d: jnp.sum(solve(centers, d, jnp.ones(r_ij.shape[0], bool))))(
+        r_ij
+    )
+    assert np.all(np.isfinite(np.asarray(grad)))
+    assert float(jnp.abs(grad).max()) > 0.0, "IFT step attached no gradient"
+
+
+def test_adaptive_cutoff_solver_end_to_end(model_data, mini_xyz):
+    """A solver-method model must run through the whole calculator pipeline
+    (k_sel sizing, in-JIT selection, autodiff forces) and give results close
+    to — but not identical with — the grid method it supersedes."""
+    model, params, metadata = model_data
+    atoms = read(str(mini_xyz), index=0)
+
+    solver_model = UPET(**{**metadata["config"], "adaptive_cutoff_method": "solver"})
+    calc = UPETCalculator(solver_model, params, metadata, skin=0.5, stress=True)
+    atoms.calc = calc
+    e_solver = atoms.get_potential_energy()
+    f_solver = atoms.get_forces().copy()
+    assert np.isfinite(e_solver)
+    assert np.all(np.isfinite(f_solver))
+
+    calc_grid = UPETCalculator(model, params, metadata, skin=0.5, stress=True)
+    atoms.calc = calc_grid
+    e_grid = atoms.get_potential_energy()
+
+    assert e_solver != e_grid, "solver had no effect — not threaded through?"
+    # The two methods approximate the same root; a large gap means a broken port.
+    assert abs(e_solver - e_grid) < 0.5, f"solver vs grid gap: {e_solver - e_grid:.4f} eV"
 
 
 def test_debug_stats_and_cutoff_override_warning(model_data, mini_xyz):

@@ -37,6 +37,7 @@ def truncate(
     num_neighbors_adaptive,
     cutoff,
     cutoff_width_adaptive,
+    method="grid",
     no_shadow=False,
 ):
     """Adaptive selection + pack for a single-structure dict: derive ``R_ij``
@@ -61,6 +62,7 @@ def truncate(
         num_neighbors_adaptive,
         cutoff,
         cutoff_width_adaptive,
+        method=method,
         no_shadow=no_shadow,
     )
 
@@ -77,6 +79,7 @@ def truncate_edges(
     num_neighbors_adaptive,
     cutoff,
     cutoff_width_adaptive,
+    method="grid",
     no_shadow=False,
 ):
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
@@ -87,7 +90,7 @@ def truncate_edges(
     ``cutoff`` is the trained maximum cutoff and ``cutoff_width_adaptive`` the
     selection taper width only — the final ``cutoff_bump`` taper inside the
     model runs on ``cutoff_width``. Both are Python floats (trace-time
-    constants).
+    constants), as is the ``method`` choice ("grid" or "solver").
 
     Layout-agnostic: works on a single structure or on several concatenated
     ones (atoms sample-contiguous, padding at the tail), since the selection
@@ -105,6 +108,7 @@ def truncate_edges(
         num_neighbors_adaptive,
         cutoff,
         cutoff_width_adaptive,
+        method=method,
         no_shadow=no_shadow,
     )
     slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
@@ -157,7 +161,13 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, species, atom_mask, k)
 # -- k_sel sizing: CPU-pinned standalone jit kernel; called via determine_k_sel --
 
 
-def determine_k_sel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive):
+def determine_k_sel(
+    structure,
+    num_neighbors_adaptive,
+    cutoff,
+    cutoff_width_adaptive,
+    method="grid",
+):
     """Trial adaptive cutoff to size k_sel. Runs the sizing kernel on CPU (the
     structure dict is moved with one ``jax.device_put``). Kept off the GPU to
     avoid contention with the forward and to read the result back without a
@@ -176,7 +186,7 @@ def determine_k_sel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adap
     cpu = jax.devices("cpu")[0]
     cpu_structure = jax.device_put(structure, cpu)
     max_count, max_cutoff = _k_sel_kernel(
-        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive
+        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method=method
     )
     return max(int(max_count), 1), float(max_cutoff)
 
@@ -188,9 +198,20 @@ def determine_k_sel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adap
 # different-sized structures) re-compile.
 @partial(
     jax.jit,
-    static_argnames=("num_neighbors_adaptive", "cutoff", "cutoff_width_adaptive"),
+    static_argnames=(
+        "num_neighbors_adaptive",
+        "cutoff",
+        "cutoff_width_adaptive",
+        "method",
+    ),
 )
-def _k_sel_kernel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive):
+def _k_sel_kernel(
+    structure,
+    num_neighbors_adaptive,
+    cutoff,
+    cutoff_width_adaptive,
+    method="grid",
+):
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],
@@ -207,6 +228,7 @@ def _k_sel_kernel(structure, num_neighbors_adaptive, cutoff, cutoff_width_adapti
         num_neighbors_adaptive,
         cutoff,
         cutoff_width_adaptive,
+        method=method,
     )
     counts = jax.ops.segment_sum(
         selected.astype(int),
@@ -257,6 +279,119 @@ def get_adaptive_cutoffs(
     return w @ probes
 
 
+def get_adaptive_cutoffs_solver(
+    centers, r_ij, pair_mask, num_neighbors, num_atoms, cutoff, cutoff_width
+):
+    """Per-atom adaptive cutoffs via a Newton-bisection root find on the
+    smoothed neighbor count (metatrain's "solver" method, the default for
+    recent checkpoints). Solves ``n_total(r) = num_neighbors`` per atom, where
+    ``n_total(r) = sum_j bump(r_j, r, w) + num_neighbors * (r / cutoff)**3``;
+    the cubic baseline makes ``n_total`` monotonic so the root is unique and
+    bracketed by ``[0, cutoff]``.
+
+    The iteration runs on gradient-detached distances; the trailing
+    implicit-function-theorem step re-attaches gradients through the residual,
+    so the backward never differentiates through the solver loop. As in the
+    grid method, ``cutoff_width`` is the checkpoint's ``cutoff_width_adaptive``.
+    """
+    inv_cutoff = 1.0 / cutoff
+    r_ij_d = jax.lax.stop_gradient(r_ij)
+
+    # Bracket [r_lo, r_hi] with f(r_lo) <= 0 <= f(r_hi): n_total(0) = 0 and the
+    # baseline alone reaches num_neighbors at r = cutoff.
+    r_lo = jnp.zeros(num_atoms, dtype=r_ij.dtype)
+    r_hi = jnp.full(num_atoms, cutoff, dtype=r_ij.dtype)
+
+    # 10 iterations converge to fp32 precision (upstream's choice). Newton
+    # steps that would leave the bracket (flat shoulders between bumps) fall
+    # back to the bracket midpoint. fori_loop keeps the HLO compact (vs. 10x
+    # unroll); safe here because the loop sits entirely on detached inputs,
+    # so autodiff never needs to enter it.
+    def newton_bisection_step(_, carry):
+        r_lo, r_hi, r = carry
+        n, dn = _n_total_and_dn_dr(
+            r,
+            r_ij_d,
+            centers,
+            pair_mask,
+            num_atoms,
+            cutoff_width,
+            inv_cutoff,
+            num_neighbors,
+        )
+        f = n - num_neighbors
+        below = f <= 0
+        r_lo = jnp.where(below, r, r_lo)
+        r_hi = jnp.where(below, r_hi, r)
+        r_newton = r - f / jnp.clip(dn, 1e-6, None)
+        inside = (r_newton >= r_lo) & (r_newton <= r_hi)
+        return r_lo, r_hi, jnp.where(inside, r_newton, 0.5 * (r_lo + r_hi))
+
+    _, _, r = jax.lax.fori_loop(0, 10, newton_bisection_step, (r_lo, r_hi, 0.5 * r_hi))
+    _, dn_root = _n_total_and_dn_dr(
+        r, r_ij_d, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+    )
+
+    # IFT step: r and dn_root are constants; gradients attach only through the
+    # residual (live r_ij). The clamps mirror upstream: the derivative floor
+    # bounds the correction in pathological geometries, cutoff/16 is the
+    # physical lower bound on the adapted cutoff.
+    n_residual = (
+        _n_total(
+            r, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+        )
+        - num_neighbors
+    )
+    return jnp.clip(r - n_residual / jnp.clip(dn_root, 1e-6, None), cutoff / 16, cutoff)
+
+
+def _n_total(
+    r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+):
+    """Smoothed neighbor count plus cubic baseline, evaluated at per-atom
+    cutoff ``r_per_atom``. Padded pairs are masked out (upstream has no
+    padding; the mask is the only deviation)."""
+    per_edge = cutoff_bump(r_ij, r_per_atom[centers], cutoff_width) * pair_mask
+    n = jax.ops.segment_sum(per_edge, centers, num_atoms)
+    x = r_per_atom * inv_cutoff
+    return n + num_neighbors * x**3
+
+
+def _n_total_and_dn_dr(
+    r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+):
+    """``n_total`` and its analytic d/dr in one pass, for the Newton steps.
+
+    Closed form of the bump in its active region ``s = (d - r + w)/w`` in (0, 1):
+    ``f = 0.5 * (1 + tanh(cot(pi s)))``, ``df/dr = (pi / 2w) sech^2(cot(pi s)) /
+    sin^2(pi s)``; outside, f saturates to 1 (below) / 0 (above) with df/dr = 0.
+    The clamp of ``s`` matches the eps in ``cutoff_bump`` so f agrees
+    numerically with the forward pass."""
+    scaled = (r_ij - (r_per_atom[centers] - cutoff_width)) / cutoff_width
+    active = (scaled > 0.0) & (scaled < 1.0) & pair_mask
+    smaller = (scaled <= 0.0) & pair_mask
+
+    safe = jnp.clip(scaled, 1e-6, 1 - 1e-6)
+    s = jnp.pi * safe
+    sin_s = jnp.sin(s)
+    tanh_cot = jnp.tanh(jnp.cos(s) / sin_s)
+
+    f = jnp.where(active, 0.5 * (1.0 + tanh_cot), smaller.astype(scaled.dtype))
+    df_dr = jnp.where(
+        active,
+        (0.5 * jnp.pi / cutoff_width) * (1.0 - tanh_cot**2) / (sin_s * sin_s),
+        0.0,
+    )
+
+    n = jax.ops.segment_sum(f, centers, num_atoms)
+    dn = jax.ops.segment_sum(df_dr, centers, num_atoms)
+
+    x = r_per_atom * inv_cutoff
+    n = n + num_neighbors * x**3
+    dn = dn + 3.0 * num_neighbors * x**2 * inv_cutoff
+    return n, dn
+
+
 # -- selection mask: adaptive cutoffs, r_ij <= pair_cutoff --
 
 
@@ -269,12 +404,24 @@ def _select_edges(
     num_neighbors_adaptive,
     cutoff,
     cutoff_width_adaptive,
+    method="grid",
     no_shadow=False,
 ):
     """Shared selection core: consumed by ``_k_sel_kernel`` (sizing) and
-    ``truncate_edges`` (forward). Returns ``(pair_cutoffs, selected)``."""
+    ``truncate_edges`` (forward). Returns ``(pair_cutoffs, selected)``.
+
+    ``method`` picks the per-atom cutoff algorithm (a trace-time branch);
+    grid and solver take the same arguments."""
     r_ij = safe_norm(R_ij, axis=-1)
-    atomic_cutoffs = get_adaptive_cutoffs(
+    if method == "grid":
+        adaptive_fn = get_adaptive_cutoffs
+    elif method == "solver":
+        adaptive_fn = get_adaptive_cutoffs_solver
+    else:
+        raise ValueError(
+            f"adaptive_cutoff_method must be 'grid' or 'solver', got {method!r}"
+        )
+    atomic_cutoffs = adaptive_fn(
         centers,
         r_ij,
         pair_mask,
