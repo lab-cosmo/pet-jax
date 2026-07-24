@@ -1,13 +1,14 @@
 """Convert metatrain PET ``.ckpt`` files to pet-jax's Flax msgpack layout.
 
 Reads the Lightning-style ``.ckpt`` directly — no ``mtt export`` / TorchScript
-intermediate. Expects the LLPR-wrapped PET-MAD v1.5.0 format as published on
-Hugging Face (``lab-cosmo/upet``):
-
-    outer:  architecture_name="llpr",  model_ckpt_version=3
-    inner:  architecture_name="pet",   model_ckpt_version=11
-
-Other versions fail hard — use ``mtt upgrade`` or fetch a newer release.
+intermediate. Accepts both layouts published on Hugging Face
+(``lab-cosmo/upet``): bare PET checkpoints (the pet-omat / pet-omad / … lines)
+and LLPR-wrapped ones (the PET-MAD releases; wrapper v3 or v4 — the wrapper
+state itself is never read). Inner PET checkpoint versions 10 through 16 are
+supported; the between-version differences (new hypers, the v13 scaler split,
+the v16 ``backend.`` state-dict prefix) are absorbed here, mirroring
+metatrain's own upgrade rules. Older checkpoints fail hard — run
+``mtt upgrade``; newer ones fail hard until pet-jax catches up.
 
 Writes:
     {output_dir}/model.msgpack    -- Flax parameter tree
@@ -24,12 +25,13 @@ from pathlib import Path
 
 from marathon.io import write_msgpack, write_yaml
 
-# -- expected checkpoint versions --
+# -- accepted checkpoint versions --
 
 OUTER_ARCH = "llpr"
-OUTER_VERSION = 3
+OUTER_VERSIONS = (3, 4)  # v3→v4 only reworks LLPR covariance buffers, never read
 INNER_ARCH = "pet"
-INNER_VERSION = 11
+INNER_MIN_VERSION = 10  # v9 and older imply the Cosine cutoff era — rejected anyway
+INNER_MAX_VERSION = 16
 
 # -- architecture knobs pet-jax hard-implements (must match the checkpoint) --
 
@@ -55,7 +57,6 @@ CONFIG_KEYS = (
     "cutoff",
     "cutoff_width",
     "num_neighbors_adaptive",
-    "attention_temperature",
 )
 
 
@@ -75,10 +76,16 @@ def convert_checkpoint(ckpt_path, output_dir):
     ckpt = torch.load(str(ckpt_path), weights_only=False, map_location="cpu")
 
     pet_ckpt = _unwrap_pet_checkpoint(ckpt)
-    _check_single_readout(pet_ckpt["best_model_state_dict"])
+    # metatrain ckpt v16 moved the PET core under a `backend.` submodule;
+    # strip the prefix so one rename pipeline serves all versions. Scaler /
+    # additive-model keys were not moved, so metadata extraction is unaffected.
+    state_dict = {
+        k.removeprefix("backend."): v for k, v in pet_ckpt["best_model_state_dict"].items()
+    }
+    _check_single_readout(state_dict)
     meta = _extract_metadata(pet_ckpt)
 
-    flat = _convert_state_dict(pet_ckpt["best_model_state_dict"])
+    flat = _convert_state_dict(state_dict)
     n_rows = meta["config"]["max_atomic_number"] + 1
     _scatter_species_embeddings(flat, meta["atomic_types"], n_rows)
 
@@ -131,30 +138,49 @@ def load_checkpoint(checkpoint_dir):
 
 
 def _unwrap_pet_checkpoint(ckpt):
-    """Navigate the LLPR wrapper, validate versions, return the inner PET dict."""
-    outer_arch = ckpt.get("architecture_name")
-    outer_ver = ckpt.get("model_ckpt_version")
-    if outer_arch != OUTER_ARCH or outer_ver != OUTER_VERSION:
+    """Validate versions and return the inner PET dict — either the checkpoint
+    itself (bare PET, e.g. the pet-omat line) or the one nested inside the LLPR
+    wrapper (PET-MAD releases). The wrapper's own state is never read, so any
+    wrapper version that keeps the inner checkpoint at
+    ``wrapped_model_checkpoint`` is acceptable."""
+    arch = ckpt.get("architecture_name")
+    if arch == OUTER_ARCH:
+        outer_ver = ckpt.get("model_ckpt_version")
+        if outer_ver not in OUTER_VERSIONS:
+            raise ValueError(
+                f"pet-jax accepts LLPR wrapper versions {OUTER_VERSIONS}; got "
+                f"v{outer_ver}. Run `uv run --with metatrain mtt upgrade` on the "
+                f".ckpt or fetch a newer release."
+            )
+        inner = ckpt.get("wrapped_model_checkpoint")
+        if not isinstance(inner, dict):
+            raise ValueError(
+                "missing 'wrapped_model_checkpoint' in outer ckpt — the LLPR "
+                "wrapper is expected to carry the PET model nested inside."
+            )
+    elif arch == INNER_ARCH:
+        inner = ckpt
+    else:
         raise ValueError(
-            f"pet-jax expects LLPR-wrapped PET-MAD v1.5.0 checkpoints "
-            f"({OUTER_ARCH!r} v{OUTER_VERSION}); got {outer_arch!r} v{outer_ver}. "
-            f"Run `uv run --with metatrain mtt upgrade` on the .ckpt or fetch a "
-            f"compatible release."
-        )
-
-    inner = ckpt.get("wrapped_model_checkpoint")
-    if not isinstance(inner, dict):
-        raise ValueError(
-            "missing 'wrapped_model_checkpoint' in outer ckpt — the LLPR wrapper "
-            "is expected to carry the PET model nested inside."
+            f"pet-jax expects a PET checkpoint, bare ({INNER_ARCH!r}) or "
+            f"LLPR-wrapped ({OUTER_ARCH!r}); got architecture_name={arch!r}."
         )
 
     inner_arch = inner.get("architecture_name")
     inner_ver = inner.get("model_ckpt_version")
-    if inner_arch != INNER_ARCH or inner_ver != INNER_VERSION:
+    if inner_arch != INNER_ARCH:
+        raise ValueError(f"pet-jax expects inner {INNER_ARCH!r}; got {inner_arch!r}.")
+    if not isinstance(inner_ver, int) or inner_ver < INNER_MIN_VERSION:
         raise ValueError(
-            f"pet-jax expects inner {INNER_ARCH!r} v{INNER_VERSION}; got "
-            f"{inner_arch!r} v{inner_ver}. Run `mtt upgrade` on the source ckpt."
+            f"pet-jax accepts PET checkpoint versions {INNER_MIN_VERSION}.."
+            f"{INNER_MAX_VERSION}; got v{inner_ver}. Run `mtt upgrade` on the "
+            f"source ckpt."
+        )
+    if inner_ver > INNER_MAX_VERSION:
+        raise ValueError(
+            f"pet-jax accepts PET checkpoint versions {INNER_MIN_VERSION}.."
+            f"{INNER_MAX_VERSION}; got v{inner_ver}, which is newer than this "
+            f"pet-jax release knows about — update pet-jax."
         )
 
     return inner
@@ -204,13 +230,20 @@ def _extract_metadata(pet_ckpt):
             f"unknown adaptive_cutoff_method {method!r} in checkpoint; "
             f"pet-jax implements 'grid' and 'solver'."
         )
+    # metatrain ckpt v15 added charge/spin conditioning; pet-jax has no
+    # equivalent embedding, so a conditioned model would be silently wrong.
+    if hypers.get("system_conditioning", False):
+        raise ValueError(
+            "pet-jax does not implement system conditioning (charge/spin "
+            "embeddings); checkpoint has system_conditioning=True."
+        )
 
     config = {k: hypers[k] for k in CONFIG_KEYS}
     config["adaptive_cutoff_method"] = method
-    # metatrain split the adaptive-selection taper width off cutoff_width at
-    # ckpt v14; older checkpoints (incl. the pinned v11) predate the split and
-    # used cutoff_width in both roles — same fallback as metatrain's v13→v14
-    # upgrade rule.
+    # Hyper fallbacks mirror metatrain's own upgrade rules for checkpoints
+    # predating each hyper: attention_temperature (v10→v11) and the
+    # adaptive-selection taper width split off cutoff_width (v13→v14).
+    config["attention_temperature"] = hypers.get("attention_temperature", 1.0)
     config["cutoff_width_adaptive"] = hypers.get(
         "cutoff_width_adaptive", hypers["cutoff_width"]
     )
@@ -220,23 +253,16 @@ def _extract_metadata(pet_ckpt):
 
     state_dict = pet_ckpt["best_model_state_dict"]
 
-    scaler = parse_metatensor_buffer(state_dict["scaler.energy_scaler_buffer"])
-    energy_scale = float(scaler["blocks/0/values.npy"].item())
+    energy_values = _scaler_values(state_dict, "energy")
+    if energy_values is None:
+        raise ValueError("checkpoint carries no energy scaler buffer.")
+    energy_scale = float(energy_values.item())
 
     # Non-conservative scales (direct-capable checkpoints only): force is one
     # std per trained species, stress a scalar.
-    force_scale = None
-    if "scaler.non_conservative_forces_scaler_buffer" in state_dict:
-        fbuf = parse_metatensor_buffer(
-            state_dict["scaler.non_conservative_forces_scaler_buffer"]
-        )
-        force_scale = fbuf["blocks/0/values.npy"].flatten()
-    stress_scale = None
-    if "scaler.non_conservative_stress_scaler_buffer" in state_dict:
-        sbuf = parse_metatensor_buffer(
-            state_dict["scaler.non_conservative_stress_scaler_buffer"]
-        )
-        stress_scale = float(sbuf["blocks/0/values.npy"].item())
+    force_scale = _scaler_values(state_dict, "non_conservative_forces")
+    stress_values = _scaler_values(state_dict, "non_conservative_stress")
+    stress_scale = float(stress_values.item()) if stress_values is not None else None
 
     comp = parse_metatensor_buffer(
         state_dict["additive_models.0.energy_composition_buffer"]
@@ -253,6 +279,30 @@ def _extract_metadata(pet_ckpt):
         "stress_scale": stress_scale,
         "shifts": shifts,
     }
+
+
+def _scaler_values(state_dict, target):
+    """Scale values for ``target`` as a flat array, or None if absent.
+
+    metatrain ckpt v13 split the single ``<target>_scaler_buffer`` into
+    per-target × per-property factors whose product is the effective scale.
+    Upgraded checkpoints carry all three buffers, fresh v13+ ones only the
+    pair — prefer the pair, fall back to the old single buffer."""
+    per_target_key = f"scaler.{target}_per_target_scaler_buffer"
+    if per_target_key in state_dict:
+        per_target = parse_metatensor_buffer(state_dict[per_target_key])
+        per_property = parse_metatensor_buffer(
+            state_dict[f"scaler.{target}_per_property_scaler_buffer"]
+        )
+        return (
+            per_target["blocks/0/values.npy"].flatten()
+            * per_property["blocks/0/values.npy"].flatten()
+        )
+    old_key = f"scaler.{target}_scaler_buffer"
+    if old_key in state_dict:
+        buf = parse_metatensor_buffer(state_dict[old_key])
+        return buf["blocks/0/values.npy"].flatten()
+    return None
 
 
 def parse_metatensor_buffer(buf_tensor):

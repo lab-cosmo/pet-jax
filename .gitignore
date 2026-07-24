@@ -35,6 +35,7 @@ uv.lock
 tests/assets/checkpoints/pet-mad-xs/model.msgpack
 tests/assets/checkpoints/pet-mad-xs/metadata.yaml
 tests/assets/checkpoints/pet-mad-s/
+tests/assets/checkpoints/pet-omat-xs/
 
 # Extended test assets (fetched/generated locally; CI uses test_mini only)
 tests/assets/test_s.xyz

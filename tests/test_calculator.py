@@ -407,6 +407,27 @@ def test_adaptive_cutoff_solver_end_to_end(model_data, mini_xyz):
     assert abs(e_solver - e_grid) < 0.5, f"solver vs grid gap: {e_solver - e_grid:.4f} eV"
 
 
+def test_pet_omat_xs_bare_v10_checkpoint(pet_omat_xs_checkpoint, mini_xyz):
+    """The published pet-omat line ships bare (unwrapped) PET checkpoints at
+    ckpt v10 — below the old v11 pin, missing ``attention_temperature``.
+    Conversion must fill the newer hypers by metatrain's upgrade rules and the
+    calculator must run. Full numerical parity against the metatrain reference
+    was verified out-of-suite (max 5.7e-6 eV/atom, 5.3e-5 eV/Å on the mini set);
+    this test guards the version-range plumbing end-to-end.
+    """
+    params, metadata = load_checkpoint(pet_omat_xs_checkpoint)
+    config = metadata["config"]
+    assert config["attention_temperature"] == 1.0
+    assert config["adaptive_cutoff_method"] == "grid"
+    assert config["cutoff_width_adaptive"] == config["cutoff_width"]
+
+    calc = UPETCalculator.from_checkpoint(str(pet_omat_xs_checkpoint), stress=False)
+    atoms = read(str(mini_xyz), index=0)
+    atoms.calc = calc
+    assert np.isfinite(atoms.get_potential_energy())
+    assert np.all(np.isfinite(atoms.get_forces()))
+
+
 def test_debug_stats_and_cutoff_override_warning(model_data, mini_xyz):
     """debug_stats is populated on a rebuild; a too-small cutoff_override warns."""
     model, params, metadata = model_data

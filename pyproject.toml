@@ -42,7 +42,9 @@ Repository = "https://github.com/lab-cosmo/pet-jax"
 Issues = "https://github.com/lab-cosmo/pet-jax/issues"
 
 [project.optional-dependencies]
-convert = ["torch", "metatomic-torch", "metatrain"]
+# The metatrain floor keeps the resolver off the broken metatrain==0.0.0
+# placeholder sdist on PyPI (predates the real releases; fails to build).
+convert = ["torch", "metatomic-torch", "metatrain>=2026.3"]
 
 [project.scripts]
 petjax-convert = "petjax.cli:convert_main"

@@ -84,6 +84,17 @@ def pet_mad_xs_checkpoint():
 
 
 @pytest.fixture(scope="session")
+def pet_omat_xs_checkpoint():
+    path = ASSETS / "checkpoints" / "pet-omat-xs"
+    if not (path / "model.msgpack").exists():
+        pytest.skip(
+            "pet-omat-xs checkpoint missing — run `tox -e fetch-checkpoints` or "
+            "`petjax-convert pet-omat-xs-v1.0.0`"
+        )
+    return path
+
+
+@pytest.fixture(scope="session")
 def pet_mad_s_checkpoint():
     path = ASSETS / "checkpoints" / "pet-mad-s"
     if not (path / "model.msgpack").exists():

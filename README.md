@@ -138,7 +138,7 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
   metadata.yaml    # config (architecture hypers), shifts
 ```
 
-Use `UPETCalculator.from_checkpoint("<ckpt_dir>")` to load. Conversion from the upstream `metatrain` `.ckpt` format goes through `petjax-convert`, which reads the LLPR-wrapped PET-MAD checkpoint directly (no TorchScript intermediate). Checkpoint format is pinned to PET-MAD v1.5.0 (outer `llpr` v3 / inner `pet` v11); other versions are rejected — run `mtt upgrade` on the source to migrate.
+Use `UPETCalculator.from_checkpoint("<ckpt_dir>")` to load. Conversion from the upstream `metatrain` `.ckpt` format goes through `petjax-convert`, which reads the checkpoint directly (no TorchScript intermediate). Both published layouts are accepted: bare PET checkpoints (the pet-omat / pet-omad / … lines) and LLPR-wrapped ones (the PET-MAD releases), with PET checkpoint versions 10 through 16 — the between-version differences are absorbed during conversion, mirroring `metatrain`'s own upgrade rules. Older versions are rejected (run `mtt upgrade` on the source); newer ones are rejected until `pet-jax` catches up.
 
 ## Validation
 
