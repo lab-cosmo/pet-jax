@@ -252,7 +252,7 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
         structure["others"],
         structure["reverse"],
         structure["pair_mask"],
-        structure["species"],
+        structure["atomic_numbers"],
         structure["atom_mask"],
         k_sel,
         config["num_neighbors_adaptive"],

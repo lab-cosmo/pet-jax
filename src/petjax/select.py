@@ -56,7 +56,7 @@ def truncate(
         structure["others"],
         structure["reverse"],
         structure["pair_mask"],
-        structure["species"],
+        structure["atomic_numbers"],
         structure["atom_mask"],
         structure["k_sel_sizer"].shape[-1],
         num_neighbors_adaptive,
@@ -73,7 +73,7 @@ def truncate_edges(
     others,
     reverse,
     pair_mask,
-    species,
+    atomic_numbers,
     atom_mask,
     k_sel,
     num_neighbors_adaptive,
@@ -97,7 +97,7 @@ def truncate_edges(
     couples pairs only through their center/other atoms. Requires ``centers``
     non-decreasing; ``k_sel`` must be a static int under jit.
     """
-    N = species.shape[0]
+    N = atomic_numbers.shape[0]
 
     pair_cutoffs, selected = _select_edges(
         R_ij,
@@ -121,7 +121,7 @@ def truncate_edges(
         "R_ij": R_ij[sel_to_pair],
         "centers": centers[sel_to_pair],
         "neighbors": others[sel_to_pair],
-        "species": species,
+        "atomic_numbers": atomic_numbers,
         "reverse": slot[reverse[sel_to_pair]],
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,
@@ -130,7 +130,7 @@ def truncate_edges(
     return truncated, overflow
 
 
-def pack_edges(R_ij, centers, others, reverse, pair_mask, species, atom_mask, k):
+def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_mask, k):
     """Fixed-width pack on a flat NL with precomputed displacements — no
     selection: every unmasked pair goes into the rectangular ``[N * k]``
     layout. Returns the truncated dict keyed like ``truncate_edges``'s, with
@@ -141,7 +141,7 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, species, atom_mask, k)
     Same layout requirements as ``truncate_edges``: ``centers``
     non-decreasing, ``k`` a static int under jit.
     """
-    N = species.shape[0]
+    N = atomic_numbers.shape[0]
     slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
         pair_mask, centers, N, k
     )
@@ -149,7 +149,7 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, species, atom_mask, k)
         "R_ij": R_ij[sel_to_pair],
         "centers": centers[sel_to_pair],
         "neighbors": others[sel_to_pair],
-        "species": species,
+        "atomic_numbers": atomic_numbers,
         "reverse": slot[reverse[sel_to_pair]],
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,

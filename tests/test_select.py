@@ -32,7 +32,7 @@ def _pack(structure, k):
         structure["others"],
         structure["reverse"],
         structure["pair_mask"],
-        structure["species"],
+        structure["atomic_numbers"],
         structure["atom_mask"],
         k,
     )

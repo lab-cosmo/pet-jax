@@ -47,7 +47,7 @@ class UPET(nn.Module):
         R_ij,
         centers,
         neighbors,
-        species,
+        atomic_numbers,
         reverse,
         pair_mask,
         atom_mask,
@@ -65,7 +65,16 @@ class UPET(nn.Module):
             max_atomic_number=self.max_atomic_number,
             attention_temperature=self.attention_temperature,
             name="backbone",
-        )(R_ij, centers, neighbors, species, reverse, pair_mask, atom_mask, pair_cutoffs)
+        )(
+            R_ij,
+            centers,
+            neighbors,
+            atomic_numbers,
+            reverse,
+            pair_mask,
+            atom_mask,
+            pair_cutoffs,
+        )
 
         predictions = Energy(d_head=self.d_head, name="energy_head")(
             node, edge, cutoffs, pair_mask, atom_mask
@@ -78,7 +87,7 @@ class UPET(nn.Module):
             return energy
 
         # Non-conservative heads: raw per-atom force/stress, scaled by their
-        # loaded scales (forces per-species by Z; stress scalar).
+        # loaded scales (forces per atomic number; stress scalar).
         out = {"energy": energy}
         if self.direct_forces:
             forces = DirectForces(d_head=self.d_head, name="forces_head")(
@@ -87,7 +96,9 @@ class UPET(nn.Module):
             force_scale = self.param(
                 "force_scale", nn.initializers.ones, (self.max_atomic_number + 1,)
             )
-            out["forces"] = forces * force_scale[species][:, None] * atom_mask[:, None]
+            out["forces"] = (
+                forces * force_scale[atomic_numbers][:, None] * atom_mask[:, None]
+            )
         if self.direct_stress:
             stress = DirectStress(d_head=self.d_head, name="stress_head")(
                 node, edge, cutoffs, pair_mask, atom_mask
@@ -121,7 +132,7 @@ class Backbone(nn.Module):
         R_ij,
         centers,
         neighbors,
-        species,
+        atomic_numbers,
         reverse,
         pair_mask,
         atom_mask,
@@ -130,7 +141,7 @@ class Backbone(nn.Module):
         d_pet = self.d_pet
         d_node = self.d_node
         P = R_ij.shape[0]
-        N = species.shape[0]
+        N = atomic_numbers.shape[0]
         n = P // N
 
         r_ij = safe_norm(R_ij, axis=-1)
@@ -149,11 +160,11 @@ class Backbone(nn.Module):
         # Initial edge features; species embeddings index by atomic number Z
         # (table size max_atomic_number + 1, row 0 unused).
         edge_embed = nn.Embed(self.max_atomic_number + 1, d_pet, name="edge_embedder")
-        messages = edge_embed(species)[neighbors] * pair_mask[..., None]
+        messages = edge_embed(atomic_numbers)[neighbors] * pair_mask[..., None]
 
         # Node embedding (feedforward: persists across layers)
         node_embed = nn.Embed(self.max_atomic_number + 1, d_node, name="node_embedders_0")
-        node = node_embed(species)[:, None, :] * atom_mask[:, None, None]
+        node = node_embed(atomic_numbers)[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
             # Geometric features
@@ -179,7 +190,9 @@ class Backbone(nn.Module):
                     d_pet,
                     name=f"gnn_layers_{layer_idx}_neighbor_embed",
                 )
-                neighbor_feats = neighbor_embed(species)[neighbors] * pair_mask[..., None]
+                neighbor_feats = (
+                    neighbor_embed(atomic_numbers)[neighbors] * pair_mask[..., None]
+                )
                 tokens_flat = masked(
                     MLP(
                         (d_pet, d_pet),
