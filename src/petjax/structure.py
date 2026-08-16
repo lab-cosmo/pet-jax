@@ -103,8 +103,8 @@ def to_structure(
     pair_mask[:n_pair_raw] = True
     reverse[:n_pair_raw] = reverse_sparse.astype(int_dtype)
 
-    species = np.zeros(N_padded, dtype=int_dtype)
-    species[:n_atoms] = atoms.get_atomic_numbers()  # embeddings index by atomic number
+    atomic_numbers = np.zeros(N_padded, dtype=int_dtype)
+    atomic_numbers[:n_atoms] = atoms.get_atomic_numbers()
 
     atom_mask = np.zeros(N_padded, dtype=bool)
     atom_mask[:n_atoms] = True
@@ -119,7 +119,7 @@ def to_structure(
     return {
         "positions": positions,
         "cell": cell,
-        "species": species,
+        "atomic_numbers": atomic_numbers,
         "atom_mask": atom_mask,
         "centers": centers,
         "others": others,
