@@ -87,7 +87,7 @@ class UPET(nn.Module):
             return energy
 
         # Non-conservative heads: raw per-atom force/stress, scaled by their
-        # loaded scales (forces per atomic number; stress scalar).
+        # loaded scales (forces per-species by Z; stress scalar).
         out = {"energy": energy}
         if self.direct_forces:
             forces = DirectForces(d_head=self.d_head, name="forces_head")(
