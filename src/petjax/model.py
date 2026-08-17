@@ -216,7 +216,7 @@ class Backbone(nn.Module):
                 )(node, edge, cutoffs_tokens, mask)
 
             # Message passing (feedforward mixing)
-            edge_flat = edge.reshape(P, d_pet)
+            edge_flat = edge.reshape(P, d_pet) * pair_mask[..., None]
             reversed_flat = edge_flat[reverse]
             combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
             combined = nn.LayerNorm(name=f"comb_norms_{layer_idx}")(combined)
