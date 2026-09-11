@@ -1,15 +1,18 @@
 """Shared test fixtures and configuration.
 
 The CI-friendly default runs the "mini" suite: 12 structures in
-`tests/assets/test_mini.xyz` and the LFS-tracked `pet-mad-xs` checkpoint
-under `tests/assets/checkpoints/pet-mad-xs/`.
+`tests/assets/test_mini.xyz` against every checkpoint in `MINI_RELEASES`.
+
+Converted checkpoints are gitignored build artifacts — run
+`tox -e fetch-checkpoints` to rebuild them from the upstream `.ckpt` files.
+Only the reference `.xyz` predictions are tracked.
 
 The extended suite covers the full `test_s` / `test_m` / `test_l` datasets
-and (optionally) `pet-mad-s`. Extended assets are gitignored; populate them
-locally with `petjax-convert` (for the pet-mad-s checkpoint) and local
-inference runs (for the larger reference prediction files). Opt in with
-`pytest --run-extended`; extended tests that cannot find their inputs skip
-individually.
+and (optionally) `pet-mad-s`. Extended assets are gitignored too; populate
+them locally with `petjax-convert` (for the pet-mad-s checkpoint) and
+`tests/generate_references.py` (for the larger reference prediction files).
+Opt in with `pytest --run-extended`; extended tests that cannot find their
+inputs skip individually.
 """
 
 from pathlib import Path
@@ -53,24 +56,34 @@ def assets_dir():
 def mini_xyz():
     path = ASSETS / "test_mini.xyz"
     if not path.exists():
-        pytest.skip("tests/assets/test_mini.xyz is missing — did you pull git-lfs objects?")
+        pytest.skip("tests/assets/test_mini.xyz is missing")
     return path
 
 
-@pytest.fixture(scope="session")
-def mini_predictions_xs():
-    path = ASSETS / "predictions" / "test_mini_pet-mad-xs.xyz"
-    if not path.exists():
-        pytest.skip("mini reference predictions missing (git-lfs pull?)")
-    return path
+# PET-MAD releases the mini suite runs against. Two of them, because v1.6
+# renamed the direct-force readout target (`non_conservative_forces` ->
+# `non_conservative_force`) without bumping the checkpoint version, so only a
+# real checkpoint of each spelling pins that the converter handles both. The
+# v1.5 assets keep the unversioned `pet-mad-xs` name that the extended suite's
+# local-only prediction files are also named after.
+MINI_RELEASES = ("pet-mad-xs", "pet-mad-xs-v1.6")
 
 
-@pytest.fixture(scope="session")
-def mini_predictions_xs_direct():
-    path = ASSETS / "predictions" / "test_mini_pet-mad-xs_direct.xyz"
-    if not path.exists():
-        pytest.skip("mini direct reference predictions missing (git-lfs pull?)")
-    return path
+@pytest.fixture(scope="session", params=MINI_RELEASES)
+def mini_release(request):
+    """(checkpoint dir, conservative reference, direct reference) per release."""
+    name = request.param
+    checkpoint = ASSETS / "checkpoints" / name
+    conservative = ASSETS / "predictions" / f"test_mini_{name}.xyz"
+    direct = ASSETS / "predictions" / f"test_mini_{name}_direct.xyz"
+    missing = [
+        path.name
+        for path in (checkpoint / "model.msgpack", conservative, direct)
+        if not path.exists()
+    ]
+    if missing:
+        pytest.skip(f"mini assets for {name} missing: {', '.join(missing)}")
+    return checkpoint, conservative, direct
 
 
 @pytest.fixture(scope="session")
@@ -78,7 +91,8 @@ def pet_mad_xs_checkpoint():
     path = ASSETS / "checkpoints" / "pet-mad-xs"
     if not (path / "model.msgpack").exists():
         pytest.skip(
-            "pet-mad-xs checkpoint missing — git-lfs pull or `petjax-convert pet-mad-xs`"
+            "pet-mad-xs (v1.5) checkpoint missing — run "
+            "`petjax-convert pet-mad-xs --version 1.5.0`"
         )
     return path
 

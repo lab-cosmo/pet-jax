@@ -1,9 +1,11 @@
 """Cross-check petjax predictions against reference predictions.
 
 Default (CI) mode compares against `tests/assets/predictions/test_mini_*.xyz`
-using the LFS-tracked pet-mad-xs checkpoint. Extended mode additionally runs
-the full test_s / test_m / test_l datasets for both pet-mad-xs and
-pet-mad-s; those assets are local-only and skipped when missing.
+for every release in `conftest.MINI_RELEASES` — the PET-MAD v1.5 and v1.6
+pet-mad-xs checkpoints, whose readout heads are named differently. Extended
+mode additionally runs the full test_s / test_m / test_l datasets for both
+pet-mad-xs and pet-mad-s; those assets are local-only and skipped when
+missing.
 """
 
 import numpy as np
@@ -84,10 +86,13 @@ def load_reference(path):
 _CALC_CACHE = {}
 
 
-def get_calc(ckpt_dir):
-    key = str(ckpt_dir)
+def get_calc(ckpt_dir, direct=False):
+    key = (str(ckpt_dir), direct)
     if key not in _CALC_CACHE:
-        _CALC_CACHE[key] = UPETCalculator.from_checkpoint(str(ckpt_dir), stress=True)
+        extra = {"direct_forces": True, "direct_stress": True} if direct else {}
+        _CALC_CACHE[key] = UPETCalculator.from_checkpoint(
+            str(ckpt_dir), stress=True, **extra
+        )
     return _CALC_CACHE[key]
 
 
@@ -139,25 +144,22 @@ def _assert_stress(calc, structures, ref):
 # -- CI (mini) tests --
 
 
-def test_mini_energies(pet_mad_xs_checkpoint, mini_xyz, mini_predictions_xs):
-    calc = get_calc(pet_mad_xs_checkpoint)
+def test_mini_energies(mini_release, mini_xyz):
+    checkpoint, conservative, _ = mini_release
     structures = read(str(mini_xyz), index=":")
-    ref = load_reference(mini_predictions_xs)
-    _assert_energies(calc, structures, ref)
+    _assert_energies(get_calc(checkpoint), structures, load_reference(conservative))
 
 
-def test_mini_forces(pet_mad_xs_checkpoint, mini_xyz, mini_predictions_xs):
-    calc = get_calc(pet_mad_xs_checkpoint)
+def test_mini_forces(mini_release, mini_xyz):
+    checkpoint, conservative, _ = mini_release
     structures = read(str(mini_xyz), index=":")
-    ref = load_reference(mini_predictions_xs)
-    _assert_forces(calc, structures, ref)
+    _assert_forces(get_calc(checkpoint), structures, load_reference(conservative))
 
 
-def test_mini_stress(pet_mad_xs_checkpoint, mini_xyz, mini_predictions_xs):
-    calc = get_calc(pet_mad_xs_checkpoint)
+def test_mini_stress(mini_release, mini_xyz):
+    checkpoint, conservative, _ = mini_release
     structures = read(str(mini_xyz), index=":")
-    ref = load_reference(mini_predictions_xs)
-    _assert_stress(calc, structures, ref)
+    _assert_stress(get_calc(checkpoint), structures, load_reference(conservative))
 
 
 # -- extended (local) tests: full test_{s,m,l} × pet-mad-{xs,s} matrix --
@@ -214,26 +216,22 @@ def test_extended_stress(extended_combo):
 # -- non-conservative heads --
 
 
-@pytest.fixture(scope="module")
-def direct_calc(pet_mad_xs_checkpoint):
-    return UPETCalculator.from_checkpoint(
-        str(pet_mad_xs_checkpoint), direct_forces=True, direct_stress=True, stress=True
-    )
-
-
-def test_mini_direct_energy(direct_calc, mini_xyz, mini_predictions_xs_direct):
+def test_mini_direct_energy(mini_release, mini_xyz):
+    checkpoint, _, direct = mini_release
     structures = read(str(mini_xyz), index=":")
-    ref = load_reference(mini_predictions_xs_direct)
-    _assert_energies(direct_calc, structures, ref)
+    calc = get_calc(checkpoint, direct=True)
+    _assert_energies(calc, structures, load_reference(direct))
 
 
-def test_mini_direct_forces(direct_calc, mini_xyz, mini_predictions_xs_direct):
+def test_mini_direct_forces(mini_release, mini_xyz):
+    checkpoint, _, direct = mini_release
     structures = read(str(mini_xyz), index=":")
-    ref = load_reference(mini_predictions_xs_direct)
-    _assert_forces(direct_calc, structures, ref)
+    calc = get_calc(checkpoint, direct=True)
+    _assert_forces(calc, structures, load_reference(direct))
 
 
-def test_mini_direct_stress(direct_calc, mini_xyz, mini_predictions_xs_direct):
+def test_mini_direct_stress(mini_release, mini_xyz):
+    checkpoint, _, direct = mini_release
     structures = read(str(mini_xyz), index=":")
-    ref = load_reference(mini_predictions_xs_direct)
-    _assert_stress(direct_calc, structures, ref)
+    calc = get_calc(checkpoint, direct=True)
+    _assert_stress(calc, structures, load_reference(direct))

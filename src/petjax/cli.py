@@ -32,7 +32,7 @@ from pathlib import Path
 
 HF_BASE = "https://huggingface.co/lab-cosmo/upet/resolve/main/models"
 
-DEFAULT_PET_MAD_VERSION = "1.5.0"
+DEFAULT_PET_MAD_VERSION = "1.6.0"
 PET_MAD_VARIANTS = ("pet-mad-xs", "pet-mad-s")
 
 # Full published model name, e.g. "pet-omat-xs-v1.0.0" — anything in the
@@ -42,7 +42,7 @@ _HF_MODEL_NAME = re.compile(r"pet-[a-z]+-[a-z]+-v[\d.]+")
 
 def _pet_mad_url(variant, version):
     """Hugging Face URL for a PET-MAD checkpoint at the given release version,
-    e.g. ``("pet-mad-xs", "1.5.0")`` → ``.../pet-mad-xs-v1.5.0.ckpt``."""
+    e.g. ``("pet-mad-xs", "1.6.0")`` → ``.../pet-mad-xs-v1.6.0.ckpt``."""
     return f"{HF_BASE}/{variant}-v{version}.ckpt"
 
 
