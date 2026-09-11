@@ -10,6 +10,11 @@ the v16 ``backend.`` state-dict prefix) are absorbed here, mirroring
 metatrain's own upgrade rules. Older checkpoints fail hard — run
 ``mtt upgrade``; newer ones fail hard until pet-jax catches up.
 
+Not every upstream change is versioned: PET-MAD v1.6 renamed the direct-force
+readout target from ``non_conservative_forces`` to ``non_conservative_force``
+while leaving the checkpoint version alone. Readout weights are therefore
+scoped by head name, not by version, and both spellings are accepted.
+
 Writes:
     {output_dir}/model.msgpack    -- Flax parameter tree
     {output_dir}/metadata.yaml    -- config, shifts
@@ -260,7 +265,7 @@ def _extract_metadata(pet_ckpt):
 
     # Non-conservative scales (direct-capable checkpoints only): force is one
     # std per trained species, stress a scalar.
-    force_scale = _scaler_values(state_dict, "non_conservative_forces")
+    force_scale = _scaler_values(state_dict, *FORCE_TARGETS)
     stress_values = _scaler_values(state_dict, "non_conservative_stress")
     stress_scale = float(stress_values.item()) if stress_values is not None else None
 
@@ -281,27 +286,32 @@ def _extract_metadata(pet_ckpt):
     }
 
 
-def _scaler_values(state_dict, target):
-    """Scale values for ``target`` as a flat array, or None if absent.
+def _scaler_values(state_dict, *targets):
+    """Scale values as a flat array for the first of ``targets`` present in the
+    checkpoint, or None if none of them is.
+
+    Several names per target exist only because metatrain renamed the
+    direct-force target between PET-MAD v1.5 and v1.6; see ``_HEAD_SCOPES``.
 
     metatrain ckpt v13 split the single ``<target>_scaler_buffer`` into
     per-target × per-property factors whose product is the effective scale.
     Upgraded checkpoints carry all three buffers, fresh v13+ ones only the
     pair — prefer the pair, fall back to the old single buffer."""
-    per_target_key = f"scaler.{target}_per_target_scaler_buffer"
-    if per_target_key in state_dict:
-        per_target = parse_metatensor_buffer(state_dict[per_target_key])
-        per_property = parse_metatensor_buffer(
-            state_dict[f"scaler.{target}_per_property_scaler_buffer"]
-        )
-        return (
-            per_target["blocks/0/values.npy"].flatten()
-            * per_property["blocks/0/values.npy"].flatten()
-        )
-    old_key = f"scaler.{target}_scaler_buffer"
-    if old_key in state_dict:
-        buf = parse_metatensor_buffer(state_dict[old_key])
-        return buf["blocks/0/values.npy"].flatten()
+    for target in targets:
+        per_target_key = f"scaler.{target}_per_target_scaler_buffer"
+        if per_target_key in state_dict:
+            per_target = parse_metatensor_buffer(state_dict[per_target_key])
+            per_property = parse_metatensor_buffer(
+                state_dict[f"scaler.{target}_per_property_scaler_buffer"]
+            )
+            return (
+                per_target["blocks/0/values.npy"].flatten()
+                * per_property["blocks/0/values.npy"].flatten()
+            )
+        old_key = f"scaler.{target}_scaler_buffer"
+        if old_key in state_dict:
+            buf = parse_metatensor_buffer(state_dict[old_key])
+            return buf["blocks/0/values.npy"].flatten()
     return None
 
 
@@ -344,28 +354,55 @@ def _convert_state_dict(state_dict):
         new_key = _rename_key(key)
         np_value = value.cpu().numpy()
         new_key, np_value = _finalize_key(new_key, np_value)
-        out[_scope_key(new_key, key)] = jnp.array(np_value)
+        scoped = _scope_key(new_key, key)
+        # The rename pipeline must be injective: a collision means two source
+        # tensors landed on one Flax parameter, silently discarding one.
+        if scoped in out:
+            raise ValueError(
+                f"state-dict key {key!r} maps onto {scoped!r}, already written "
+                f"by another key — the rename rules are ambiguous for this "
+                f"checkpoint."
+            )
+        out[scoped] = jnp.array(np_value)
     return out
 
 
-# Readout target name (in the source key) -> Flax head-module scope.
-_HEAD_SCOPES = (
-    ("non_conservative_forces", "forces_head"),
-    ("non_conservative_stress", "stress_head"),
-    ("energy", "energy_head"),
-)
+# Readout target name, as spelled in the state-dict key -> Flax head-module
+# scope. The direct-force target is ``non_conservative_forces`` up to PET-MAD
+# v1.5 and ``non_conservative_force`` from v1.6 on; metatrain renamed it
+# without bumping the checkpoint version, so the head name — never the
+# checkpoint version — is what decides the scope, and both spellings map to
+# the same head.
+_HEAD_SCOPES = {
+    "energy": "energy_head",
+    "non_conservative_forces": "forces_head",
+    "non_conservative_force": "forces_head",
+    "non_conservative_stress": "stress_head",
+}
+
+# Both spellings, for the scaler buffers, which are named after the target too.
+FORCE_TARGETS = ("non_conservative_forces", "non_conservative_force")
 
 
 def _scope_key(key, orig_key):
     """Nest a flat key under its module scope: a per-target head module for
     readout heads (``energy_head`` / ``forces_head`` / ``stress_head``),
-    ``backbone`` for everything else."""
+    ``backbone`` for everything else.
+
+    Head keys are ``<head>.<target>.…``, so the target is the second segment —
+    matched exactly, since a substring test cannot tell the two spellings of
+    the direct-force target apart."""
     if not key.startswith(_HEAD_PREFIXES):
         return f"backbone.{key}"
-    for tag, scope in _HEAD_SCOPES:
-        if f".{tag}." in orig_key:
-            return f"{scope}.{key}"
-    return f"energy_head.{key}"
+    target = orig_key.split(".")[1]
+    if target not in _HEAD_SCOPES:
+        # No silent default: an unrecognized target used to fall back to
+        # energy_head and overwrite the energy weights with the other head's.
+        raise ValueError(
+            f"unknown readout target {target!r} in state-dict key {orig_key!r}; "
+            f"pet-jax maps {sorted(_HEAD_SCOPES)}."
+        )
+    return f"{_HEAD_SCOPES[target]}.{key}"
 
 
 def _rename_key(key):

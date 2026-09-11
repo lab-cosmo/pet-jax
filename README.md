@@ -53,7 +53,7 @@ Any environment manager works (`pip`, `uv`, `conda`, ...); the examples below us
 petjax-convert pet-mad-xs --out checkpoints/pet-mad-xs
 ```
 
-This downloads the PET-MAD `.ckpt` from Hugging Face (`lab-cosmo/upet`) and converts it directly to `pet-jax`'s Flax msgpack layout — no TorchScript intermediate. The `convert` extra pulls in `torch`, `metatomic-torch`, and `metatrain` (needed only for conversion; not for inference).
+This downloads the current PET-MAD release (v1.6.0) from Hugging Face (`lab-cosmo/upet`) and converts it directly to `pet-jax`'s Flax msgpack layout — no TorchScript intermediate. Pass `--version` for an older release (`--version 1.5.0`). The `convert` extra pulls in `torch`, `metatomic-torch`, and `metatrain` (needed only for conversion; not for inference).
 
 `petjax-convert` also accepts arbitrary URLs or local `.ckpt` paths:
 
@@ -140,9 +140,11 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 
 Use `UPETCalculator.from_checkpoint("<ckpt_dir>")` to load. Conversion from the upstream `metatrain` `.ckpt` format goes through `petjax-convert`, which reads the checkpoint directly (no TorchScript intermediate). Both published layouts are accepted: bare PET checkpoints (the pet-omat / pet-omad / … lines) and LLPR-wrapped ones (the PET-MAD releases), with PET checkpoint versions 10 through 16 — the between-version differences are absorbed during conversion, mirroring `metatrain`'s own upgrade rules. Older versions are rejected (run `mtt upgrade` on the source); newer ones are rejected until `pet-jax` catches up.
 
+Not everything upstream changes is versioned, though: PET-MAD v1.6 renamed the direct-force readout target from `non_conservative_forces` to `non_conservative_force` while leaving the checkpoint version alone. Conversion therefore dispatches readout weights on the head name rather than the version, accepts both spellings, and refuses (rather than guesses) a head name it does not know.
+
 ## Validation
 
-`tests/test_predictions.py` compares the calculator's output against saved `metatrain` reference `.xyz` files on the mini CI dataset (and the larger `test_s/m/l` datasets under `--run-extended`).
+`tests/test_predictions.py` compares the calculator's output against saved `metatrain` reference `.xyz` files on the mini CI dataset (and the larger `test_s/m/l` datasets under `--run-extended`). The mini suite runs against every release in `conftest.MINI_RELEASES` — currently `pet-mad-xs` at v1.5 and v1.6, one checkpoint per readout-head naming scheme — in both conservative and non-conservative mode. Regenerate the reference files with `tests/generate_references.py` (see its docstring; needs `metatrain >= 2026.4` to read a v16 checkpoint through `metatrain`'s own model classes).
 
 `tests/test_calculator.py` additionally covers:
 
@@ -167,7 +169,7 @@ The canonical task runner is `tox` (with the `tox-uv` plugin so environments are
 
 - `tox -e lint` — `ruff check` + `ruff format --check`
 - `tox -e tests` — `pytest` mini suite (pass `--run-extended` after `--` for the extended local suite)
-- `tox -e fetch-checkpoints` — `petjax-convert pet-mad-xs --out tests/assets/checkpoints/pet-mad-xs` (one-off; uses the `convert` extra)
+- `tox -e fetch-checkpoints` — converts the reference checkpoints the tests need into `tests/assets/checkpoints/` (one-off; uses the `convert` extra)
 
 Bootstrap:
 
