@@ -1,6 +1,6 @@
 """Cross-check petjax predictions against reference predictions.
 
-Default (CI) mode compares against `tests/assets/predictions/test_mini_*.xyz`
+Default (CI) mode compares against `tests/assets/predictions/test_mini_*.npz`
 for every release in `conftest.MINI_RELEASES` — the PET-MAD v1.5 and v1.6
 pet-mad-xs checkpoints, whose readout heads are named differently. Extended
 mode additionally runs the full test_s / test_m / test_l datasets for both
@@ -10,7 +10,6 @@ missing.
 
 import numpy as np
 
-import re
 from pathlib import Path
 
 import pytest
@@ -25,60 +24,28 @@ ASSETS = Path(__file__).parent / "assets"
 # -- reference parsing --
 
 
-def _parse_properties(prop_str):
-    fields = prop_str.split(":")
-    columns = []
-    i = 0
-    while i < len(fields):
-        columns.append((fields[i], fields[i + 1], int(fields[i + 2])))
-        i += 3
-    return columns
+def load_reference(path, structures):
+    """Reference predictions for `structures`, one dict per structure.
 
+    References hold numbers only — energies, forces, stresses — never geometry:
+    the structures come from the dataset file. `natoms` is what ties the two
+    together, so a reference built for a different dataset fails here instead
+    of silently lining up against the wrong frames.
+    """
+    data = np.load(path)
+    natoms = data["natoms"]
+    expected = np.array([len(atoms) for atoms in structures])
+    if not np.array_equal(natoms, expected):
+        raise AssertionError(
+            f"{Path(path).name} does not match the dataset it is compared "
+            f"against: atom counts {natoms.tolist()} vs {expected.tolist()}"
+        )
 
-def _forces_column_offset(prop_str):
-    offset = 0
-    for name, _dtype, count in _parse_properties(prop_str):
-        if name == "forces":
-            return offset
-        offset += count
-    raise ValueError("No 'forces' in Properties")
-
-
-def load_reference(path):
-    with open(path) as f:
-        lines = f.readlines()
-
-    results = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
-        natoms = int(line)
-        comment = lines[i + 1]
-
-        energy = float(re.search(r"energy=([^\s]+)", comment).group(1))
-
-        stress_match = re.search(r'stress="([^"]+)"', comment)
-        stress = np.array(stress_match.group(1).split(), dtype=np.float64).reshape(3, 3)
-
-        prop_match = re.search(r"Properties=([^\s]+)", comment)
-        col_offset = _forces_column_offset(prop_match.group(1))
-
-        forces = np.zeros((natoms, 3))
-        for j in range(natoms):
-            parts = lines[i + 2 + j].split()
-            forces[j] = [
-                float(parts[col_offset]),
-                float(parts[col_offset + 1]),
-                float(parts[col_offset + 2]),
-            ]
-
-        results.append({"energy": energy, "forces": forces, "stress": stress})
-        i += 2 + natoms
-
-    return results
+    forces = np.split(data["forces"], np.cumsum(natoms)[:-1])
+    return [
+        {"energy": float(energy), "forces": per_structure, "stress": stress}
+        for energy, per_structure, stress in zip(data["energy"], forces, data["stress"])
+    ]
 
 
 # -- calculator loading --
@@ -147,19 +114,40 @@ def _assert_stress(calc, structures, ref):
 def test_mini_energies(mini_release, mini_xyz):
     checkpoint, conservative, _ = mini_release
     structures = read(str(mini_xyz), index=":")
-    _assert_energies(get_calc(checkpoint), structures, load_reference(conservative))
+    ref = load_reference(conservative, structures)
+    _assert_energies(get_calc(checkpoint), structures, ref)
 
 
 def test_mini_forces(mini_release, mini_xyz):
     checkpoint, conservative, _ = mini_release
     structures = read(str(mini_xyz), index=":")
-    _assert_forces(get_calc(checkpoint), structures, load_reference(conservative))
+    ref = load_reference(conservative, structures)
+    _assert_forces(get_calc(checkpoint), structures, ref)
 
 
 def test_mini_stress(mini_release, mini_xyz):
     checkpoint, conservative, _ = mini_release
     structures = read(str(mini_xyz), index=":")
-    _assert_stress(get_calc(checkpoint), structures, load_reference(conservative))
+    ref = load_reference(conservative, structures)
+    _assert_stress(get_calc(checkpoint), structures, ref)
+
+
+def test_reference_dataset_mismatch_detected(tmp_path, mini_xyz):
+    """The atom counts are the only tie between a reference and its dataset."""
+    structures = read(str(mini_xyz), index=":")
+    natoms = np.array([len(atoms) for atoms in structures])
+    natoms[0] += 1
+
+    path = tmp_path / "mismatched.npz"
+    np.savez(
+        path,
+        energy=np.zeros(len(structures)),
+        forces=np.zeros((natoms.sum(), 3)),
+        stress=np.zeros((len(structures), 3, 3)),
+        natoms=natoms,
+    )
+    with pytest.raises(AssertionError, match="does not match the dataset"):
+        load_reference(path, structures)
 
 
 # -- extended (local) tests: full test_{s,m,l} × pet-mad-{xs,s} matrix --
@@ -176,7 +164,7 @@ EXTENDED_COMBOS = [
 
 def _extended_combo_available(model_name, dataset):
     ckpt = ASSETS / "checkpoints" / model_name / "model.msgpack"
-    pred = ASSETS / "predictions" / f"{dataset}_{model_name}.xyz"
+    pred = ASSETS / "predictions" / f"{dataset}_{model_name}.npz"
     ds = ASSETS / f"{dataset}.xyz"
     return ckpt.exists() and pred.exists() and ds.exists()
 
@@ -193,8 +181,8 @@ def extended_combo(request):
         pytest.skip(f"Missing extended files for {model_name}/{dataset}")
     ckpt_dir = ASSETS / "checkpoints" / model_name
     calc = get_calc(ckpt_dir)
-    ref = load_reference(ASSETS / "predictions" / f"{dataset}_{model_name}.xyz")
     structures = read(str(ASSETS / f"{dataset}.xyz"), index=":")
+    ref = load_reference(ASSETS / "predictions" / f"{dataset}_{model_name}.npz", structures)
     return calc, ref, structures
 
 
@@ -219,19 +207,19 @@ def test_extended_stress(extended_combo):
 def test_mini_direct_energy(mini_release, mini_xyz):
     checkpoint, _, direct = mini_release
     structures = read(str(mini_xyz), index=":")
-    calc = get_calc(checkpoint, direct=True)
-    _assert_energies(calc, structures, load_reference(direct))
+    ref = load_reference(direct, structures)
+    _assert_energies(get_calc(checkpoint, direct=True), structures, ref)
 
 
 def test_mini_direct_forces(mini_release, mini_xyz):
     checkpoint, _, direct = mini_release
     structures = read(str(mini_xyz), index=":")
-    calc = get_calc(checkpoint, direct=True)
-    _assert_forces(calc, structures, load_reference(direct))
+    ref = load_reference(direct, structures)
+    _assert_forces(get_calc(checkpoint, direct=True), structures, ref)
 
 
 def test_mini_direct_stress(mini_release, mini_xyz):
     checkpoint, _, direct = mini_release
     structures = read(str(mini_xyz), index=":")
-    calc = get_calc(checkpoint, direct=True)
-    _assert_stress(calc, structures, load_reference(direct))
+    ref = load_reference(direct, structures)
+    _assert_stress(get_calc(checkpoint, direct=True), structures, ref)
