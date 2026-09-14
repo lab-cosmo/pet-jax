@@ -396,8 +396,7 @@ def _scope_key(key, orig_key):
         return f"backbone.{key}"
     target = orig_key.split(".")[1]
     if target not in _HEAD_SCOPES:
-        # No silent default: an unrecognized target used to fall back to
-        # energy_head and overwrite the energy weights with the other head's.
+        # Never guess: a misrouted head silently overwrites another head's weights.
         raise ValueError(
             f"unknown readout target {target!r} in state-dict key {orig_key!r}; "
             f"pet-jax maps {sorted(_HEAD_SCOPES)}."

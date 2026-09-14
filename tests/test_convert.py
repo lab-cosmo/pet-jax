@@ -2,9 +2,9 @@
 
 The end-to-end checks live in `test_predictions.py`, which runs real
 checkpoints of both PET-MAD readout-head naming schemes. What is worth pinning
-separately is the head-scoping rule itself, because getting it wrong is silent:
-a readout target that fails to match its head module used to fall through to
-`energy_head` and overwrite the energy weights with another head's.
+separately is the head-scoping rule itself: a readout target that lands on the
+wrong head module overwrites that head's weights, which no shape check
+necessarily catches.
 """
 
 import numpy as np
