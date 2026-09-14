@@ -144,7 +144,7 @@ Not everything upstream changes is versioned, though: PET-MAD v1.6 renamed the d
 
 ## Validation
 
-`tests/test_predictions.py` compares the calculator's output against saved `metatrain` reference `.xyz` files on the mini CI dataset (and the larger `test_s/m/l` datasets under `--run-extended`). The mini suite runs against every release in `conftest.MINI_RELEASES` — currently `pet-mad-xs` at v1.5 and v1.6, one checkpoint per readout-head naming scheme — in both conservative and non-conservative mode. Regenerate the reference files with `tests/generate_references.py` (see its docstring; needs `metatrain >= 2026.4` to read a v16 checkpoint through `metatrain`'s own model classes).
+`tests/test_predictions.py` compares the calculator's output against saved `metatrain` reference predictions on the mini CI dataset (and the larger `test_s/m/l` datasets under `--run-extended`). The mini suite runs against every release in `conftest.MINI_RELEASES` — currently `pet-mad-xs` at v1.5 and v1.6, one checkpoint per readout-head naming scheme — in both conservative and non-conservative mode. References are `.npz` arrays — energies, forces, stresses, and the per-structure atom counts that tie them to the dataset — never geometry, which lives in the dataset file. Regenerate them with `tests/generate_references.py` (see its docstring; needs `metatrain >= 2026.4` to read a v16 checkpoint through `metatrain`'s own model classes).
 
 `tests/test_calculator.py` additionally covers:
 
