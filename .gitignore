@@ -34,6 +34,7 @@ uv.lock
 # artifact reproduced from the upstream metatrain .ckpt.
 tests/assets/checkpoints/pet-mad-xs/model.msgpack
 tests/assets/checkpoints/pet-mad-xs/metadata.yaml
+tests/assets/checkpoints/pet-mad-xs-v1.6/
 tests/assets/checkpoints/pet-mad-s/
 tests/assets/checkpoints/pet-omat-xs/
 
