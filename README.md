@@ -16,6 +16,8 @@ src/petjax/
   structure.py    # host-side neighborlist build
   select.py       # in-JIT adaptive selection
   predict.py      # in-JIT forward + autodiff
+  hessian.py      # positions-Hessian factories (dense + sparse)
+  sparse/         # Hessian sparsity pattern + star coloring (asdex)
   utils.py        # shared helpers
 ```
 
@@ -33,6 +35,12 @@ Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra
 
 ```bash
 pip install "pet-jax[convert] @ git+https://github.com/lab-cosmo/pet-jax"
+```
+
+Sparse Hessians (see [Hessians](#hessians)) need the `sparse` extra (`asdex`, `scipy`); the dense Hessian works without it:
+
+```bash
+pip install "pet-jax[sparse] @ git+https://github.com/lab-cosmo/pet-jax"
 ```
 
 Or from a checkout, which is the easiest way to also get the examples and tests:
@@ -130,6 +138,26 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 - **Adaptive cutoff**: per-atom, recomputed inside the autograd graph each step (required for force correctness). The selection runs at the checkpoint's `cutoff_width_adaptive` — recent `metatrain` versions split it off the final-taper `cutoff_width`; checkpoints converted before the split fall back to the shared value, matching upstream's own migration rule. Both upstream selection algorithms are implemented and picked via the checkpoint's `adaptive_cutoff_method`: `grid` (probe grid + Gaussian weights, what pre-split checkpoints trained with) and `solver` (Newton-bisection root find, the upstream default for new trainings; gradients attach via an implicit-function-theorem step).
 - **Non-conservative forces/stress**: PET-MAD checkpoints also carry direct force/stress heads. Pass `direct_forces=True` / `direct_stress=True` to `from_checkpoint` to read forces/stress straight from those heads (skipping autodiff — cheaper, no double-backward) instead of differentiating the energy. The default stays conservative (autodiff). Both reproduce the metatrain reference to fp32; for forces the per-structure mean is subtracted to remove the spurious net force the direct head would otherwise leave (matching metatrain's calculator).
 
+## Hessians
+
+`UPETCalculator.hessian` returns the positions-Hessian of the energy as an `(n, 3, n, 3)` float64 array, `H[a, α, b, β] = ∂²E / ∂R[a, α] ∂R[b, β]`, for phonons, heat capacities, or any other second-order property. It needs a calculator built with `default_dtype="float64"`.
+
+```python
+calc = UPETCalculator.from_checkpoint("checkpoints/pet-mad-xs", default_dtype="float64")
+
+H_dense = calc.hessian(atoms)                  # 3n Hessian-vector products, the reference
+H_exact = calc.hessian(atoms, hops="exact")    # sparse, exact for this model
+H_trunc = calc.hessian(atoms, hops=3)          # sparse, truncated to 3 graph hops
+```
+
+The dense path (the default, `hops=None`) sweeps the identity basis with forward-over-reverse Hessian-vector products (HVPs), in chunks of `chunk_size` to bound memory. It is the only mode that allows the shadow coupling through the adaptive cutoff, and it is the reference.
+
+The sparse path exploits that two atoms couple in the Hessian only if a chain of selected neighbour edges connects them within the model's reach: `K = 2L + 1` hops for PET with `L` message-passing layers (the energy is read off edge messages, one hop wider than a node readout). The sparsity pattern is that reachability on the selected neighbour list; a star coloring of the pattern, found on the atom graph and lifted to Cartesian coordinates, compresses the Hessian into one HVP per color instead of `3n`. `hops="exact"` computes the full Hessian this way and agrees with the dense no-shadow Hessian to rounding. An integer `hops` below `K` truncates: couplings beyond that distance are dropped and, since the compression assumes them zero, fold into the retained entries. Force-constant blocks decay by roughly an order of magnitude per hop, so truncation is a good trade for derived observables — with 0.1% as the threshold for the heat capacity, PET-S is converged at `hops=3` and PET-XS at `hops=4` for the vast majority of MOF structures (zeolites need one more hop), and at exact `K` the heat capacity agrees with the dense reference to better than 1e-5 relative. Method, derivation of `K`, and these numbers: Langer, Hill, Ceriotti, *Truncated automatic sparse differentiation for machine learning interatomic potentials*, [arXiv:2609.20510](https://arxiv.org/abs/2609.20510) (2026), with code and data at [marcel.science/tasd4mlip](https://marcel.science/tasd4mlip). Coloring and decompression come from [`asdex`](https://github.com/adrhill/asdex), via the `sparse` extra.
+
+The sparse pattern is derived from the selected neighbour list and is only valid when no gradient flows through the adaptive cutoff, so sparse mode forces `no_shadow=True` and raises if `no_shadow=False` is asked for; it never produces a silently wrong Hessian. Dense mode resolves `no_shadow=None` to the calculator's own setting, so the dense Hessian is consistent with the forces that calculator returns (the Hessian always differentiates the energy; for a `direct_forces` calculator it is not the derivative of the head's forces). Composition shifts are constant in positions and never enter. The adaptive selection is recomputed at every call; the coloring is cached on the selected pair set, and the jitted Hessian function with it, one entry each, so a geometry whose selection differs from the last one recolors and recompiles. `remat=True` recomputes the forward per HVP batch instead of holding its residuals, for large cells.
+
+The building blocks are public for custom drivers: `petjax.hessian` has the energy function and the dense and sparse Hessian factories, `petjax.sparse` the pattern and coloring on a bare pair list. `tests/test_hop_count.py` pins `K = 2L + 1` on a graph deep enough to distinguish it from `K ± 1`.
+
 ## Checkpoint format
 
 `pet-jax` checkpoints are a directory with two files:
@@ -210,13 +238,20 @@ Optional (the `convert` extra — see [Installation](#installation)):
 
 - `torch`, `metatomic-torch`, `metatrain` — only needed when converting `metatrain` `.ckpt` files. Inference itself runs on the JAX stack alone.
 
+Optional (the `sparse` extra — see [Hessians](#hessians)):
+
+- `asdex` — star coloring and sparse Hessian decompression (pulls in `numba`). Its floors are stricter than ours: `asdex` 0.5.1 needs `jax >= 0.9` and Python ≥ 3.11, `asdex` 0.5.2 needs `jax >= 0.11` and Python ≥ 3.12. The extra does not raise `pet-jax`'s own floors; on an older Python the resolver simply fails.
+- `scipy` — graph reachability for the sparsity pattern
+
+Second-order autodiff under `jit` is broken in `jax` 0.11.0 (silent, nondeterministic NaNs); the test environments pin `jax != 0.11.0`. 0.10.x and 0.11.2 are verified clean on the Hessian tests.
+
 ## Contributing
 
 Code conventions (`ruff` config, naming patterns, file layout, JIT placement rule, Markdown soft-wrap, internal NL/attention conventions) and the architecture deep-dive live in [`src/petjax/README.md`](src/petjax/README.md). Read it before submitting non-trivial PRs.
 
 ## Status
 
-Working: inference, forces, stress, BFGS/FIRE relaxations, cell optimization, `metatrain` checkpoint conversion, parity with upstream PET.
+Working: inference, forces, stress, BFGS/FIRE relaxations, cell optimization, dense and sparse (truncated) Hessians, `metatrain` checkpoint conversion, parity with upstream PET.
 
 Not yet: training (use `metatrain` directly), batched multi-structure inference in the calculator (single-structure only), GPU performance tuning.
 
