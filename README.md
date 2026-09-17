@@ -101,6 +101,8 @@ The solution to this is a two-phase design: Outside of `jax`, we compute the ini
 
 For neighbor lists already trimmed to a fixed neighbor count upstream, `pack_edges` is the selection-free sibling of `truncate_edges`: it packs to the same fixed-width layout, skipping the adaptive-cutoff selection (`pair_cutoffs=None`).
 
+`select_edges` runs the sizing pass on a structure dict and returns the selected-pair mask host-side, for consumers that need the model's actual adjacency rather than the raw neighbor ball (the Hessian sparsity pattern, graph-distance analyses).
+
 For the design rationale and more details, see [`src/petjax/README.md`](src/petjax/README.md).
 
 ## Performance knobs

@@ -112,3 +112,43 @@ def test_pack_edges_forward_smoke(structure):
     params = model.init(jax.random.key(0), **packed)
     energy = model.apply(params, **packed)
     assert bool(jnp.all(jnp.isfinite(energy)))
+
+
+# -- select_edges: the adaptive selection's mask, host-side --
+
+
+def test_select_edges_mask(structure):
+    """The public mask is the sizing pass's own selection: padded pairs off,
+    symmetric under ``reverse``, max per-center count equal to ``k_sel``, and
+    bit-identical to the eager selection core on the same displacements."""
+    from petjax import select_edges
+    from petjax.select import _select_edges, determine_k_sel
+    from petjax.utils import edge_displacements
+
+    hypers = dict(num_neighbors_adaptive=4, cutoff=CUTOFF, cutoff_width_adaptive=0.5)
+    selected = select_edges(structure, **hypers, method="grid")
+
+    assert selected.dtype == bool and selected.shape == structure["centers"].shape
+    assert not selected[~structure["pair_mask"]].any()
+    assert np.array_equal(selected[structure["reverse"]], selected)
+
+    k_sel, _ = determine_k_sel(structure, **hypers, method="grid")
+    assert np.bincount(structure["centers"][selected]).max() == k_sel
+
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+    _, eager = _select_edges(
+        R_ij,
+        structure["centers"],
+        structure["others"],
+        structure["pair_mask"],
+        structure["positions"].shape[0],
+        **hypers,
+        method="grid",
+    )
+    assert np.array_equal(selected, np.asarray(eager))
