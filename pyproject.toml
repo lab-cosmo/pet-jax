@@ -28,8 +28,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "jax>=0.4.30",
-    "jaxlib>=0.4.30",
+    # 0.4.31: `jax.lax.map(..., batch_size=)`, used by the dense Hessian.
+    "jax>=0.4.31",
+    "jaxlib>=0.4.31",
     "flax>=0.8",
     "numpy>=1.26",
     "ase>=3.23",
@@ -45,6 +46,10 @@ Issues = "https://github.com/lab-cosmo/pet-jax/issues"
 # The metatrain floor keeps the resolver off the broken metatrain==0.0.0
 # placeholder sdist on PyPI (predates the real releases; fails to build).
 convert = ["torch", "metatomic-torch", "metatrain>=2026.3"]
+# Sparse Hessians (`UPETCalculator.hessian` with `hops`): star coloring and
+# decompression via asdex, graph reachability via scipy. asdex needs jax >= 0.9
+# and pulls in numba; the dense Hessian path works without the extra.
+sparse = ["asdex>=0.5.1", "scipy>=1.11"]
 
 [project.scripts]
 petjax-convert = "petjax.cli:convert_main"
@@ -77,6 +82,10 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
+    # jax 0.11.0 NaN-poisons jitted second-order AD nondeterministically and
+    # silently; the Hessian tests need a clean release. 0.10.x and 0.11.2 are.
+    "jax!=0.11.0",
+    "jaxlib!=0.11.0",
     "pytest>=8.0",
     "ruff>=0.15.10",
     "tox>=4",
