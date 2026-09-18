@@ -8,6 +8,7 @@ from .select import (
     get_adaptive_cutoffs,
     get_adaptive_cutoffs_solver,
     pack_edges,
+    select_edges,
     truncate,
     truncate_edges,
 )
@@ -31,5 +32,6 @@ __all__ = [
     "truncate",
     "truncate_edges",
     "pack_edges",
+    "select_edges",
     "get_predict_fn",
 ]

@@ -14,7 +14,8 @@ unmasked pair, for NLs already trimmed upstream (e.g. a kNN pass).
 
 Two distinct JIT contexts touch this module:
   - ``_k_sel_kernel`` (``@jax.jit``, the sizing path) — CPU-pinned by
-    ``determine_k_sel``, runs once per NL-rebuild.
+    ``determine_k_sel`` (runs once per NL-rebuild) and by ``select_edges``,
+    which returns the same pass's selected-pair mask host-side.
   - ``truncate`` is **undecorated** and traced by ``predict.predict_fn`` —
     runs on the default device, every step.
 
@@ -22,6 +23,7 @@ Rule: do not ``@jax.jit`` the traced helpers below — that nests jit inside
 ``predict_fn``. Decorate only entry points.
 """
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 
@@ -158,7 +160,7 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_m
     return truncated, overflow
 
 
-# -- k_sel sizing: CPU-pinned standalone jit kernel; called via determine_k_sel --
+# -- k_sel sizing + selected mask: CPU-pinned standalone jit kernel --
 
 
 def determine_k_sel(
@@ -183,12 +185,51 @@ def determine_k_sel(
     adaptive cutoff (host float) — the selection's "real reach", for tuning
     ``cutoff_override``.
     """
-    cpu = jax.devices("cpu")[0]
-    cpu_structure = jax.device_put(structure, cpu)
-    max_count, max_cutoff = _k_sel_kernel(
-        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method=method
+    max_count, max_cutoff, _selected = _run_k_sel_kernel(
+        structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method
     )
     return max(int(max_count), 1), float(max_cutoff)
+
+
+def select_edges(
+    structure,
+    num_neighbors_adaptive,
+    cutoff,
+    cutoff_width_adaptive,
+    method="grid",
+):
+    """The adaptive selection's per-pair mask for a structure dict, host-side.
+
+    Runs the same CPU-pinned kernel as ``determine_k_sel`` and returns the
+    ``[n_pair_padded]`` boolean mask of raw-NL pairs the model will attend
+    over: exactly the pairs ``truncate`` packs for these positions. Padded pairs
+    are ``False``. The mask is a value, so there is no ``no_shadow`` argument —
+    that only changes what the selection's gradient sees, never which pairs
+    survive.
+
+    For consumers that need the model's actual adjacency rather than the raw
+    neighbour ball: the Hessian sparsity pattern, graph-distance analyses.
+    Like ``determine_k_sel``, ``cutoff`` is the trained maximum cutoff, not a
+    ``cutoff_override``.
+    """
+    _max_count, _max_cutoff, selected = _run_k_sel_kernel(
+        structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method
+    )
+    return np.asarray(selected, dtype=bool)
+
+
+def _run_k_sel_kernel(
+    structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method
+):
+    # Only what the kernel reads: the pytree structure is part of the jit cache
+    # key, so a caller passing a dict with extra keys (the calculator's, which
+    # carries `k_sel_sizer`) must not compile a second executable.
+    keys = ("positions", "cell", "centers", "others", "cell_shifts", "pair_mask")
+    cpu = jax.devices("cpu")[0]
+    cpu_structure = jax.device_put({k: structure[k] for k in keys}, cpu)
+    return _k_sel_kernel(
+        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method=method
+    )
 
 
 # jit on the inner k_sel kernel is fine in steady state: everything but the
@@ -239,7 +280,7 @@ def _k_sel_kernel(
     # Largest adaptive cutoff among selected pairs — the real reach of the
     # selection. 0.0 if nothing is selected (degenerate: isolated atom).
     max_cutoff = jnp.max(jnp.where(selected, pair_cutoffs, 0.0))
-    return counts.max(), max_cutoff
+    return counts.max(), max_cutoff, selected
 
 
 # -- adaptive per-atom cutoffs --
