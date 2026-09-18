@@ -26,9 +26,19 @@ The top-level README explains the 2-phase split (outside JIT = build + size; ins
 - The Verlet skin check skips the raw-NL rebuild while displacements stay below the skin. Position-only updates re-derive `R_ij` inside JIT from cached cell shifts and avoid all host-side work.
 - If any atom selects more than `k_sel` neighbours, `predict_fn` returns `overflow=True`. The calculator rebuilds with `k_sel_actual + extra_neighbors` and retries. One retry covers all but pathological cases.
 
+**Hessians** — `hessian.get_energy_fn` + the two Hessian factories, orchestrated by `UPETCalculator.hessian`
+
+- The energy differentiated is `predict._select_and_predict` with the adaptive selection re-run inside every call, exactly as the forward does; only `no_shadow` is threaded. Positions are a separate argument so the AD machinery differentiates one `(N, 3)` array; `params` and the structure are captured as tracers under jit, never baked into the executable.
+- The sparse path (`petjax.sparse`, asdex-bound) is deliberately model-agnostic: pair list in, `asdex` objects out, so it can move into `asdex` later. The pattern is `(I + A)^hops` on the *selected* adjacency (the raw ball would only inflate the coloring). The coloring is found on the `N x N` atom graph and lifted to `3N x 3N`: every atom pair is a dense 3x3 block, so coloring coordinates would do 9x the work for the same colors, and the atom-level hub choice settles all nine entries of a block. The lift validates the coloring (a merely distance-1 coloring decompresses wrongly and is rejected).
+- The pattern is only exact without shadow coupling: with gradients through the adaptive cutoff, an atom couples to everything that moved its cutoff, which is the raw ball and not the selected list. Hence sparse forces `no_shadow=True`.
+- The selection is recomputed at every `hessian` call, not cached with the Verlet NL: positions move under the skin without a rebuild, and a rebuild-time pattern could miss a pair selected at Hessian time — a silently wrong Hessian. The coloring is cached on a digest of the selected pair set, the jitted Hessian fn on the full configuration; one entry each, dropped on every rebuild.
+- Known gap: the pattern's selection (the CPU sizing kernel) and the energy's (traced inside the Hessian fn) are two separately compiled evaluations of the same function, and XLA may round the segment sums differently in each. A pair sitting exactly on its pair cutoff could in principle be classified differently by the two. Not closable from here; documented on the method.
+- The coloring is baked into the jitted Hessian fn, and its array shapes change with the pattern, so a geometry whose selection differs from the cached one recolors and recompiles. Fine for phonons at a relaxed geometry; a Hessian along a trajectory pays a compile whenever the pair set moves.
+- Dense is chunked forward-over-reverse HVPs against the identity (seeds are basis *indices*, the one-hot tangent is built inside the HVP), sharing `chunk_size` / `remat` semantics with the sparse path so the two are interchangeable.
+
 ## JIT placement rule
 
-The only `@jax.jit` sites in the package are `select._k_sel_kernel` (CPU-pinned, sizing) and `predict.predict_fn` (forward, default device). Every other helper is undecorated and traced into whichever entry point calls it. **Do not add `@jax.jit` elsewhere** — nesting jit inside `predict_fn` defeats the trace-once-then-execute model and silently inflates compile times.
+The only `@jax.jit` sites in the package are `select._k_sel_kernel` (CPU-pinned, sizing), `predict.predict_fn` (forward, default device), and the Hessian function `UPETCalculator._run_hessian` builds per configuration (one cached entry). Every other helper is undecorated and traced into whichever entry point calls it. **Do not add `@jax.jit` elsewhere** — nesting jit inside `predict_fn` defeats the trace-once-then-execute model and silently inflates compile times.
 
 ## Key invariant
 
