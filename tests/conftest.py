@@ -15,9 +15,15 @@ Opt in with `pytest --run-extended`; extended tests that cannot find their
 inputs skip individually.
 """
 
+import os
 from pathlib import Path
 
 import pytest
+
+# Enough CPU devices for the shard_map tests. XLA reads this at backend init,
+# so it must be set before any test module imports jax -- conftest is imported
+# first, which makes this the one place it can live.
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 
 ASSETS = Path(__file__).parent / "assets"
 

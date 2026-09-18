@@ -298,9 +298,14 @@ def get_adaptive_cutoffs_solver(
     r_ij_d = jax.lax.stop_gradient(r_ij)
 
     # Bracket [r_lo, r_hi] with f(r_lo) <= 0 <= f(r_hi): n_total(0) = 0 and the
-    # baseline alone reaches num_neighbors at r = cutoff.
-    r_lo = jnp.zeros(num_atoms, dtype=r_ij.dtype)
-    r_hi = jnp.full(num_atoms, cutoff, dtype=r_ij.dtype)
+    # baseline alone reaches num_neighbors at r = cutoff. The carry must enter
+    # varying to match the body's outputs (derived from this shard's r_ij);
+    # axes read off the data, so no-op outside shard_map.
+    varying = tuple(jax.typeof(r_ij_d).manual_axis_type.varying)
+    r_lo = jax.lax.pcast(jnp.zeros(num_atoms, dtype=r_ij.dtype), varying, to="varying")
+    r_hi = jax.lax.pcast(
+        jnp.full(num_atoms, cutoff, dtype=r_ij.dtype), varying, to="varying"
+    )
 
     # 10 iterations converge to fp32 precision (upstream's choice). Newton
     # steps that would leave the bracket (flat shoulders between bumps) fall
