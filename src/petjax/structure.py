@@ -129,6 +129,53 @@ def to_structure(
     }
 
 
+# The atoms.info keys a conditioned model reads; "spin" is the OMol dataset's
+# spelling of the multiplicity, accepted as a fallback like metatomic's ASE
+# calculator does.
+CONDITIONING_INFO_KEYS = ("charge", "spin_multiplicity", "spin")
+
+
+def conditioning_inputs(
+    atoms, N_padded, max_charge, max_spin_multiplicity, int_dtype=np.int64
+):
+    """Per-atom ``charge`` / ``spin_multiplicity`` arrays ``[N_padded]`` for a
+    conditioned model, read from ``atoms.info`` under the same keys metatrain
+    uses; a missing key means neutral (0) / singlet (1), as upstream defaults.
+
+    Validated here, host-side, because the embedding lookup inside JIT would
+    clamp an out-of-range index silently: values must be integers within
+    ``[-max_charge, max_charge]`` and ``[1, max_spin_multiplicity]``.
+    """
+    charge = _integer_info(atoms, "charge", 0)
+    # metatomic's ASE calculator falls back to "spin", the OMol dataset's key.
+    spin_key = "spin_multiplicity" if "spin_multiplicity" in atoms.info else "spin"
+    spin_multiplicity = _integer_info(atoms, spin_key, 1)
+    if not -max_charge <= charge <= max_charge:
+        raise ValueError(
+            f"charge={charge} outside the model's range [{-max_charge}, {max_charge}] "
+            f"(max_charge in the checkpoint config)."
+        )
+    if not 1 <= spin_multiplicity <= max_spin_multiplicity:
+        raise ValueError(
+            f"spin_multiplicity={spin_multiplicity} outside the model's range "
+            f"[1, {max_spin_multiplicity}] (max_spin_multiplicity in the checkpoint "
+            f"config)."
+        )
+    return {
+        "charge": np.full(N_padded, charge, dtype=int_dtype),
+        "spin_multiplicity": np.full(N_padded, spin_multiplicity, dtype=int_dtype),
+    }
+
+
+def _integer_info(atoms, key, default):
+    value = atoms.info.get(key, default)
+    if np.ndim(value) != 0 or float(value) != int(value):
+        raise ValueError(
+            f"atoms.info[{key!r}] must be a single integer value; got {value!r}."
+        )
+    return int(value)
+
+
 # -- helpers --
 
 

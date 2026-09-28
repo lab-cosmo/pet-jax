@@ -60,30 +60,37 @@ def mini_xyz():
     return path
 
 
-# PET-MAD releases the mini suite runs against. Two of them, because v1.6
-# renamed the direct-force readout target (`non_conservative_forces` ->
-# `non_conservative_force`) without bumping the checkpoint version, so only a
-# real checkpoint of each spelling pins that the converter handles both. The
-# v1.5 assets keep the unversioned `pet-mad-xs` name that the extended suite's
-# local-only prediction files are also named after.
-MINI_RELEASES = ("pet-mad-xs", "pet-mad-xs-v1.6")
+# Releases the mini suite runs against, with the dataset each one is scored
+# on. Two PET-MAD checkpoints, because v1.6 renamed the direct-force readout
+# target (`non_conservative_forces` -> `non_conservative_force`) without
+# bumping the checkpoint version, so only a real checkpoint of each spelling
+# pins that the converter handles both; the v1.5 assets keep the unversioned
+# `pet-mad-xs` name that the extended suite's local-only prediction files are
+# also named after. PET-OMol-S is charge/spin conditioned and runs on the
+# mini set with a (charge, multiplicity) pair stamped on every frame.
+MINI_RELEASES = (
+    ("pet-mad-xs", "test_mini"),
+    ("pet-mad-xs-v1.6", "test_mini"),
+    ("pet-omol-s", "test_mini_conditioned"),
+)
 
 
-@pytest.fixture(scope="session", params=MINI_RELEASES)
+@pytest.fixture(scope="session", params=MINI_RELEASES, ids=[r[0] for r in MINI_RELEASES])
 def mini_release(request):
-    """(checkpoint dir, conservative reference, direct reference) per release."""
-    name = request.param
+    """(checkpoint dir, dataset, conservative reference, direct reference)."""
+    name, dataset = request.param
     checkpoint = ASSETS / "checkpoints" / name
-    conservative = ASSETS / "predictions" / f"test_mini_{name}.npz"
-    direct = ASSETS / "predictions" / f"test_mini_{name}_direct.npz"
+    structures = ASSETS / f"{dataset}.xyz"
+    conservative = ASSETS / "predictions" / f"{dataset}_{name}.npz"
+    direct = ASSETS / "predictions" / f"{dataset}_{name}_direct.npz"
     missing = [
         path.name
-        for path in (checkpoint / "model.msgpack", conservative, direct)
+        for path in (checkpoint / "model.msgpack", structures, conservative, direct)
         if not path.exists()
     ]
     if missing:
         pytest.skip(f"mini assets for {name} missing: {', '.join(missing)}")
-    return checkpoint, conservative, direct
+    return checkpoint, structures, conservative, direct
 
 
 @pytest.fixture(scope="session")

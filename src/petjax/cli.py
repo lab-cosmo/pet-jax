@@ -68,8 +68,16 @@ def _download(url, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+        expected = r.headers.get("Content-Length")
         while chunk := r.read(1 << 20):
             f.write(chunk)
+    # A connection cut short leaves a truncated zip that torch reports as a
+    # "corrupted checkpoint"; catch it here, and leave no file behind that a
+    # retry would take for the finished download.
+    if expected is not None and tmp.stat().st_size != int(expected):
+        size = tmp.stat().st_size
+        tmp.unlink()
+        raise OSError(f"download truncated: got {size} of {expected} bytes")
     tmp.rename(dest)
     print(f"[fetch] saved {dest}")
 

@@ -13,7 +13,12 @@ from ase.stress import full_3x3_to_voigt_6_stress
 
 from .predict import get_predict_fn
 from .select import select_edges
-from .structure import _bucket_or, to_structure
+from .structure import (
+    CONDITIONING_INFO_KEYS,
+    _bucket_or,
+    conditioning_inputs,
+    to_structure,
+)
 from .utils import cast_floats
 
 
@@ -140,6 +145,17 @@ class UPETCalculator(BaseCalculator):
         )
         return cls(model, params, metadata, **kwargs)
 
+    def check_state(self, atoms, tol=1e-15):
+        # ASE's compare_atoms covers arrays, cell and pbc but not atoms.info;
+        # for a conditioned model a new charge or spin multiplicity must
+        # invalidate the cached results too.
+        changes = super().check_state(atoms, tol=tol)
+        if self._model.system_conditioning and self.atoms is not None:
+            for key in CONDITIONING_INFO_KEYS:
+                if atoms.info.get(key) != self.atoms.info.get(key):
+                    changes.append(key)
+        return changes
+
     def calculate(self, atoms=None, properties=None, system_changes=None, **kwargs):
         if atoms is None:
             atoms = self.atoms
@@ -265,6 +281,7 @@ class UPETCalculator(BaseCalculator):
         # shape; the JIT retraces when k_sel (or any other shape) changes.
         self._structure = {
             **self._to_jax_structure(structure),
+            **self._conditioning(atoms, N_padded),
             "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
         }
         max_shift = (
@@ -374,7 +391,8 @@ class UPETCalculator(BaseCalculator):
         print("\n".join(lines), file=sys.stderr)
 
     def _update_geometry(self, atoms):
-        """Update positions and cell without rebuilding NL."""
+        """Update positions, cell, and the conditioning inputs without
+        rebuilding the NL."""
         n_real = len(atoms)
         N_padded = self._N_padded
         positions = np.zeros((N_padded, 3), dtype=np.float64)
@@ -384,7 +402,19 @@ class UPETCalculator(BaseCalculator):
             **self._structure,
             "positions": jnp.array(positions, dtype=self._dtype),
             "cell": jnp.array(cell, dtype=self._dtype),
+            **self._conditioning(atoms, N_padded),
         }
+
+    def _conditioning(self, atoms, N_padded):
+        """Charge / spin-multiplicity inputs for a conditioned model, read off
+        ``atoms.info`` on every step (values only, never a shape, so no
+        retrace); nothing for an unconditioned one, so its JIT inputs are
+        unchanged."""
+        if not self._model.system_conditioning:
+            return {}
+        return conditioning_inputs(
+            atoms, N_padded, self._model.max_charge, self._model.max_spin_multiplicity
+        )
 
 
 class NeighborListCache:

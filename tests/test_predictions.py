@@ -2,7 +2,10 @@
 
 Default (CI) mode compares against `tests/assets/predictions/test_mini_*.npz`
 for every release in `conftest.MINI_RELEASES` — the PET-MAD v1.5 and v1.6
-pet-mad-xs checkpoints, whose readout heads are named differently. Extended
+pet-mad-xs checkpoints, whose readout heads are named differently, and the
+charge/spin conditioned PET-OMol-S on a mini set carrying a (charge,
+multiplicity) pair per frame in `atoms.info`, which the calculator reads
+exactly as `metatrain`'s ASE calculator does. Extended
 mode additionally runs the full test_s / test_m / test_l datasets for both
 pet-mad-xs and pet-mad-s; those assets are local-only and skipped when
 missing.
@@ -16,7 +19,7 @@ import pytest
 from ase.io import read
 from ase.stress import voigt_6_to_full_3x3_stress
 
-from petjax import UPETCalculator
+from petjax import UPETCalculator, load_checkpoint
 
 ASSETS = Path(__file__).parent / "assets"
 
@@ -54,9 +57,18 @@ _CALC_CACHE = {}
 
 
 def get_calc(ckpt_dir, direct=False):
+    """Direct mode reads every non-conservative head the checkpoint carries;
+    a checkpoint with a force head only (PET-OMol) keeps the strain-derivative
+    stress, as the reference generator does."""
     key = (str(ckpt_dir), direct)
     if key not in _CALC_CACHE:
-        extra = {"direct_forces": True, "direct_stress": True} if direct else {}
+        extra = {}
+        if direct:
+            params, _ = load_checkpoint(str(ckpt_dir))
+            extra = {
+                "direct_forces": True,
+                "direct_stress": "stress_head" in params["params"],
+            }
         _CALC_CACHE[key] = UPETCalculator.from_checkpoint(
             str(ckpt_dir), stress=True, **extra
         )
@@ -111,23 +123,23 @@ def _assert_stress(calc, structures, ref):
 # -- CI (mini) tests --
 
 
-def test_mini_energies(mini_release, mini_xyz):
-    checkpoint, conservative, _ = mini_release
-    structures = read(str(mini_xyz), index=":")
+def test_mini_energies(mini_release):
+    checkpoint, dataset, conservative, _ = mini_release
+    structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
     _assert_energies(get_calc(checkpoint), structures, ref)
 
 
-def test_mini_forces(mini_release, mini_xyz):
-    checkpoint, conservative, _ = mini_release
-    structures = read(str(mini_xyz), index=":")
+def test_mini_forces(mini_release):
+    checkpoint, dataset, conservative, _ = mini_release
+    structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
     _assert_forces(get_calc(checkpoint), structures, ref)
 
 
-def test_mini_stress(mini_release, mini_xyz):
-    checkpoint, conservative, _ = mini_release
-    structures = read(str(mini_xyz), index=":")
+def test_mini_stress(mini_release):
+    checkpoint, dataset, conservative, _ = mini_release
+    structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
     _assert_stress(get_calc(checkpoint), structures, ref)
 
@@ -204,22 +216,22 @@ def test_extended_stress(extended_combo):
 # -- non-conservative heads --
 
 
-def test_mini_direct_energy(mini_release, mini_xyz):
-    checkpoint, _, direct = mini_release
-    structures = read(str(mini_xyz), index=":")
+def test_mini_direct_energy(mini_release):
+    checkpoint, dataset, _, direct = mini_release
+    structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
     _assert_energies(get_calc(checkpoint, direct=True), structures, ref)
 
 
-def test_mini_direct_forces(mini_release, mini_xyz):
-    checkpoint, _, direct = mini_release
-    structures = read(str(mini_xyz), index=":")
+def test_mini_direct_forces(mini_release):
+    checkpoint, dataset, _, direct = mini_release
+    structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
     _assert_forces(get_calc(checkpoint, direct=True), structures, ref)
 
 
-def test_mini_direct_stress(mini_release, mini_xyz):
-    checkpoint, _, direct = mini_release
-    structures = read(str(mini_xyz), index=":")
+def test_mini_direct_stress(mini_release):
+    checkpoint, dataset, _, direct = mini_release
+    structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
     _assert_stress(get_calc(checkpoint, direct=True), structures, ref)

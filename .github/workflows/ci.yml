@@ -30,7 +30,17 @@ jobs:
           enable-cache: true
       - name: Install tox
         run: uv tool install --with tox-uv tox
-      - name: Fetch + convert pet-mad-xs checkpoint
+      # The converted reference checkpoints depend only on the checkpoint list
+      # in tox.ini and on the converter itself; keyed on those, a hit skips the
+      # ~180 MB of downloads and the torch-side conversion.
+      - name: Cache converted checkpoints
+        id: checkpoints
+        uses: actions/cache@v4
+        with:
+          path: tests/assets/checkpoints
+          key: checkpoints-${{ hashFiles('tox.ini', 'src/petjax/convert.py', 'src/petjax/cli.py') }}
+      - name: Fetch + convert reference checkpoints
+        if: steps.checkpoints.outputs.cache-hit != 'true'
         run: tox -e fetch-checkpoints
       - name: Tests (pytest)
         run: tox -e tests

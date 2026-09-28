@@ -78,7 +78,12 @@ def main(argv=None):
     frames = read(str(args.dataset), index=":")
     stem = args.dataset.stem
 
-    for suffix, non_conservative in (("", False), ("_direct", True)):
+    # Direct mode reads whichever non-conservative heads the checkpoint has;
+    # PET-OMol ships a force head only, so its stress stays the strain derivative.
+    outputs = exported.capabilities().outputs
+    direct = True if "non_conservative_stress" in outputs else "forces"
+
+    for suffix, non_conservative in (("", False), ("_direct", direct)):
         calculator = MetatomicCalculator(exported, non_conservative=non_conservative)
         path = args.out_dir / f"{stem}_{args.name}{suffix}.npz"
         np.savez_compressed(path, **predict(calculator, frames))
