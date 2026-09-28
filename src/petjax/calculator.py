@@ -215,8 +215,9 @@ class UPETCalculator(BaseCalculator):
         skin); coloring and jitted function are cached on the selected pair
         set. Composition shifts never enter.
 
-        Requires a calculator built with ``default_dtype="float64"``; matmul
-        precision is pinned to ``"highest"`` for the call.
+        Runs at the calculator's dtype and matmul precision, like the forces.
+        fp64 is the reference; the preprint's production Hessians are fp32 with
+        full-precision matmuls.
 
         Args:
             atoms: The structure.
@@ -229,11 +230,6 @@ class UPETCalculator(BaseCalculator):
             remat: Wrap the energy in ``jax.checkpoint`` (recompute the
                 forward per HVP batch instead of holding its residuals).
         """
-        if self._dtype != jnp.float64:
-            raise ValueError(
-                "UPETCalculator.hessian: fp64 only; build the calculator with "
-                'default_dtype="float64"'
-            )
         hops = self._resolve_hops(hops)
         sparse = hops is not None
         if no_shadow is None:
@@ -252,16 +248,15 @@ class UPETCalculator(BaseCalculator):
             self._update_geometry(atoms)
 
         n_real = len(atoms)
-        with jax.default_matmul_precision("highest"):
+        H, overflow = self._run_hessian(hops, no_shadow, chunk_size, remat, n_real)
+        if bool(overflow):
+            self._build_structure(atoms, force_recompute_k_sel=True)
             H, overflow = self._run_hessian(hops, no_shadow, chunk_size, remat, n_real)
             if bool(overflow):
-                self._build_structure(atoms, force_recompute_k_sel=True)
-                H, overflow = self._run_hessian(hops, no_shadow, chunk_size, remat, n_real)
-                if bool(overflow):
-                    raise RuntimeError(
-                        "UPETCalculator: cannot recover from overflow "
-                        f"after retry (k_sel={self._k_sel})"
-                    )
+                raise RuntimeError(
+                    "UPETCalculator: cannot recover from overflow "
+                    f"after retry (k_sel={self._k_sel})"
+                )
         if hasattr(H, "todense"):  # BCOO from the sparse path
             H = H.todense()
         return np.asarray(H, dtype=np.float64)[:n_real, :, :n_real, :]

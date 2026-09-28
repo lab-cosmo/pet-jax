@@ -140,7 +140,7 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 
 ## Hessians
 
-`UPETCalculator.hessian` returns the positions-Hessian of the energy as an `(n, 3, n, 3)` float64 array, `H[a, α, b, β] = ∂²E / ∂R[a, α] ∂R[b, β]`, for phonons, heat capacities, or any other second-order property. It needs a calculator built with `default_dtype="float64"`.
+`UPETCalculator.hessian` returns the positions-Hessian of the energy as an `(n, 3, n, 3)` float64 array, `H[a, α, b, β] = ∂²E / ∂R[a, α] ∂R[b, β]`, for phonons, heat capacities, or any other second-order property. It runs at the calculator's dtype and matmul precision, like the forces: fp64 is the reference, and the preprint's production Hessians are fp32 with full-precision matmuls.
 
 ```python
 calc = UPETCalculator.from_checkpoint("checkpoints/pet-mad-xs", default_dtype="float64")

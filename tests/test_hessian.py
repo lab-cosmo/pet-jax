@@ -250,16 +250,29 @@ def test_no_shadow_resolves_to_calculator_setting(calc, shadow_calc):
     )
 
 
-def test_guards(calc, shadow_calc, pet_mad_xs_checkpoint):
+def test_guards(calc, shadow_calc):
     atoms = _atoms()
     with pytest.raises(ValueError, match="no_shadow"):
         shadow_calc.hessian(atoms, hops="exact", no_shadow=False)
     for bad in (-1, 1.5, "five", True):
         with pytest.raises(ValueError, match="hops"):
             calc.hessian(atoms, hops=bad)
-    fp32 = UPETCalculator.from_checkpoint(pet_mad_xs_checkpoint, stress=False)
-    with pytest.raises(ValueError, match="float64"):
-        fp32.hessian(atoms)
+
+
+def test_fp32_mirrors_calculator(calc, pet_mad_xs_checkpoint):
+    """An fp32 calculator gives an fp32 Hessian (the preprint's production
+    setting): sparse and dense agree to fp32 rounding, and both sit within
+    fp32 distance of the fp64 reference."""
+    fp32 = UPETCalculator.from_checkpoint(
+        pet_mad_xs_checkpoint, no_shadow=True, stress=False, matmul_precision="highest"
+    )
+    atoms = _atoms()
+    H_ref = calc.hessian(atoms, hops="exact")
+    H_dense = fp32.hessian(atoms)
+    H_sparse = fp32.hessian(atoms, hops="exact")
+    scale = np.abs(H_ref).max()
+    assert np.allclose(H_sparse, H_dense, atol=1e-4 * scale, rtol=0)
+    assert np.allclose(H_dense, H_ref, atol=1e-2 * scale, rtol=0)
 
 
 def test_selection_recomputed_and_coloring_cached(calc, monkeypatch):
