@@ -243,13 +243,8 @@ class UPETCalculator(BaseCalculator):
                 self._model.cutoff_width_adaptive,
                 method=self._model.adaptive_cutoff_method,
             )
-            counts = np.bincount(
-                np.asarray(structure["centers"])[selection.selected], minlength=N_padded
-            )
-            k_sel_actual = max(int(counts.max()), 1)
-            # Largest adaptive cutoff among selected pairs: the selection's
-            # real reach, for tuning cutoff_override. 0.0 if nothing is
-            # selected (degenerate: isolated atom).
+            k_sel_actual = max(int(selection.counts.max()), 1)
+            # The selection's real reach, for tuning cutoff_override.
             self._max_selected_cutoff = float(
                 selection.pair_cutoffs[selection.selected].max(initial=0.0)
             )

@@ -137,6 +137,7 @@ def test_select_edges_mask(structure):
     assert sel.selected.dtype == bool and sel.selected.shape == centers.shape
     assert not sel.selected[~pair_mask].any()
     assert np.array_equal(sel.selected[structure["reverse"]], sel.selected)
+    assert np.array_equal(sel.counts, np.bincount(centers[sel.selected], minlength=N))
 
     R_ij = edge_displacements(
         structure["positions"], centers, others, structure["cell_shifts"], structure["cell"]
