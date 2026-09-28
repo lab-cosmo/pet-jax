@@ -5,12 +5,19 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+import hashlib
 import sys
 import warnings
 
 from ase.calculators.calculator import BaseCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
+from .hessian import (
+    get_dense_hessian_fn,
+    get_energy_fn,
+    get_sparse_hessian_fn,
+    selected_adjacency,
+)
 from .predict import get_predict_fn
 from .select import select_edges
 from .structure import _bucket_or, to_structure
@@ -121,6 +128,11 @@ class UPETCalculator(BaseCalculator):
         self._k_sel = None
         self._structure = None
         self._shift_offset = 0.0
+        # One-entry caches for `hessian`: (key, colored pattern) and (key,
+        # jitted Hessian fn). One entry each bounds the compile cache; a
+        # Hessian call is once per geometry in practice. Dropped on rebuild.
+        self._coloring_cache = None
+        self._hessian_cache = None
 
         self._shifts = {int(z): float(v) for z, v in metadata["shifts"].items()}
 
@@ -179,6 +191,136 @@ class UPETCalculator(BaseCalculator):
             self.results["stress"] = full_3x3_to_voigt_6_stress(virial / volume)
 
         return self.results
+
+    def hessian(self, atoms, *, hops=None, no_shadow=None, chunk_size=None, remat=False):
+        """Positions-Hessian of the energy, ``(n, 3, n, 3)`` float64 numpy:
+        ``H[a, alpha, b, beta] = d2E / dR[a, alpha] dR[b, beta]``.
+
+        ``hops=None`` (the default) is dense: ``3n`` Hessian-vector products
+        against the identity, with or without shadow coupling. An int or
+        ``"exact"`` is sparse: only atoms within ``hops`` hops on the selected
+        neighbour list couple, and a star coloring of that pattern needs one
+        HVP per color. ``"exact"`` is PET's reach, ``2L + 1`` with ``L``
+        message-passing layers; below it the dropped couplings fold into the
+        retained entries. Needs the ``sparse`` extra (``asdex``). Method, hop
+        count, and how far truncation can go: arXiv:2609.20510.
+
+        Sparse mode forces ``no_shadow=True`` and raises on ``False``. The
+        shadow Hessian is sparse too, but on all pairs within the cutoff
+        rather than the selected ones and up to two hops wider, since the
+        cutoff itself depends on positions: a far denser pattern, not
+        implemented. Dense mode resolves ``no_shadow=None`` to the calculator's
+        setting, so the dense Hessian is consistent with its forces. The
+        selection is recomputed every call (positions move under the Verlet
+        skin); coloring and jitted function are cached on the selected pair
+        set. Composition shifts never enter.
+
+        Runs at the calculator's dtype and matmul precision, like the forces.
+        fp64 is the reference; the preprint's production Hessians are fp32 with
+        full-precision matmuls.
+
+        Args:
+            atoms: The structure.
+            hops: ``None`` for dense; a non-negative int for sparse at that hop
+                count; ``"exact"`` for sparse at ``2L + 1``.
+            no_shadow: Stop-gradient the adaptive cutoff. ``None`` resolves to
+                the calculator's setting for dense and to ``True`` for sparse.
+            chunk_size: HVPs per batch; bounds peak AD memory. ``None`` runs
+                all in one batch.
+            remat: Wrap the energy in ``jax.checkpoint`` (recompute the
+                forward per HVP batch instead of holding its residuals).
+        """
+        hops = self._resolve_hops(hops)
+        sparse = hops is not None
+        if no_shadow is None:
+            no_shadow = True if sparse else self._no_shadow
+        if sparse and not no_shadow:
+            raise ValueError(
+                "UPETCalculator.hessian: a sparse Hessian needs no_shadow=True. "
+                "With shadow coupling the pattern lives on all pairs within the "
+                "cutoff, not the selected ones; that mode is not implemented. Use "
+                "hops=None for the dense reference with shadow forces."
+            )
+
+        if self._nl_cache.needs_update(atoms):
+            self._build_structure(atoms)
+        else:
+            self._update_geometry(atoms)
+
+        n_real = len(atoms)
+        H, overflow = self._run_hessian(hops, no_shadow, chunk_size, remat, n_real)
+        if bool(overflow):
+            self._build_structure(atoms, force_recompute_k_sel=True)
+            H, overflow = self._run_hessian(hops, no_shadow, chunk_size, remat, n_real)
+            if bool(overflow):
+                raise RuntimeError(
+                    "UPETCalculator: cannot recover from overflow "
+                    f"after retry (k_sel={self._k_sel})"
+                )
+        if hasattr(H, "todense"):  # BCOO from the sparse path
+            H = H.todense()
+        return np.asarray(H, dtype=np.float64)[:n_real, :, :n_real, :]
+
+    def _resolve_hops(self, hops):
+        if hops is None:
+            return None
+        if isinstance(hops, str):
+            if hops == "exact":
+                return 2 * self._model.num_gnn_layers + 1
+            raise ValueError(
+                f"hops must be None, a non-negative int, or 'exact', got {hops!r}"
+            )
+        if isinstance(hops, bool) or not isinstance(hops, (int, np.integer)) or hops < 0:
+            raise ValueError(
+                f"hops must be None, a non-negative int, or 'exact', got {hops!r}"
+            )
+        return int(hops)
+
+    def _run_hessian(self, hops, no_shadow, chunk_size, remat, n_real):
+        """Fetch (or build) the jitted Hessian fn for this configuration and run
+        it on the current structure. Sparse: recompute the selection, color the
+        pattern on a cache miss."""
+        pattern_key = None
+        coloring = None
+        if hops is not None:
+            try:
+                from .sparse import hessian_coloring
+            except ImportError as exc:
+                raise ImportError(
+                    "UPETCalculator.hessian: sparse Hessians need the `sparse` extra "
+                    "(asdex, scipy): pip install 'pet-jax[sparse]'"
+                ) from exc
+
+            selected = select_edges(
+                self._structure,
+                self._num_neighbors_adaptive,
+                self._model.cutoff,
+                self._model.cutoff_width_adaptive,
+                method=self._model.adaptive_cutoff_method,
+            ).selected
+            centers, others = selected_adjacency(self._structure, selected, n_real)
+            pattern_key = (hops, self._N_padded, _pair_digest(centers, others))
+            if self._coloring_cache is None or self._coloring_cache[0] != pattern_key:
+                coloring = hessian_coloring(centers, others, self._N_padded, hops)
+                self._coloring_cache = (pattern_key, coloring)
+            coloring = self._coloring_cache[1]
+
+        fn_key = (hops, no_shadow, chunk_size, remat, pattern_key)
+        if self._hessian_cache is None or self._hessian_cache[0] != fn_key:
+            energy_fn = get_energy_fn(
+                self._model,
+                no_shadow=no_shadow,
+                num_neighbors_adaptive=self._num_neighbors_adaptive,
+            )
+            if hops is None:
+                fn = get_dense_hessian_fn(energy_fn, chunk_size=chunk_size, remat=remat)
+            else:
+                fn = get_sparse_hessian_fn(
+                    energy_fn, coloring, chunk_size=chunk_size, remat=remat
+                )
+            self._hessian_cache = (fn_key, jax.jit(fn))
+        hessian_fn = self._hessian_cache[1]
+        return hessian_fn(self._params, self._structure["positions"], self._structure)
 
     # -- internals --
 
@@ -260,6 +402,10 @@ class UPETCalculator(BaseCalculator):
         self._N_padded = N_padded
         self._n_pair_padded = n_pair_padded
         self._k_sel = k_sel_padded
+        # The pattern key carries N_padded, so a stale coloring cannot be hit;
+        # dropping both keeps the caches from outliving the structure they fit.
+        self._coloring_cache = None
+        self._hessian_cache = None
 
         # k_sel_sizer carries k_sel into the shape-agnostic predict_fn via its
         # shape; the JIT retraces when k_sel (or any other shape) changes.
@@ -385,6 +531,12 @@ class UPETCalculator(BaseCalculator):
             "positions": jnp.array(positions, dtype=self._dtype),
             "cell": jnp.array(cell, dtype=self._dtype),
         }
+
+
+def _pair_digest(centers, others):
+    """Order-independent digest of a pair set, the coloring cache key."""
+    pairs = np.unique(np.stack([centers, others], axis=1).astype(np.int64), axis=0)
+    return hashlib.sha1(np.ascontiguousarray(pairs).tobytes()).hexdigest()
 
 
 class NeighborListCache:
