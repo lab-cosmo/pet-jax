@@ -118,37 +118,37 @@ def test_pack_edges_forward_smoke(structure):
 
 
 def test_select_edges_mask(structure):
-    """The public mask is the sizing pass's own selection: padded pairs off,
-    symmetric under ``reverse``, max per-center count equal to ``k_sel``, and
-    bit-identical to the eager selection core on the same displacements."""
+    """The host-side selection is internally consistent (pair cutoffs are the
+    endpoint means of the atomic ones, the mask is ``r_ij <= pair_cutoff`` on
+    unmasked pairs, symmetric under ``reverse``) and matches the eager selection
+    core on the same displacements."""
     from petjax import select_edges
-    from petjax.select import _select_edges, determine_k_sel
-    from petjax.utils import edge_displacements
+    from petjax.select import _select_edges
+    from petjax.utils import edge_displacements, safe_norm
 
     hypers = dict(num_neighbors_adaptive=4, cutoff=CUTOFF, cutoff_width_adaptive=0.5)
-    selected = select_edges(structure, **hypers, method="grid")
+    sel = select_edges(structure, **hypers, method="grid")
+    centers, others, pair_mask = (structure[k] for k in ("centers", "others", "pair_mask"))
+    N = structure["positions"].shape[0]
 
-    assert selected.dtype == bool and selected.shape == structure["centers"].shape
-    assert not selected[~structure["pair_mask"]].any()
-    assert np.array_equal(selected[structure["reverse"]], selected)
-
-    k_sel, _ = determine_k_sel(structure, **hypers, method="grid")
-    assert np.bincount(structure["centers"][selected]).max() == k_sel
+    assert all(isinstance(x, np.ndarray) for x in sel)
+    assert sel.atomic_cutoffs.shape == (N,)
+    assert sel.pair_cutoffs.shape == centers.shape
+    assert sel.selected.dtype == bool and sel.selected.shape == centers.shape
+    assert not sel.selected[~pair_mask].any()
+    assert np.array_equal(sel.selected[structure["reverse"]], sel.selected)
 
     R_ij = edge_displacements(
-        structure["positions"],
-        structure["centers"],
-        structure["others"],
-        structure["cell_shifts"],
-        structure["cell"],
+        structure["positions"], centers, others, structure["cell_shifts"], structure["cell"]
     )
-    _, eager = _select_edges(
-        R_ij,
-        structure["centers"],
-        structure["others"],
-        structure["pair_mask"],
-        structure["positions"].shape[0],
-        **hypers,
-        method="grid",
-    )
-    assert np.array_equal(selected, np.asarray(eager))
+    r_ij = np.asarray(safe_norm(R_ij, axis=-1))
+    pair_cutoffs = (sel.atomic_cutoffs[centers] + sel.atomic_cutoffs[others]) / 2
+    assert np.array_equal(sel.pair_cutoffs, pair_cutoffs)
+    assert np.array_equal(sel.selected, (r_ij <= sel.pair_cutoffs) & pair_mask)
+
+    # The jitted kernel and the eager core agree to float32 rounding on the
+    # cutoffs (XLA fuses the reductions differently) and exactly on the mask.
+    eager = _select_edges(R_ij, centers, others, pair_mask, N, **hypers, method="grid")
+    assert np.allclose(sel.atomic_cutoffs, eager[0], rtol=1e-6, atol=0)
+    assert np.allclose(sel.pair_cutoffs, eager[1], rtol=1e-6, atol=0)
+    assert np.array_equal(sel.selected, np.asarray(eager[2]))

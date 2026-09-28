@@ -37,7 +37,7 @@ def to_structure(
 
     Returns the structure dict. ``N_padded`` / ``n_pair_padded`` are read off
     ``structure["positions"].shape[0]`` / ``structure["centers"].shape[0]``;
-    ``k_sel_sizer`` is put in by the calculator after ``determine_k_sel``.
+    ``k_sel_sizer`` is put in by the calculator after sizing ``k_sel``.
     """
     if n_pair_bucket_strategy is None:
         n_pair_bucket_strategy = bucket_strategy

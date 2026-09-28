@@ -13,9 +13,9 @@ structures, where no single cell exists — call ``truncate_edges`` directly.
 unmasked pair, for NLs already trimmed upstream (e.g. a kNN pass).
 
 Two distinct JIT contexts touch this module:
-  - ``_k_sel_kernel`` (``@jax.jit``, the sizing path) — CPU-pinned by
-    ``determine_k_sel`` (runs once per NL-rebuild) and by ``select_edges``,
-    which returns the same pass's selected-pair mask host-side.
+  - ``_select_edges_kernel`` (``@jax.jit``, the host-side path) — CPU-pinned
+    by ``select_edges``, which returns the selection as host arrays. The
+    calculator sizes ``k_sel`` from it once per NL-rebuild.
   - ``truncate`` is **undecorated** and traced by ``predict.predict_fn`` —
     runs on the default device, every step.
 
@@ -28,6 +28,8 @@ import jax
 import jax.numpy as jnp
 
 from functools import partial
+
+from typing import NamedTuple
 
 from .utils import cutoff_bump, edge_displacements, safe_norm
 
@@ -101,7 +103,7 @@ def truncate_edges(
     """
     N = atomic_numbers.shape[0]
 
-    pair_cutoffs, selected = _select_edges(
+    _atomic_cutoffs, pair_cutoffs, selected = _select_edges(
         R_ij,
         centers,
         others,
@@ -160,35 +162,20 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_m
     return truncated, overflow
 
 
-# -- k_sel sizing + selected mask: CPU-pinned standalone jit kernel --
+# -- select_edges: the adaptive selection host-side, via a CPU-pinned jit kernel --
 
 
-def determine_k_sel(
-    structure,
-    num_neighbors_adaptive,
-    cutoff,
-    cutoff_width_adaptive,
-    method="grid",
-):
-    """Trial adaptive cutoff to size k_sel. Runs the sizing kernel on CPU (the
-    structure dict is moved with one ``jax.device_put``). Kept off the GPU to
-    avoid contention with the forward and to read the result back without a
-    device→host sync.
+class Selection(NamedTuple):
+    """What the adaptive selection produced for a structure dict, as host
+    arrays. ``atomic_cutoffs`` ``[N_padded]`` is the per-atom adaptive cutoff,
+    ``pair_cutoffs`` ``[n_pair_padded]`` the mean of each pair's two, and
+    ``selected`` ``[n_pair_padded]`` the mask of raw-NL pairs with
+    ``r_ij <= pair_cutoff``: exactly the pairs ``truncate`` packs for these
+    positions. Padded pairs are ``False``."""
 
-    ``jax.devices("cpu")`` is resolved lazily here — *not* at module import —
-    so a process that only imports ``petjax`` (e.g. a grain pool worker doing
-    preprocessing) never triggers a JAX backend init at import time. The cheap
-    repeated lookup is amortised by ``determine_k_sel`` running at most once per
-    NL rebuild.
-
-    Returns ``(k_sel, max_cutoff)``: the host-int k_sel and the largest selected
-    adaptive cutoff (host float) — the selection's "real reach", for tuning
-    ``cutoff_override``.
-    """
-    max_count, max_cutoff, _selected = _run_k_sel_kernel(
-        structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method
-    )
-    return max(int(max_count), 1), float(max_cutoff)
+    atomic_cutoffs: np.ndarray
+    pair_cutoffs: np.ndarray
+    selected: np.ndarray
 
 
 def select_edges(
@@ -198,44 +185,39 @@ def select_edges(
     cutoff_width_adaptive,
     method="grid",
 ):
-    """The adaptive selection's per-pair mask for a structure dict, host-side.
+    """Run the adaptive selection on a structure dict, on CPU, and return what
+    it produced as a ``Selection`` of host arrays.
 
-    Runs the same CPU-pinned kernel as ``determine_k_sel`` and returns the
-    ``[n_pair_padded]`` boolean mask of raw-NL pairs the model will attend
-    over: exactly the pairs ``truncate`` packs for these positions. Padded pairs
-    are ``False``. The mask is a value, so there is no ``no_shadow`` argument —
-    that only changes what the selection's gradient sees, never which pairs
-    survive.
+    The calculator sizes ``k_sel`` from it once per NL rebuild (the per-center
+    max of ``selected``); consumers that need the model's actual adjacency
+    rather than the raw neighbour ball (the Hessian sparsity pattern,
+    graph-distance analyses) read ``selected`` directly. The mask is a value,
+    so there is no ``no_shadow`` argument: that only changes what the
+    selection's gradient sees, never which pairs survive. ``cutoff`` is the
+    trained maximum cutoff, not a ``cutoff_override``.
 
-    For consumers that need the model's actual adjacency rather than the raw
-    neighbour ball: the Hessian sparsity pattern, graph-distance analyses.
-    Like ``determine_k_sel``, ``cutoff`` is the trained maximum cutoff, not a
-    ``cutoff_override``.
+    Kept off the GPU to avoid contention with the forward and to read the
+    result back without a device→host sync. ``jax.devices("cpu")`` is resolved
+    lazily here — *not* at module import — so a process that only imports
+    ``petjax`` (e.g. a grain pool worker doing preprocessing) never triggers a
+    JAX backend init at import time.
     """
-    _max_count, _max_cutoff, selected = _run_k_sel_kernel(
-        structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method
-    )
-    return np.asarray(selected, dtype=bool)
-
-
-def _run_k_sel_kernel(
-    structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method
-):
     # Only what the kernel reads: the pytree structure is part of the jit cache
-    # key, so a caller passing a dict with extra keys (the calculator's, which
-    # carries `k_sel_sizer`) must not compile a second executable.
+    # key, so callers passing dicts with different extra keys (the calculator's
+    # carries `k_sel_sizer`) must share one executable.
     keys = ("positions", "cell", "centers", "others", "cell_shifts", "pair_mask")
     cpu = jax.devices("cpu")[0]
     cpu_structure = jax.device_put({k: structure[k] for k in keys}, cpu)
-    return _k_sel_kernel(
+    out = _select_edges_kernel(
         cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method=method
     )
+    return Selection(*(np.asarray(x) for x in out))
 
 
-# jit on the inner k_sel kernel is fine in steady state: everything but the
-# structure is a per-model constant (hence static args — the probe grid is
-# built from cutoff / width at trace time), so the kernel compiles once per
-# Calculator and is reused. Across-shape calls (e.g. a Calculator reused on
+# jit here is fine in steady state: everything but the structure is a
+# per-model constant (hence static args — the probe grid is built from
+# cutoff / width at trace time), so the kernel compiles once per Calculator
+# and is reused. Across-shape calls (e.g. a Calculator reused on
 # different-sized structures) re-compile.
 @partial(
     jax.jit,
@@ -246,7 +228,7 @@ def _run_k_sel_kernel(
         "method",
     ),
 )
-def _k_sel_kernel(
+def _select_edges_kernel(
     structure,
     num_neighbors_adaptive,
     cutoff,
@@ -260,7 +242,7 @@ def _k_sel_kernel(
         structure["cell_shifts"],
         structure["cell"],
     )
-    pair_cutoffs, selected = _select_edges(
+    return _select_edges(
         R_ij,
         structure["centers"],
         structure["others"],
@@ -271,16 +253,6 @@ def _k_sel_kernel(
         cutoff_width_adaptive,
         method=method,
     )
-    counts = jax.ops.segment_sum(
-        selected.astype(int),
-        structure["centers"],
-        num_segments=structure["positions"].shape[0],
-        indices_are_sorted=True,
-    )
-    # Largest adaptive cutoff among selected pairs — the real reach of the
-    # selection. 0.0 if nothing is selected (degenerate: isolated atom).
-    max_cutoff = jnp.max(jnp.where(selected, pair_cutoffs, 0.0))
-    return counts.max(), max_cutoff, selected
 
 
 # -- adaptive per-atom cutoffs --
@@ -448,8 +420,9 @@ def _select_edges(
     method="grid",
     no_shadow=False,
 ):
-    """Shared selection core: consumed by ``_k_sel_kernel`` (sizing) and
-    ``truncate_edges`` (forward). Returns ``(pair_cutoffs, selected)``.
+    """Shared selection core: consumed by ``_select_edges_kernel`` (host-side)
+    and ``truncate_edges`` (forward). Returns ``(atomic_cutoffs, pair_cutoffs,
+    selected)``.
 
     ``method`` picks the per-atom cutoff algorithm (a trace-time branch);
     grid and solver take the same arguments."""
@@ -475,7 +448,7 @@ def _select_edges(
         atomic_cutoffs = jax.lax.stop_gradient(atomic_cutoffs)
     pair_cutoffs = (atomic_cutoffs[centers] + atomic_cutoffs[others]) / 2
     selected = (r_ij <= pair_cutoffs) & pair_mask
-    return pair_cutoffs, selected
+    return atomic_cutoffs, pair_cutoffs, selected
 
 
 # -- pack flat selection into the [N_padded * k_sel] rectangular layout --
