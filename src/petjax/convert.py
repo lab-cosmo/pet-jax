@@ -96,6 +96,8 @@ def convert_checkpoint(ckpt_path, output_dir):
     flat = _convert_state_dict(state_dict)
     n_rows = meta["config"]["max_atomic_number"] + 1
     _scatter_species_embeddings(flat, meta["atomic_types"], n_rows)
+    if meta["config"]["system_conditioning"]:
+        _layout_conditioning_tables(flat, meta["config"]["max_charge"])
 
     # Scales live in the parameter tree, not metadata. force_scale is
     # per-species (scattered to Z rows); energy/stress scales are scalars.
@@ -529,6 +531,24 @@ def _scatter_species_embeddings(flat, atomic_types, n_rows):
             scattered = np.zeros((n_rows, table.shape[1]), dtype=table.dtype)
             scattered[rows] = table
             flat[key] = jnp.array(scattered)
+
+
+_CHARGE_TABLE = "backbone.system_conditioning.charge_embedding.embedding"
+_SPIN_TABLE = "backbone.system_conditioning.spin_multiplicity_embedding.embedding"
+
+
+def _layout_conditioning_tables(flat, max_charge):
+    """Re-index the conditioning tables by value, the way species tables are
+    indexed by Z: upstream stores charge ``c`` at row ``c + max_charge`` and
+    multiplicity ``m`` at row ``m - 1``. Rolling the charge table puts ``c``
+    at row ``c`` for ``c >= 0`` and at row ``size + c`` for ``c < 0``, which
+    is where a negative index lands; the spin table gets an unused row 0."""
+    charge = np.asarray(flat[_CHARGE_TABLE])
+    flat[_CHARGE_TABLE] = jnp.array(np.roll(charge, -max_charge, axis=0))
+    spin = np.asarray(flat[_SPIN_TABLE])
+    flat[_SPIN_TABLE] = jnp.array(
+        np.concatenate([np.zeros((1, spin.shape[1]), dtype=spin.dtype), spin])
+    )
 
 
 def _unflatten(flat):

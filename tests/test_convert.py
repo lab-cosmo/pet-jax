@@ -12,7 +12,10 @@ import numpy as np
 import pytest
 
 from petjax.convert import (
+    _CHARGE_TABLE,
+    _SPIN_TABLE,
     _finalize_key,
+    _layout_conditioning_tables,
     _rename_key,
     _scatter_species_embeddings,
     _scope_key,
@@ -79,6 +82,23 @@ def test_conditioning_key_names(state_dict_key, expected):
     """The conditioning module's Flax names, as `SystemConditioning` declares them."""
     renamed, _ = _finalize_key(_rename_key(state_dict_key), np.zeros((2, 3)))
     assert renamed == expected
+
+
+def test_conditioning_tables_indexed_by_value():
+    """Upstream's offset rows become value-indexed rows: charge c at row c
+    (negative c counted from the end), multiplicity m at row m."""
+    max_charge = 2
+    upstream_charge = np.arange(-max_charge, max_charge + 1, dtype=np.float32)[:, None]
+    upstream_spin = np.array([[1.0], [2.0], [3.0]], dtype=np.float32)
+    flat = {_CHARGE_TABLE: upstream_charge.copy(), _SPIN_TABLE: upstream_spin.copy()}
+    _layout_conditioning_tables(flat, max_charge)
+    charge = np.asarray(flat[_CHARGE_TABLE])
+    spin = np.asarray(flat[_SPIN_TABLE])
+    for c in range(-max_charge, max_charge + 1):
+        assert charge[c, 0] == c
+    assert spin[0, 0] == 0.0
+    for m in (1, 2, 3):
+        assert spin[m, 0] == m
 
 
 def test_scatter_leaves_conditioning_tables_alone():

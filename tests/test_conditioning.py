@@ -67,7 +67,7 @@ def test_conditioning_params_present(atoms):
     calc = make_calc(atoms, **CONDITIONED)
     cond = calc._params["params"]["backbone"]["system_conditioning"]
     assert cond["charge_embedding"]["embedding"].shape == (7, 16)
-    assert cond["spin_multiplicity_embedding"]["embedding"].shape == (3, 16)
+    assert cond["spin_multiplicity_embedding"]["embedding"].shape == (4, 16)
     assert cond["project"]["Dense_0"]["kernel"].shape == (32, 16)
     assert cond["project"]["Dense_1"]["kernel"].shape == (16, 16)
 

@@ -357,8 +357,12 @@ class DirectStress(nn.Module):
 class SystemConditioning(nn.Module):
     """Charge / spin-multiplicity embedding, one vector per atom ``[N, d_out]``.
 
-    Two lookup tables (charge offset by ``max_charge``, multiplicity by 1),
-    concatenated and projected; upstream's ``SystemConditioningEmbedding``.
+    Two lookup tables, concatenated and projected; upstream's
+    ``SystemConditioningEmbedding``. Both are indexed by the value itself,
+    like the species tables by Z: multiplicity ``m`` is row ``m`` (row 0
+    unused), charge ``c`` is row ``c``, a negative charge reaching its row
+    from the end of the table the way any negative index does. The
+    converter lays the tables out that way; upstream stores them offset.
     """
 
     d_out: int
@@ -371,10 +375,10 @@ class SystemConditioning(nn.Module):
             2 * self.max_charge + 1, self.d_out, name="charge_embedding"
         )
         spin_embed = nn.Embed(
-            self.max_spin_multiplicity, self.d_out, name="spin_multiplicity_embedding"
+            self.max_spin_multiplicity + 1, self.d_out, name="spin_multiplicity_embedding"
         )
-        c = charge_embed(charge + self.max_charge)
-        s = spin_embed(spin_multiplicity - 1)
+        c = charge_embed(charge)
+        s = spin_embed(spin_multiplicity)
         return MLP((self.d_out, self.d_out), name="project")(
             jnp.concatenate([c, s], axis=-1)
         )
