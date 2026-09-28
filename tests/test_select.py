@@ -153,3 +153,25 @@ def test_select_edges_mask(structure):
     assert np.allclose(sel.atomic_cutoffs, eager[0], rtol=1e-6, atol=0)
     assert np.allclose(sel.pair_cutoffs, eager[1], rtol=1e-6, atol=0)
     assert np.array_equal(sel.selected, np.asarray(eager[2]))
+
+
+def test_masked_slots_carry_no_features(structure):
+    """Padded pair slots leave the backbone at exactly zero. The reverse gather
+    is the one consumer of a masked slot, so anything left there leaks into an
+    edge whose reciprocal was trimmed upstream."""
+    from petjax.model import Backbone
+
+    backbone = Backbone(
+        d_pet=8,
+        d_node=8,
+        d_feedforward=8,
+        num_heads=2,
+        num_attention_layers=1,
+        num_gnn_layers=2,
+        cutoff=CUTOFF,
+    )
+    packed, _ = _pack(structure, _max_count(structure) + 5)
+    inputs = {k: v for k, v in packed.items() if k != "pair_cutoffs"}
+    params = backbone.init(jax.random.key(0), **inputs, pair_cutoffs=None)
+    _, messages, _ = backbone.apply(params, **inputs, pair_cutoffs=None)
+    assert np.all(np.asarray(messages)[~np.asarray(packed["pair_mask"])] == 0.0)
