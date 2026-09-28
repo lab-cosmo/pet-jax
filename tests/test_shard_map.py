@@ -1,6 +1,6 @@
 """Adaptive cutoffs under shard_map (data-parallel training).
 
-Callers such as iris wrap the step in `jax.shard_map` over a data-parallel
+Data-parallel training wraps the step in `jax.shard_map` over a data-parallel
 mesh axis, which makes every array derived from the local batch "varying"
 over that axis. Code traced inside must keep loop carries varying too. The
 device count is forced in conftest, so these run on CPU -- no GPU needed.
