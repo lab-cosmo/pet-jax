@@ -144,6 +144,11 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_m
     that pair is silently dropped, so trim upstream to ``<= k`` per center.
     Same layout requirements as ``truncate_edges``: ``centers``
     non-decreasing, ``k`` a static int under jit.
+
+    Pairs whose ``reverse`` is masked (an asymmetric NL, e.g. from a per-center
+    rank trim upstream) are legal: the model gathers a zero partner message
+    for them. That differs from what a checkpoint trained on a symmetric NL
+    has seen, and ``overflow`` does not flag it.
     """
     N = atomic_numbers.shape[0]
     slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
