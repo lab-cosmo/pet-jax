@@ -5,7 +5,7 @@ The CI-friendly default runs the "mini" suite: 12 structures in
 
 Converted checkpoints are gitignored build artifacts — run
 `tox -e fetch-checkpoints` to rebuild them from the upstream `.ckpt` files.
-Only the reference `.xyz` predictions are tracked.
+Only the reference `.npz` predictions are tracked.
 
 The extended suite covers the full `test_s` / `test_m` / `test_l` datasets
 and (optionally) `pet-mad-s`. Extended assets are gitignored too; populate
@@ -74,8 +74,8 @@ def mini_release(request):
     """(checkpoint dir, conservative reference, direct reference) per release."""
     name = request.param
     checkpoint = ASSETS / "checkpoints" / name
-    conservative = ASSETS / "predictions" / f"test_mini_{name}.xyz"
-    direct = ASSETS / "predictions" / f"test_mini_{name}_direct.xyz"
+    conservative = ASSETS / "predictions" / f"test_mini_{name}.npz"
+    direct = ASSETS / "predictions" / f"test_mini_{name}_direct.npz"
     missing = [
         path.name
         for path in (checkpoint / "model.msgpack", conservative, direct)

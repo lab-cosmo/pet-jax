@@ -1,14 +1,17 @@
 """Regenerate the `metatrain` reference predictions the test suite compares against.
 
-Runs upstream `metatrain` (never `pet-jax`) on a dataset and writes extxyz with
-`energy`, `forces`, and `stress` — the format `test_predictions.load_reference`
-parses. Non-periodic frames get a zero stress placeholder; the stress assertions
-skip them anyway.
+Runs upstream `metatrain` (never `pet-jax`) on a dataset and writes an `.npz` of
+`energy` (n_structures,), `forces` (n_atoms_total, 3), `stress`
+(n_structures, 3, 3), and `natoms` (n_structures,). Numbers only — the geometry
+stays in the dataset file, and `natoms` is what lets
+`test_predictions.load_reference` split the forces back up and check that the
+reference belongs to the dataset it is compared against. Non-periodic frames
+get a zero stress placeholder; the stress assertions skip them anyway.
 
 Two files per checkpoint, one per force/stress mode:
 
-    test_mini_<name>.xyz          conservative (energy gradients)
-    test_mini_<name>_direct.xyz   non-conservative (direct readout heads)
+    test_mini_<name>.npz          conservative (energy gradients)
+    test_mini_<name>_direct.npz   non-conservative (direct readout heads)
 
 Needs the upstream stack, not the inference one, and `metatrain >= 2026.4` to
 read a PET checkpoint v16 through `metatrain`'s own model classes (2026.3 tops
@@ -24,30 +27,31 @@ import numpy as np
 import argparse
 from pathlib import Path
 
-from ase.calculators.singlepoint import SinglePointCalculator
-from ase.io import read, write
+from ase.io import read
 
 ASSETS = Path(__file__).parent / "assets"
 
 
 def predict(calculator, frames):
-    """Re-attach metatrain's predictions to copies of the input frames."""
-    out = []
+    """Run metatrain over `frames`, collected into the stored array layout."""
+    energy, forces, stress = [], [], []
     for atoms in frames:
         driven = atoms.copy()
         driven.calc = calculator
-        energy = driven.get_potential_energy()
-        forces = driven.get_forces()
+        energy.append(driven.get_potential_energy())
+        forces.append(driven.get_forces())
         # ASE refuses stress without periodicity; the reference format wants a
         # value on every frame, and the stress assertions skip aperiodic ones.
-        stress = driven.get_stress(voigt=False) if driven.pbc.any() else np.zeros((3, 3))
-
-        frame = atoms.copy()
-        frame.calc = SinglePointCalculator(
-            frame, energy=energy, forces=forces, stress=stress
+        stress.append(
+            driven.get_stress(voigt=False) if driven.pbc.any() else np.zeros((3, 3))
         )
-        out.append(frame)
-    return out
+
+    return {
+        "energy": np.asarray(energy),
+        "forces": np.concatenate(forces),
+        "stress": np.asarray(stress),
+        "natoms": np.asarray([len(atoms) for atoms in frames]),
+    }
 
 
 def main(argv=None):
@@ -76,8 +80,8 @@ def main(argv=None):
 
     for suffix, non_conservative in (("", False), ("_direct", True)):
         calculator = MetatomicCalculator(exported, non_conservative=non_conservative)
-        path = args.out_dir / f"{stem}_{args.name}{suffix}.xyz"
-        write(str(path), predict(calculator, frames), format="extxyz")
+        path = args.out_dir / f"{stem}_{args.name}{suffix}.npz"
+        np.savez_compressed(path, **predict(calculator, frames))
         print(f"wrote {len(frames)} frames to {path}")
 
 
