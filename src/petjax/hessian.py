@@ -43,9 +43,10 @@ def get_energy_fn(model, *, no_shadow, num_neighbors_adaptive=None):
     Hessian, so they are never added.
 
     ``no_shadow=True`` stop-gradients the adaptive cutoff, confining every
-    coupling to the selected neighbour list. The sparse path requires it: the
-    sparsity pattern is derived from that list and is wrong with shadow
-    coupling. The dense path accepts either.
+    coupling to the selected neighbour list, which is the graph the sparse
+    pattern is built on. With shadow coupling the pattern would live on all
+    pairs within the cutoff instead; that is not implemented, so the sparse
+    path requires ``no_shadow=True``. The dense path accepts either.
     """
     if num_neighbors_adaptive is None:
         num_neighbors_adaptive = model.num_neighbors_adaptive

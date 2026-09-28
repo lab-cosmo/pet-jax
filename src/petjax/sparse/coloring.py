@@ -57,10 +57,6 @@ def hessian_coloring(centers, others, n, hops, *, mode="fwd_over_rev"):
 def lift_atom_coloring(atom_colors, atom_pattern, coord_pattern, *, mode="fwd_over_rev"):
     """Build the coordinate-level ``ColoredPattern`` from an atom coloring.
 
-    The coloring is a black box: any dense, non-negative ``int[n]`` array is
-    accepted and validated against the pattern, so nothing here depends on
-    asdex's coloring algorithm.
-
     Args:
         atom_colors: Color per atom, dense in ``[0, num_atom_colors)``.
         atom_pattern: The ``(n, n)`` pattern the colors belong to.

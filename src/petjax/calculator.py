@@ -193,50 +193,27 @@ class UPETCalculator(BaseCalculator):
         return self.results
 
     def hessian(self, atoms, *, hops=None, no_shadow=None, chunk_size=None, remat=False):
-        """Positions-Hessian of the energy, ``(n, 3, n, 3)`` float64 numpy with
-        ``n = len(atoms)``: ``H[a, alpha, b, beta] = d2E / dR[a, alpha] dR[b, beta]``.
+        """Positions-Hessian of the energy, ``(n, 3, n, 3)`` float64 numpy:
+        ``H[a, alpha, b, beta] = d2E / dR[a, alpha] dR[b, beta]``.
 
-        Dense (``hops=None``, the default) is the reference: ``3n``
-        Hessian-vector products against the identity, any ``no_shadow``. Sparse
-        (``hops`` an int, or ``"exact"``) computes only the couplings of atoms
-        within ``hops`` graph hops on the selected neighbour list and needs far
-        fewer HVPs, one per color of a star coloring of that pattern; the
-        pattern is ``(I + A)^hops`` on the selected adjacency, diagonal always
-        present. Requires the ``sparse`` extra (``asdex``).
+        ``hops=None`` (the default) is dense: ``3n`` Hessian-vector products
+        against the identity, with or without shadow coupling. An int or
+        ``"exact"`` is sparse: only atoms within ``hops`` hops on the selected
+        neighbour list couple, and a star coloring of that pattern needs one
+        HVP per color. ``"exact"`` is PET's reach, ``2L + 1`` with ``L``
+        message-passing layers; below it the dropped couplings fold into the
+        retained entries. Needs the ``sparse`` extra (``asdex``). Method, hop
+        count, and how far truncation can go: arXiv:2609.20510.
 
-        Two atoms couple in the Hessian iff a chain of selected edges connects
-        them within the model's reach, which for PET is ``K = 2L + 1`` hops with
-        ``L = num_gnn_layers`` (the energy is read off edge messages, one hop
-        wider than a node readout). ``hops="exact"`` is that ``K``; the sparse
-        Hessian then equals the dense no-shadow one up to rounding. Anything
-        below is a truncation: the couplings beyond ``hops`` are dropped and,
-        since the compression assumes them zero, fold into the retained entries.
-        Force-constant blocks decay by about an order of magnitude per hop for
-        PET, so truncation is a good trade for derived observables. With 0.1%
-        as the threshold for the heat capacity, PET-S is converged at
-        ``hops=3`` and PET-XS at ``hops=4`` for the vast majority of MOF
-        structures; zeolites need one more hop. At exact ``K`` the heat
-        capacity agrees with the dense reference to better than 1e-5 relative.
-        Method and numbers: Langer, Hill, Ceriotti, *Truncated automatic sparse
-        differentiation for machine learning interatomic potentials*,
-        arXiv:2609.20510 (2026).
-
-        The sparse pattern is only valid without shadow coupling, so sparse
-        mode forces ``no_shadow=True`` and raises on ``False``; dense mode
-        resolves ``no_shadow=None`` to the calculator's own setting, so the
-        dense Hessian is consistent with the forces it produces. (The Hessian
-        always differentiates the energy: for a ``direct_forces`` calculator
-        it is not the derivative of the forces the head reports.) The adaptive
-        selection is recomputed at every call (positions move under the Verlet
-        skin without a rebuild, so a cached pattern could miss a pair); the
-        coloring is cached on the selected pair set, and the jitted Hessian
-        function with it, so a call at a geometry whose selection differs from
-        the last one recolors and recompiles. One caveat that cannot be closed
-        from here: the pattern's selection and the energy's are two separately
-        compiled evaluations of the same function, so a pair sitting exactly
-        on its pair cutoff could in principle be classified differently by the
-        two. Composition shifts are never added, they are constant in
-        positions.
+        Sparse mode forces ``no_shadow=True`` and raises on ``False``. The
+        shadow Hessian is sparse too, but on all pairs within the cutoff
+        rather than the selected ones and up to two hops wider, since the
+        cutoff itself depends on positions: a far denser pattern, not
+        implemented. Dense mode resolves ``no_shadow=None`` to the calculator's
+        setting, so the dense Hessian is consistent with its forces. The
+        selection is recomputed every call (positions move under the Verlet
+        skin); coloring and jitted function are cached on the selected pair
+        set. Composition shifts never enter.
 
         Requires a calculator built with ``default_dtype="float64"``; matmul
         precision is pinned to ``"highest"`` for the call.
@@ -263,10 +240,10 @@ class UPETCalculator(BaseCalculator):
             no_shadow = True if sparse else self._no_shadow
         if sparse and not no_shadow:
             raise ValueError(
-                "UPETCalculator.hessian: a sparse Hessian needs no_shadow=True; "
-                "the sparsity pattern is derived from the selected neighbour list "
-                "and is wrong with shadow coupling. Use hops=None for the dense "
-                "reference with shadow forces."
+                "UPETCalculator.hessian: a sparse Hessian needs no_shadow=True. "
+                "With shadow coupling the pattern lives on all pairs within the "
+                "cutoff, not the selected ones; that mode is not implemented. Use "
+                "hops=None for the dense reference with shadow forces."
             )
 
         if self._nl_cache.needs_update(atoms):
