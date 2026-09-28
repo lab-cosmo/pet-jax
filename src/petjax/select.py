@@ -303,8 +303,20 @@ def get_adaptive_cutoffs_solver(
 
     # Bracket [r_lo, r_hi] with f(r_lo) <= 0 <= f(r_hi): n_total(0) = 0 and the
     # baseline alone reaches num_neighbors at r = cutoff.
-    r_lo = jnp.zeros(num_atoms, dtype=r_ij.dtype)
-    r_hi = jnp.full(num_atoms, cutoff, dtype=r_ij.dtype)
+    #
+    # Under shard_map, arrays derived from the per-device batch are typed as
+    # "varying" over the mesh axis, and fori_loop insists that the carry has
+    # the same type going in and coming out. The bracket starts from plain
+    # constants (not varying) but the body updates it from r_ij (varying), so
+    # without help the loop fails to trace. pcast just re-tags the constants
+    # as varying; it computes nothing. The axes are read off r_ij_d, so this
+    # is a no-op outside shard_map and does not care what the mesh axis is
+    # called.
+    varying = tuple(jax.typeof(r_ij_d).manual_axis_type.varying)
+    r_lo = jax.lax.pcast(jnp.zeros(num_atoms, dtype=r_ij.dtype), varying, to="varying")
+    r_hi = jax.lax.pcast(
+        jnp.full(num_atoms, cutoff, dtype=r_ij.dtype), varying, to="varying"
+    )
 
     # 10 iterations converge to fp32 precision (upstream's choice). Newton
     # steps that would leave the bracket (flat shoulders between bumps) fall
