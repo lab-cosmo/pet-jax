@@ -12,7 +12,7 @@ from ase.calculators.calculator import BaseCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from .predict import get_predict_fn
-from .select import determine_k_sel
+from .select import select_edges
 from .structure import _bucket_or, to_structure
 from .utils import cast_floats
 
@@ -72,7 +72,7 @@ class UPETCalculator(BaseCalculator):
         # Perf-tuning numbers, refreshed each NL rebuild (None until first
         # `calculate`). Always populated; `debug` only gates the stderr summary.
         self.debug_stats = None
-        # Cached max selected adaptive cutoff from the last `determine_k_sel`;
+        # Cached max selected adaptive cutoff from the last sizing pass;
         # carried across rebuilds that reuse k_sel (which skip the sizing run).
         self._max_selected_cutoff = None
 
@@ -197,7 +197,7 @@ class UPETCalculator(BaseCalculator):
         Two things, each behind its own gate:
 
         * raw NL — always (``to_structure``, vesin at ``cutoff + skin``).
-        * k_sel — recomputed via ``determine_k_sel`` (expensive: a CPU
+        * k_sel — recomputed via ``select_edges`` (expensive: a CPU
           selection kernel at ``[n_pair_padded]``) only on the first call, a
           shape change, or ``force_recompute_k_sel``; otherwise the cached
           bucket is reused, since k_sel rarely shifts between displacement-only
@@ -232,16 +232,21 @@ class UPETCalculator(BaseCalculator):
             or n_pair_padded != self._n_pair_padded
         )
 
-        k_sel_actual = None  # set only when determine_k_sel runs (debug stat)
+        k_sel_actual = None  # set only when the sizing pass runs (debug stat)
         if force_recompute_k_sel or shape_changed:
             # The trained self._model.cutoff, NOT self._cutoff: cutoff_override
             # narrows only the raw-NL radius, never the selection's reach.
-            k_sel_actual, self._max_selected_cutoff = determine_k_sel(
+            selection = select_edges(
                 structure,
                 self._num_neighbors_adaptive,
                 self._model.cutoff,
                 self._model.cutoff_width_adaptive,
                 method=self._model.adaptive_cutoff_method,
+            )
+            k_sel_actual = max(int(selection.counts.max()), 1)
+            # The selection's real reach, for tuning cutoff_override.
+            self._max_selected_cutoff = float(
+                selection.pair_cutoffs[selection.selected].max(initial=0.0)
             )
             # T = k_sel edge tokens + 1 central-atom token. Bucket T (an even
             # T keeps attention on XLA's fused fast path); k_sel = T - 1.

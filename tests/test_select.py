@@ -112,3 +112,44 @@ def test_pack_edges_forward_smoke(structure):
     params = model.init(jax.random.key(0), **packed)
     energy = model.apply(params, **packed)
     assert bool(jnp.all(jnp.isfinite(energy)))
+
+
+# -- select_edges: the adaptive selection's mask, host-side --
+
+
+def test_select_edges_mask(structure):
+    """The host-side selection is internally consistent (pair cutoffs are the
+    endpoint means of the atomic ones, the mask is ``r_ij <= pair_cutoff`` on
+    unmasked pairs, symmetric under ``reverse``) and matches the eager selection
+    core on the same displacements."""
+    from petjax import select_edges
+    from petjax.select import _select_edges
+    from petjax.utils import edge_displacements, safe_norm
+
+    hypers = dict(num_neighbors_adaptive=4, cutoff=CUTOFF, cutoff_width_adaptive=0.5)
+    sel = select_edges(structure, **hypers, method="grid")
+    centers, others, pair_mask = (structure[k] for k in ("centers", "others", "pair_mask"))
+    N = structure["positions"].shape[0]
+
+    assert all(isinstance(x, np.ndarray) for x in sel)
+    assert sel.atomic_cutoffs.shape == (N,)
+    assert sel.pair_cutoffs.shape == centers.shape
+    assert sel.selected.dtype == bool and sel.selected.shape == centers.shape
+    assert not sel.selected[~pair_mask].any()
+    assert np.array_equal(sel.selected[structure["reverse"]], sel.selected)
+    assert np.array_equal(sel.counts, np.bincount(centers[sel.selected], minlength=N))
+
+    R_ij = edge_displacements(
+        structure["positions"], centers, others, structure["cell_shifts"], structure["cell"]
+    )
+    r_ij = np.asarray(safe_norm(R_ij, axis=-1))
+    pair_cutoffs = (sel.atomic_cutoffs[centers] + sel.atomic_cutoffs[others]) / 2
+    assert np.array_equal(sel.pair_cutoffs, pair_cutoffs)
+    assert np.array_equal(sel.selected, (r_ij <= sel.pair_cutoffs) & pair_mask)
+
+    # The jitted kernel and the eager core agree to float32 rounding on the
+    # cutoffs (XLA fuses the reductions differently) and exactly on the mask.
+    eager = _select_edges(R_ij, centers, others, pair_mask, N, **hypers, method="grid")
+    assert np.allclose(sel.atomic_cutoffs, eager[0], rtol=1e-6, atol=0)
+    assert np.allclose(sel.pair_cutoffs, eager[1], rtol=1e-6, atol=0)
+    assert np.array_equal(sel.selected, np.asarray(eager[2]))

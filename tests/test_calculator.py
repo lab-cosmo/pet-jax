@@ -14,9 +14,9 @@ from petjax.convert import load_checkpoint
 from petjax.model import UPET
 from petjax.select import (
     _n_total,
-    determine_k_sel,
     get_adaptive_cutoffs,
     get_adaptive_cutoffs_solver,
+    select_edges,
     truncate_edges,
 )
 from petjax.structure import to_structure
@@ -233,12 +233,13 @@ def test_pair_cutoffs_none_uses_static_cutoff(model_data, mini_xyz):
     # the public truncate_edges seam, to get valid model inputs.
     structure = to_structure(atoms, model.cutoff, skin=0.5)
     N_padded = structure["positions"].shape[0]
-    k_sel, _ = determine_k_sel(
+    selected = select_edges(
         structure,
         config["num_neighbors_adaptive"],
         model.cutoff,
         model.cutoff_width_adaptive,
-    )
+    ).selected
+    k_sel = int(np.bincount(np.asarray(structure["centers"])[selected]).max())
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],

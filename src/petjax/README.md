@@ -6,7 +6,7 @@ Developer-facing notes for the `petjax` package. See the top-level [README.md](.
 
 The top-level README explains the 2-phase split (outside JIT = build + size; inside JIT = re-run + forward + grad). The rationales behind that split, grouped by which side of the JIT boundary they live on:
 
-**Outside JIT** — `structure.to_structure` (host-side build) + `select.determine_k_sel` (CPU-pinned sizing kernel)
+**Outside JIT** — `structure.to_structure` (host-side build) + `select.select_edges` (CPU-pinned selection kernel, which sizes `k_sel`)
 
 - The structure dict stores **cell shifts**, not pre-computed displacements. `R_ij` is re-derived from `(positions, cell)` inside JIT so positions and cell are the only gradient inputs. Clean autodiff w.r.t. both, including the strain derivative for stress.
 - `N_padded` / `n_pair_padded` / `k_sel` are snapped to a bucket strategy via `marathon.utils.next_size`. Small fluctuations in atom or pair count must not retrigger XLA compilation.
@@ -28,7 +28,7 @@ The top-level README explains the 2-phase split (outside JIT = build + size; ins
 
 ## JIT placement rule
 
-The only `@jax.jit` sites in the package are `select._k_sel_kernel` (CPU-pinned, sizing) and `predict.predict_fn` (forward, default device). Every other helper is undecorated and traced into whichever entry point calls it. **Do not add `@jax.jit` elsewhere** — nesting jit inside `predict_fn` defeats the trace-once-then-execute model and silently inflates compile times.
+The only `@jax.jit` sites in the package are `select._select_edges_kernel` (CPU-pinned, host-side selection) and `predict.predict_fn` (forward, default device). Every other helper is undecorated and traced into whichever entry point calls it. **Do not add `@jax.jit` elsewhere** — nesting jit inside `predict_fn` defeats the trace-once-then-execute model and silently inflates compile times.
 
 ## Key invariant
 
