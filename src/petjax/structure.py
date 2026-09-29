@@ -129,6 +129,52 @@ def to_structure(
     }
 
 
+def read_conditioning(atoms):
+    """``(charge, spin_multiplicity)`` of ``atoms``, from ``atoms.info`` under
+    the keys metatrain uses; missing means neutral (0) / singlet (1), as
+    upstream defaults. ``spin`` is the OMol dataset's spelling of the
+    multiplicity, accepted as a fallback like metatomic's ASE calculator does."""
+    charge = _integer_info(atoms, "charge", 0)
+    spin_key = "spin_multiplicity" if "spin_multiplicity" in atoms.info else "spin"
+    return charge, _integer_info(atoms, spin_key, 1)
+
+
+def conditioning_inputs(
+    atoms, N_padded, max_charge, max_spin_multiplicity, int_dtype=np.int64
+):
+    """Per-atom ``charge`` / ``spin_multiplicity`` arrays ``[N_padded]`` for a
+    conditioned model. Validated here, host-side, because the embedding lookup
+    inside JIT would not raise on an out-of-range index: values must be
+    integers within ``[-max_charge, max_charge]`` and
+    ``[1, max_spin_multiplicity]``.
+    """
+    charge, spin_multiplicity = read_conditioning(atoms)
+    if not -max_charge <= charge <= max_charge:
+        raise ValueError(
+            f"charge={charge} outside the model's range [{-max_charge}, {max_charge}] "
+            f"(max_charge in the checkpoint config)."
+        )
+    if not 1 <= spin_multiplicity <= max_spin_multiplicity:
+        raise ValueError(
+            f"spin_multiplicity={spin_multiplicity} outside the model's range "
+            f"[1, {max_spin_multiplicity}] (max_spin_multiplicity in the checkpoint "
+            f"config)."
+        )
+    return {
+        "charge": np.full(N_padded, charge, dtype=int_dtype),
+        "spin_multiplicity": np.full(N_padded, spin_multiplicity, dtype=int_dtype),
+    }
+
+
+def _integer_info(atoms, key, default):
+    value = atoms.info.get(key, default)
+    if np.ndim(value) != 0 or float(value) != int(value):
+        raise ValueError(
+            f"atoms.info[{key!r}] must be a single integer value; got {value!r}."
+        )
+    return int(value)
+
+
 # -- helpers --
 
 

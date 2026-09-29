@@ -33,6 +33,9 @@ from typing import NamedTuple
 
 from .utils import cutoff_bump, edge_displacements, safe_norm
 
+# Per-atom model inputs a structure dict may carry besides the geometry.
+CONDITIONING_KEYS = ("charge", "spin_multiplicity")
+
 # -- truncate: structure -> (truncated dict, overflow) — the per-step entry --
 
 
@@ -46,7 +49,9 @@ def truncate(
 ):
     """Adaptive selection + pack for a single-structure dict: derive ``R_ij``
     from ``(positions, cell_shifts, cell)``, read ``k_sel`` off the
-    ``k_sel_sizer`` carrier, delegate to ``truncate_edges``."""
+    ``k_sel_sizer`` carrier, delegate to ``truncate_edges``. Per-atom model
+    inputs beyond the geometry (``charge``, ``spin_multiplicity``) pass
+    through untouched when present."""
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],
@@ -54,7 +59,7 @@ def truncate(
         structure["cell_shifts"],
         structure["cell"],
     )
-    return truncate_edges(
+    truncated, overflow = truncate_edges(
         R_ij,
         structure["centers"],
         structure["others"],
@@ -69,6 +74,10 @@ def truncate(
         method=method,
         no_shadow=no_shadow,
     )
+    for key in CONDITIONING_KEYS:
+        if key in structure:
+            truncated[key] = structure[key]
+    return truncated, overflow
 
 
 def truncate_edges(

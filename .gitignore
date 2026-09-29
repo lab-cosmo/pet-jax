@@ -37,6 +37,7 @@ tests/assets/checkpoints/pet-mad-xs/metadata.yaml
 tests/assets/checkpoints/pet-mad-xs-v1.6/
 tests/assets/checkpoints/pet-mad-s/
 tests/assets/checkpoints/pet-omat-xs/
+tests/assets/checkpoints/pet-omol-s
 
 # Extended test assets (fetched/generated locally; CI uses test_mini only)
 tests/assets/test_s.xyz

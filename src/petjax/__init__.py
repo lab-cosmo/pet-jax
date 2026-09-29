@@ -2,7 +2,15 @@
 
 from .calculator import UPETCalculator
 from .convert import convert_checkpoint, load_checkpoint
-from .model import MLP, UPET, Backbone, DirectForces, DirectStress, Energy
+from .model import (
+    MLP,
+    UPET,
+    Backbone,
+    DirectForces,
+    DirectStress,
+    Energy,
+    SystemConditioning,
+)
 from .predict import get_predict_fn
 from .select import (
     get_adaptive_cutoffs,
@@ -21,6 +29,7 @@ __all__ = [
     "Energy",
     "DirectForces",
     "DirectStress",
+    "SystemConditioning",
     "MLP",
     "UPETCalculator",
     "cutoff_bump",

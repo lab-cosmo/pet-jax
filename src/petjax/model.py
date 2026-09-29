@@ -38,6 +38,9 @@ class UPET(nn.Module):
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
     max_atomic_number: int = 118
+    system_conditioning: bool = False
+    max_charge: int = 10
+    max_spin_multiplicity: int = 10
     direct_forces: bool = False
     direct_stress: bool = False
 
@@ -52,6 +55,8 @@ class UPET(nn.Module):
         pair_mask,
         atom_mask,
         pair_cutoffs=None,
+        charge=None,
+        spin_multiplicity=None,
     ):
         node, edge, cutoffs = Backbone(
             d_pet=self.d_pet,
@@ -64,6 +69,9 @@ class UPET(nn.Module):
             cutoff_width=self.cutoff_width,
             max_atomic_number=self.max_atomic_number,
             attention_temperature=self.attention_temperature,
+            system_conditioning=self.system_conditioning,
+            max_charge=self.max_charge,
+            max_spin_multiplicity=self.max_spin_multiplicity,
             name="backbone",
         )(
             R_ij,
@@ -74,6 +82,8 @@ class UPET(nn.Module):
             pair_mask,
             atom_mask,
             pair_cutoffs,
+            charge,
+            spin_multiplicity,
         )
 
         predictions = Energy(d_head=self.d_head, name="energy_head")(
@@ -113,6 +123,12 @@ class Backbone(nn.Module):
 
     Returns per-atom node features `[N, d_node]`, per-pair edge features
     (messages) `[P, d_pet]`, and per-pair cutoff factors `[P]`.
+
+    With ``system_conditioning``, ``charge`` and ``spin_multiplicity`` are
+    per-atom integer arrays ``[N]`` (every atom carries its structure's value,
+    so a batch of several structures needs no extra index); absent inputs
+    fall back to charge 0 / multiplicity 1, as upstream does for systems
+    without the data.
     """
 
     d_pet: int = 128
@@ -125,6 +141,9 @@ class Backbone(nn.Module):
     cutoff_width: float = 0.5
     max_atomic_number: int = 118
     attention_temperature: float = 1.0
+    system_conditioning: bool = False
+    max_charge: int = 10
+    max_spin_multiplicity: int = 10
 
     @nn.compact
     def __call__(
@@ -137,12 +156,30 @@ class Backbone(nn.Module):
         pair_mask,
         atom_mask,
         pair_cutoffs=None,
+        charge=None,
+        spin_multiplicity=None,
     ):
         d_pet = self.d_pet
         d_node = self.d_node
         P = R_ij.shape[0]
         N = atomic_numbers.shape[0]
         n = P // N
+
+        # Computed once, added to the node features after every GNN layer
+        # (upstream adds it to the layer's output node embeddings).
+        conditioning = None
+        if self.system_conditioning:
+            if charge is None:
+                charge = jnp.zeros(N, dtype=jnp.int32)
+            if spin_multiplicity is None:
+                spin_multiplicity = jnp.ones(N, dtype=jnp.int32)
+            conditioning = SystemConditioning(
+                d_out=d_node,
+                max_charge=self.max_charge,
+                max_spin_multiplicity=self.max_spin_multiplicity,
+                name="system_conditioning",
+            )(charge, spin_multiplicity)
+            conditioning = conditioning * atom_mask[:, None]
 
         r_ij = safe_norm(R_ij, axis=-1)
 
@@ -214,6 +251,9 @@ class Backbone(nn.Module):
                     temperature=self.attention_temperature,
                     name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
                 )(node, edge, cutoffs_tokens, mask)
+
+            if conditioning is not None:
+                node = node + conditioning[:, None, :]
 
             # Message passing (feedforward mixing)
             edge_flat = edge.reshape(P, d_pet) * pair_mask[..., None]
@@ -307,6 +347,39 @@ class DirectStress(nn.Module):
         edge_contrib = (edge_out * cutoffs[:, None]).reshape(N, n, 9).sum(axis=1)
         per_atom = (node_out + edge_contrib).reshape(N, 3, 3)
         return 0.5 * (per_atom + jnp.swapaxes(per_atom, 1, 2))
+
+
+# -- system conditioning --
+
+
+class SystemConditioning(nn.Module):
+    """Charge / spin-multiplicity embedding, one vector per atom ``[N, d_out]``.
+
+    Two lookup tables, concatenated and projected; upstream's
+    ``SystemConditioningEmbedding``. Both are indexed by the value itself,
+    like the species tables by Z: multiplicity ``m`` is row ``m`` (row 0
+    unused), charge ``c`` is row ``c``, a negative charge reaching its row
+    from the end of the table the way any negative index does. The
+    converter lays the tables out that way; upstream stores them offset.
+    """
+
+    d_out: int
+    max_charge: int = 10
+    max_spin_multiplicity: int = 10
+
+    @nn.compact
+    def __call__(self, charge, spin_multiplicity):
+        charge_embed = nn.Embed(
+            2 * self.max_charge + 1, self.d_out, name="charge_embedding"
+        )
+        spin_embed = nn.Embed(
+            self.max_spin_multiplicity + 1, self.d_out, name="spin_multiplicity_embedding"
+        )
+        c = charge_embed(charge)
+        s = spin_embed(spin_multiplicity)
+        return MLP((self.d_out, self.d_out), name="project")(
+            jnp.concatenate([c, s], axis=-1)
+        )
 
 
 # -- transformer block --

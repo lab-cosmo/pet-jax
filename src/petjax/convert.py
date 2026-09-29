@@ -6,8 +6,8 @@ intermediate. Accepts both layouts published on Hugging Face
 and LLPR-wrapped ones (the PET-MAD releases; wrapper v3 or v4 — the wrapper
 state itself is never read). Inner PET checkpoint versions 10 through 16 are
 supported; the between-version differences (new hypers, the v13 scaler split,
-the v16 ``backend.`` state-dict prefix) are absorbed here, mirroring
-metatrain's own upgrade rules. Older checkpoints fail hard — run
+the v15 charge/spin conditioning, the v16 ``backend.`` state-dict prefix) are
+absorbed here, mirroring metatrain's own upgrade rules. Older checkpoints fail hard — run
 ``mtt upgrade``; newer ones fail hard until pet-jax catches up.
 
 Not every upstream change is versioned: PET-MAD v1.6 renamed the direct-force
@@ -81,18 +81,23 @@ def convert_checkpoint(ckpt_path, output_dir):
     ckpt = torch.load(str(ckpt_path), weights_only=False, map_location="cpu")
 
     pet_ckpt = _unwrap_pet_checkpoint(ckpt)
-    # metatrain ckpt v16 moved the PET core under a `backend.` submodule;
-    # strip the prefix so one rename pipeline serves all versions. Scaler /
-    # additive-model keys were not moved, so metadata extraction is unaffected.
-    state_dict = {
-        k.removeprefix("backend."): v for k, v in pet_ckpt["best_model_state_dict"].items()
-    }
+    state_dict = _strip_backend_prefix(pet_ckpt["best_model_state_dict"])
     _check_single_readout(state_dict)
     meta = _extract_metadata(pet_ckpt)
+
+    if not meta["config"]["system_conditioning"]:
+        # A checkpoint can carry conditioning weights it was told not to use
+        # (upstream keeps them through hyper changes); the Flax model has no
+        # slot for them, so drop rather than convert.
+        state_dict = {
+            k: v for k, v in state_dict.items() if not k.startswith("system_conditioning.")
+        }
 
     flat = _convert_state_dict(state_dict)
     n_rows = meta["config"]["max_atomic_number"] + 1
     _scatter_species_embeddings(flat, meta["atomic_types"], n_rows)
+    if meta["config"]["system_conditioning"]:
+        _layout_conditioning_tables(flat, meta["config"]["max_charge"])
 
     # Scales live in the parameter tree, not metadata. force_scale is
     # per-species (scattered to Z rows); energy/stress scales are scalars.
@@ -136,10 +141,44 @@ def load_checkpoint(checkpoint_dir):
     config = metadata["config"]
     config.setdefault("adaptive_cutoff_method", "grid")
     config.setdefault("cutoff_width_adaptive", config["cutoff_width"])
+    # Conditioning hypers arrived with metatrain ckpt v15; converted before
+    # that, a model is unconditioned.
+    config.setdefault("system_conditioning", False)
+    config.setdefault("max_charge", 10)
+    config.setdefault("max_spin_multiplicity", 10)
     return params, metadata
 
 
 # -- ckpt unwrap + metadata extraction --
+
+
+def _strip_backend_prefix(state_dict):
+    """metatrain ckpt v16 moved the PET core under a ``backend.`` submodule;
+    strip the prefix so one rename pipeline serves all versions. Scaler /
+    additive-model keys were not moved, so metadata extraction is unaffected.
+
+    v16 also aliases the conditioning module at the top level, so its tensors
+    appear under both names; keep one copy, and refuse should they ever
+    disagree."""
+    import torch
+
+    out = {}
+    for key, value in state_dict.items():
+        stripped = key.removeprefix("backend.")
+        if stripped in out:
+            same = (
+                torch.equal(out[stripped], value)
+                if isinstance(value, torch.Tensor)
+                else out[stripped] == value
+            )
+            if not same:
+                raise ValueError(
+                    f"state-dict keys {key!r} and {stripped!r} collide with "
+                    f"different values."
+                )
+            continue
+        out[stripped] = value
+    return out
 
 
 def _unwrap_pet_checkpoint(ckpt):
@@ -235,23 +274,19 @@ def _extract_metadata(pet_ckpt):
             f"unknown adaptive_cutoff_method {method!r} in checkpoint; "
             f"pet-jax implements 'grid' and 'solver'."
         )
-    # metatrain ckpt v15 added charge/spin conditioning; pet-jax has no
-    # equivalent embedding, so a conditioned model would be silently wrong.
-    if hypers.get("system_conditioning", False):
-        raise ValueError(
-            "pet-jax does not implement system conditioning (charge/spin "
-            "embeddings); checkpoint has system_conditioning=True."
-        )
-
     config = {k: hypers[k] for k in CONFIG_KEYS}
     config["adaptive_cutoff_method"] = method
     # Hyper fallbacks mirror metatrain's own upgrade rules for checkpoints
-    # predating each hyper: attention_temperature (v10→v11) and the
-    # adaptive-selection taper width split off cutoff_width (v13→v14).
+    # predating each hyper: attention_temperature (v10→v11), the
+    # adaptive-selection taper width split off cutoff_width (v13→v14), and
+    # charge/spin conditioning, off by default (v14→v15).
     config["attention_temperature"] = hypers.get("attention_temperature", 1.0)
     config["cutoff_width_adaptive"] = hypers.get(
         "cutoff_width_adaptive", hypers["cutoff_width"]
     )
+    config["system_conditioning"] = bool(hypers.get("system_conditioning", False))
+    config["max_charge"] = int(hypers.get("max_charge", 10))
+    config["max_spin_multiplicity"] = int(hypers.get("max_spin_multiplicity", 10))
 
     atomic_types = list(model_data["dataset_info"].atomic_types)
     config["max_atomic_number"] = max(int(z) for z in atomic_types)
@@ -477,6 +512,8 @@ def _finalize_key(new_key, np_value):
         (r"node_heads_(\d+)\.2\.", r"node_heads_\1.Dense_1."),
         (r"edge_heads_(\d+)\.0\.", r"edge_heads_\1.Dense_0."),
         (r"edge_heads_(\d+)\.2\.", r"edge_heads_\1.Dense_1."),
+        (r"system_conditioning\.project\.0\.", r"system_conditioning.project.Dense_0."),
+        (r"system_conditioning\.project\.2\.", r"system_conditioning.project.Dense_1."),
     ):
         new_key = re.sub(regex, sub, new_key)
 
@@ -484,15 +521,34 @@ def _finalize_key(new_key, np_value):
 
 
 def _scatter_species_embeddings(flat, atomic_types, n_rows):
-    """Re-index embedding rows to atomic number: trained row ``i`` -> row
-    ``Z = atomic_types[i]``. Untrained rows stay zero."""
+    """Re-index species-embedding rows to atomic number: trained row ``i`` ->
+    row ``Z = atomic_types[i]``. Untrained rows stay zero. The conditioning
+    tables are indexed by charge / multiplicity, not species, and stay put."""
     rows = np.asarray([int(z) for z in atomic_types])
     for key in list(flat):
-        if key.endswith(".embedding"):
+        if key.endswith(".embedding") and "system_conditioning" not in key:
             table = np.asarray(flat[key])
             scattered = np.zeros((n_rows, table.shape[1]), dtype=table.dtype)
             scattered[rows] = table
             flat[key] = jnp.array(scattered)
+
+
+_CHARGE_TABLE = "backbone.system_conditioning.charge_embedding.embedding"
+_SPIN_TABLE = "backbone.system_conditioning.spin_multiplicity_embedding.embedding"
+
+
+def _layout_conditioning_tables(flat, max_charge):
+    """Re-index the conditioning tables by value, the way species tables are
+    indexed by Z: upstream stores charge ``c`` at row ``c + max_charge`` and
+    multiplicity ``m`` at row ``m - 1``. Rolling the charge table puts ``c``
+    at row ``c`` for ``c >= 0`` and at row ``size + c`` for ``c < 0``, which
+    is where a negative index lands; the spin table gets an unused row 0."""
+    charge = np.asarray(flat[_CHARGE_TABLE])
+    flat[_CHARGE_TABLE] = jnp.array(np.roll(charge, -max_charge, axis=0))
+    spin = np.asarray(flat[_SPIN_TABLE])
+    flat[_SPIN_TABLE] = jnp.array(
+        np.concatenate([np.zeros((1, spin.shape[1]), dtype=spin.dtype), spin])
+    )
 
 
 def _unflatten(flat):

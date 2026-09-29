@@ -36,6 +36,10 @@ The PET forward math in `model.py` is unchanged from the upstream `metatrain` de
 
 `UPET` is split into two Flax submodules: `Backbone` (embeddings + GNN/transformer layers → `(node, edge, cutoffs)` features) and `Energy` (the readout). `UPET` composes them. Consequence: the parameter tree nests under `backbone/…` and `energy_head/…` rather than flat at the top level, and `convert.py` scopes keys accordingly (`_scope_key`).
 
+Model inputs beyond the geometry follow the same pattern as `marathon`: they ride in the structure dict under their property name (`charge`, `spin_multiplicity`, as per-atom integer arrays so a batch of structures needs no extra index), `truncate` passes them through untouched, and `UPET.__call__` takes them as optional keyword arguments it only reads when the checkpoint enables `system_conditioning`. The calculator merges them into the structure (like `k_sel_sizer`) and validates them host-side; inside JIT an out-of-range index into an embedding table yields NaN rather than an error. The unconditioned path carries no extra JIT inputs at all.
+
+The conditioning tables are indexed by value, the same way the species tables are indexed by Z: multiplicity `m` is row `m` (row 0 unused) and charge `c` is row `c`, with negative charges in the tail rows that a negative index reaches. Upstream stores both tables offset (`c + max_charge`, `m - 1`); `convert.py` re-lays them out (`_layout_conditioning_tables`) so the model does no index arithmetic.
+
 Shape stability is best-effort, not enforced: shapes tend to be stable or grow within a relaxation/MD run (bucket granularity absorbs small fluctuations), but a rebuild can land on a smaller bucket if local density drops, triggering a re-JIT at the new size.
 
 ## Internal conventions
