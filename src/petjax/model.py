@@ -38,8 +38,6 @@ class UPET(nn.Module):
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
     max_atomic_number: int = 118
-    # Charge / spin-multiplicity conditioning (metatrain ckpt v15+); the
-    # embedding tables span [-max_charge, max_charge] and [1, max_spin_multiplicity].
     system_conditioning: bool = False
     max_charge: int = 10
     max_spin_multiplicity: int = 10

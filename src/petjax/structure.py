@@ -129,27 +129,26 @@ def to_structure(
     }
 
 
-# The atoms.info keys a conditioned model reads; "spin" is the OMol dataset's
-# spelling of the multiplicity, accepted as a fallback like metatomic's ASE
-# calculator does.
-CONDITIONING_INFO_KEYS = ("charge", "spin_multiplicity", "spin")
+def read_conditioning(atoms):
+    """``(charge, spin_multiplicity)`` of ``atoms``, from ``atoms.info`` under
+    the keys metatrain uses; missing means neutral (0) / singlet (1), as
+    upstream defaults. ``spin`` is the OMol dataset's spelling of the
+    multiplicity, accepted as a fallback like metatomic's ASE calculator does."""
+    charge = _integer_info(atoms, "charge", 0)
+    spin_key = "spin_multiplicity" if "spin_multiplicity" in atoms.info else "spin"
+    return charge, _integer_info(atoms, spin_key, 1)
 
 
 def conditioning_inputs(
     atoms, N_padded, max_charge, max_spin_multiplicity, int_dtype=np.int64
 ):
     """Per-atom ``charge`` / ``spin_multiplicity`` arrays ``[N_padded]`` for a
-    conditioned model, read from ``atoms.info`` under the same keys metatrain
-    uses; a missing key means neutral (0) / singlet (1), as upstream defaults.
-
-    Validated here, host-side, because the embedding lookup inside JIT would
-    clamp an out-of-range index silently: values must be integers within
-    ``[-max_charge, max_charge]`` and ``[1, max_spin_multiplicity]``.
+    conditioned model. Validated here, host-side, because the embedding lookup
+    inside JIT would not raise on an out-of-range index: values must be
+    integers within ``[-max_charge, max_charge]`` and
+    ``[1, max_spin_multiplicity]``.
     """
-    charge = _integer_info(atoms, "charge", 0)
-    # metatomic's ASE calculator falls back to "spin", the OMol dataset's key.
-    spin_key = "spin_multiplicity" if "spin_multiplicity" in atoms.info else "spin"
-    spin_multiplicity = _integer_info(atoms, spin_key, 1)
+    charge, spin_multiplicity = read_conditioning(atoms)
     if not -max_charge <= charge <= max_charge:
         raise ValueError(
             f"charge={charge} outside the model's range [{-max_charge}, {max_charge}] "

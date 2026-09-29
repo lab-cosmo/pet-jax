@@ -13,12 +13,7 @@ from ase.stress import full_3x3_to_voigt_6_stress
 
 from .predict import get_predict_fn
 from .select import select_edges
-from .structure import (
-    CONDITIONING_INFO_KEYS,
-    _bucket_or,
-    conditioning_inputs,
-    to_structure,
-)
+from .structure import _bucket_or, conditioning_inputs, read_conditioning, to_structure
 from .utils import cast_floats
 
 
@@ -146,14 +141,12 @@ class UPETCalculator(BaseCalculator):
         return cls(model, params, metadata, **kwargs)
 
     def check_state(self, atoms, tol=1e-15):
-        # ASE's compare_atoms covers arrays, cell and pbc but not atoms.info;
-        # for a conditioned model a new charge or spin multiplicity must
-        # invalidate the cached results too.
+        # ASE only compares geometry, so a new charge or spin multiplicity in
+        # atoms.info would otherwise return the cached results.
         changes = super().check_state(atoms, tol=tol)
         if self._model.system_conditioning and self.atoms is not None:
-            for key in CONDITIONING_INFO_KEYS:
-                if atoms.info.get(key) != self.atoms.info.get(key):
-                    changes.append(key)
+            if read_conditioning(atoms) != read_conditioning(self.atoms):
+                changes.append("conditioning")
         return changes
 
     def calculate(self, atoms=None, properties=None, system_changes=None, **kwargs):
