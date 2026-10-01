@@ -21,10 +21,10 @@ src/petjax/
 
 ## Installation
 
-`pet-jax` needs Python ≥ 3.10. It is not on PyPI yet, so install it from the repository:
+`pet-jax` needs Python ≥ 3.10. Install it from PyPI:
 
 ```bash
-pip install "git+https://github.com/lab-cosmo/pet-jax"
+pip install pet-jax
 ```
 
 This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `marathon-train`) — everything needed to load a checkpoint and run the calculator.
@@ -32,7 +32,7 @@ This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `mara
 Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra (`torch`, `metatomic-torch`, `metatrain`), which is **not** required for inference:
 
 ```bash
-pip install "pet-jax[convert] @ git+https://github.com/lab-cosmo/pet-jax"
+pip install "pet-jax[convert]"
 ```
 
 Or from a checkout, which is the easiest way to also get the examples and tests:

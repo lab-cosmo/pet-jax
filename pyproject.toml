@@ -1,6 +1,6 @@
 [project]
 name = "pet-jax"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Clean JAX/Flax implementation of uPET interatomic potentials"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,8 +50,12 @@ convert = ["torch", "metatomic-torch", "metatrain>=2026.3"]
 petjax-convert = "petjax.cli:convert_main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# The version comes from the latest `v*` git tag.
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/petjax"]
