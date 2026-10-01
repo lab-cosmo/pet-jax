@@ -21,10 +21,10 @@ src/petjax/
 
 ## Installation
 
-`pet-jax` needs Python ≥ 3.10. It is not on PyPI yet, so install it from the repository:
+`pet-jax` needs Python ≥ 3.10. Install it from PyPI:
 
 ```bash
-pip install "git+https://github.com/lab-cosmo/pet-jax"
+pip install pet-jax
 ```
 
 This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `marathon-train`) — everything needed to load a checkpoint and run the calculator.
@@ -32,7 +32,14 @@ This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `mara
 Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra (`torch`, `metatomic-torch`, `metatrain`), which is **not** required for inference:
 
 ```bash
-pip install "pet-jax[convert] @ git+https://github.com/lab-cosmo/pet-jax"
+pip install "pet-jax[convert]"
+```
+
+`pet-jax` is experimental and under active development, and releases lag behind `main`. For the latest state, install from GitHub:
+
+```bash
+pip install "git+https://github.com/lab-cosmo/pet-jax"
+pip install "pet-jax[convert] @ git+https://github.com/lab-cosmo/pet-jax"   # with the convert extra
 ```
 
 Or from a checkout, which is the easiest way to also get the examples and tests:
@@ -214,6 +221,8 @@ Optional (the `convert` extra — see [Installation](#installation)):
 ## Contributing
 
 Code conventions (`ruff` config, naming patterns, file layout, JIT placement rule, Markdown soft-wrap, internal NL/attention conventions) and the architecture deep-dive live in [`src/petjax/README.md`](src/petjax/README.md). Read it before submitting non-trivial PRs.
+
+PRs that change anything user-visible add a line to the **Unreleased** section of [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Status
 
