@@ -6,6 +6,8 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+## [0.1.0] - 2026-10-01
+
 ### Added
 
 - First release. Includes the JAX/Flax reimplementation of uPET, the `UPETCalculator` ASE calculator (energy, forces, stress, adaptive cutoffs), and `petjax-convert` for `metatrain` checkpoints (PET-MAD, PET-OMAT and other bare or LLPR-wrapped PET checkpoints, from format v10 onwards). Also includes charge/spin system conditioning (e.g. PET-OMol).
