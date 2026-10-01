@@ -122,6 +122,29 @@ def test_unconditioned_model_accepts_inputs(atoms):
     np.testing.assert_array_equal(with_inputs, without)
 
 
+def test_float_inputs_match_int(atoms):
+    config = {**CONFIG, **CONDITIONED}
+    model = UPET(**config)
+    structure = to_structure(atoms, config["cutoff"])
+    structure["k_sel_sizer"] = jnp.zeros(16, dtype=bool)
+    truncated, _ = truncate(structure, 8, config["cutoff"], 0.5)
+    params = model.init(jax.random.PRNGKey(0), **truncated)
+    N = truncated["atomic_numbers"].shape[0]
+    as_int = model.apply(
+        params,
+        **truncated,
+        charge=jnp.full(N, -2, dtype=jnp.int32),
+        spin_multiplicity=jnp.full(N, 3, dtype=jnp.int32),
+    )
+    as_float = model.apply(
+        params,
+        **truncated,
+        charge=jnp.full(N, -2.0, dtype=jnp.float32),
+        spin_multiplicity=jnp.full(N, 3.0, dtype=jnp.float32),
+    )
+    np.testing.assert_array_equal(as_float, as_int)
+
+
 @pytest.mark.parametrize(
     "info, match",
     [
