@@ -10,11 +10,15 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
+          # No lockfile is committed, so key the cache on what pins the deps.
+          cache-dependency-glob: |
+            pyproject.toml
+            tox.ini
       - name: Install tox
         run: uv tool install --with tox-uv tox
       - name: Lint (ruff)
@@ -23,11 +27,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
+          # No lockfile is committed, so key the cache on what pins the deps.
+          cache-dependency-glob: |
+            pyproject.toml
+            tox.ini
       - name: Install tox
         run: uv tool install --with tox-uv tox
       # The converted reference checkpoints depend only on the checkpoint list
@@ -35,7 +43,7 @@ jobs:
       # ~180 MB of downloads and the torch-side conversion.
       - name: Cache converted checkpoints
         id: checkpoints
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: tests/assets/checkpoints
           key: checkpoints-${{ hashFiles('tox.ini', 'src/petjax/convert.py', 'src/petjax/cli.py') }}
