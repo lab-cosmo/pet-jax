@@ -125,10 +125,10 @@ class Backbone(nn.Module):
     (messages) `[P, d_pet]`, and per-pair cutoff factors `[P]`.
 
     With ``system_conditioning``, ``charge`` and ``spin_multiplicity`` are
-    per-atom integer arrays ``[N]`` (every atom carries its structure's value,
-    so a batch of several structures needs no extra index); absent inputs
-    fall back to charge 0 / multiplicity 1, as upstream does for systems
-    without the data.
+    per-atom integer-valued arrays ``[N]``, int or float (every atom carries
+    its structure's value, so a batch of several structures needs no extra
+    index); absent inputs fall back to charge 0 / multiplicity 1, as upstream
+    does for systems without the data.
     """
 
     d_pet: int = 128
@@ -375,8 +375,8 @@ class SystemConditioning(nn.Module):
         spin_embed = nn.Embed(
             self.max_spin_multiplicity + 1, self.d_out, name="spin_multiplicity_embedding"
         )
-        c = charge_embed(charge)
-        s = spin_embed(spin_multiplicity)
+        c = charge_embed(charge.astype(jnp.int32))
+        s = spin_embed(spin_multiplicity.astype(jnp.int32))
         return MLP((self.d_out, self.d_out), name="project")(
             jnp.concatenate([c, s], axis=-1)
         )
