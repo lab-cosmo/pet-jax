@@ -40,6 +40,7 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/lab-cosmo/pet-jax"
 Issues = "https://github.com/lab-cosmo/pet-jax/issues"
+Changelog = "https://github.com/lab-cosmo/pet-jax/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # The metatrain floor keeps the resolver off the broken metatrain==0.0.0

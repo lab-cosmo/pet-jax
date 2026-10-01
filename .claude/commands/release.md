@@ -22,29 +22,31 @@ Create a new release of pet-jax on PyPI. Optional argument: version bump level (
 
 - Find the latest git tag with `git describe --tags --abbrev=0` (or note if there are no tags yet; the first release is then `0.1.0` unless the user says otherwise)
 - If a bump level was given ($ARGUMENTS), compute the new version following semver (e.g., `0.1.0` → `0.1.1` for patch, `0.2.0` for minor, `1.0.0` for major)
-- If NO bump level was given, review the changes (step 4) first, then discuss with the user what the appropriate level should be based on the nature of the changes (breaking → major, new features → minor, fixes/maintenance → patch)
+- If NO bump level was given, review the changelog (step 4) first, then discuss with the user what the appropriate level should be based on the nature of the changes (breaking → major, new features → minor, fixes/maintenance → patch)
 - Confirm the new version with the user before proceeding
 
-### 4. Review changes and write changelog
+### 4. Finalise the changelog
 
-- Run `git log <last-tag>..HEAD --oneline` to see all commits since the last release (or all commits if no prior tag)
-- Write a brief changelog summarising the changes, grouped by category where appropriate (features, fixes, breaking changes, maintenance, etc.)
-- Present the changelog to the user for review and approval
+- PRs add their own entries to the **Unreleased** section of `CHANGELOG.md`, so it should already be mostly complete
+- Run `git log <last-tag>..HEAD --oneline` (or all commits if no prior tag) and cross-check: flag user-visible changes without an entry, and entries that are unclear or in the wrong group
+- Propose fixes to the user, then turn **Unreleased** into `## [<version>] - <YYYY-MM-DD>` and add a fresh, empty `## Unreleased` above it
+- Present the finished section to the user for review and approval
+- Open a PR titled `Release v<version>` containing only the `CHANGELOG.md` change, and wait for the user to merge it. Then fetch and check out the merge commit on `origin/main`: the tag must point at the commit that contains the versioned section. If anything else was merged in the meantime, add it to the section first.
 
 ### 5. Tag and push
 
-- Create an annotated tag: `git tag -a v<version> -m "Release v<version>"`
+- Create an annotated tag on the release PR's merge commit: `git tag -a v<version> -m "Release v<version>"`
 - Push the tag: `git push origin v<version>`
 - This triggers `.github/workflows/release.yml`, which builds the package and publishes it to PyPI via trusted publishing from the `release` environment
 - Watch it: `gh run watch` (or `gh run list --repo lab-cosmo/pet-jax --workflow release.yml --limit 1`), and confirm the publish job succeeded before continuing
 
 ### 6. Create GitHub release
 
-- Use `gh release create v<version> --repo lab-cosmo/pet-jax --title "v<version>" --notes-file <file>` with the changelog from step 4 (inline `--notes` with backticks gets mangled by the sandbox)
+- Use `gh release create v<version> --repo lab-cosmo/pet-jax --title "v<version>" --notes-file <file>`, where the file holds the version's `CHANGELOG.md` section without its heading (inline `--notes` with backticks gets mangled by the sandbox)
 - Confirm the new version is visible on PyPI: `curl -s https://pypi.org/pypi/pet-jax/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])"`
 
 ## Notes
 
-- The version is derived from git tags by `hatch-vcs` (`[tool.hatch.version] source = "vcs"` in `pyproject.toml`). No files need to be modified for a release.
+- The version is derived from git tags by `hatch-vcs` (`[tool.hatch.version] source = "vcs"` in `pyproject.toml`). The only file a release modifies is `CHANGELOG.md`.
 - The release workflow uses PyPI trusted publishing (no tokens). The one-time setup is a `release` environment on the GitHub repo and a trusted publisher for `pet-jax` on pypi.org pointing at `lab-cosmo/pet-jax`, `release.yml`, environment `release` (a "pending publisher" until the first upload creates the project).
 - Sandbox: `git fetch`, `git push`, and `gh` must run as bare commands in their own Bash call, with the shell already inside the repo (use a separate `cd` call first). Wrapping them in `cd … &&`, `$(…)`, `;` or a pipe keeps them inside the sandbox, where ssh keys and the gh token are unreachable.

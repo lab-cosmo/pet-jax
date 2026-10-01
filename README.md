@@ -215,6 +215,8 @@ Optional (the `convert` extra — see [Installation](#installation)):
 
 Code conventions (`ruff` config, naming patterns, file layout, JIT placement rule, Markdown soft-wrap, internal NL/attention conventions) and the architecture deep-dive live in [`src/petjax/README.md`](src/petjax/README.md). Read it before submitting non-trivial PRs.
 
+PRs that change anything user-visible add a line to the **Unreleased** section of [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Status
 
 Working: inference, forces, stress, BFGS/FIRE relaxations, cell optimization, `metatrain` checkpoint conversion, charge/spin conditioning, parity with upstream PET.
