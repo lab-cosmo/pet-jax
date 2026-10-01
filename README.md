@@ -35,6 +35,13 @@ Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra
 pip install "pet-jax[convert]"
 ```
 
+`pet-jax` is experimental and under active development, and releases lag behind `main`. For the latest state, install from GitHub:
+
+```bash
+pip install "git+https://github.com/lab-cosmo/pet-jax"
+pip install "pet-jax[convert] @ git+https://github.com/lab-cosmo/pet-jax"   # with the convert extra
+```
+
 Or from a checkout, which is the easiest way to also get the examples and tests:
 
 ```bash
