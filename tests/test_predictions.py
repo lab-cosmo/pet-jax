@@ -23,6 +23,14 @@ from petjax import UPETCalculator, load_checkpoint
 
 ASSETS = Path(__file__).parent / "assets"
 
+# Worst deviations from the references, in eV/atom, eV/Å and eV/Å³. On the
+# mini sets fp32 agreement reaches ~4e-6, ~2e-4 and ~2e-5 (direct stress);
+# these sit ~5-10x above that, so a real numerical change fails. The extended
+# sets accumulate fp32 drift over thousands of edges (stress up to ~1e-3 on
+# test_l), hence the looser bounds there.
+MINI_TOL = {"energy": 2e-5, "forces": 2e-3, "stress": 2e-4}
+EXTENDED_TOL = {"energy": 1e-3, "forces": 1e-2, "stress": 5e-3}
+
 
 # -- reference parsing --
 
@@ -90,24 +98,24 @@ def run_single(calc, atoms):
     return energy, forces, stress
 
 
-def _assert_energies(calc, structures, ref):
+def _assert_energies(calc, structures, ref, tol):
     max_diff_per_atom = 0.0
     for atoms, ref_data in zip(structures, ref):
         energy, _, _ = run_single(calc, atoms)
         dpa = abs(energy - ref_data["energy"]) / len(atoms)
         max_diff_per_atom = max(max_diff_per_atom, dpa)
-    assert max_diff_per_atom < 1e-3, f"max diff/atom = {max_diff_per_atom:.2e}"
+    assert max_diff_per_atom < tol["energy"], f"max diff/atom = {max_diff_per_atom:.2e}"
 
 
-def _assert_forces(calc, structures, ref):
+def _assert_forces(calc, structures, ref, tol):
     worst_maxae = 0.0
     for atoms, ref_data in zip(structures, ref):
         _, forces, _ = run_single(calc, atoms)
         worst_maxae = max(worst_maxae, float(np.max(np.abs(forces - ref_data["forces"]))))
-    assert worst_maxae < 0.01, f"worst force maxAE = {worst_maxae:.2e}"
+    assert worst_maxae < tol["forces"], f"worst force maxAE = {worst_maxae:.2e}"
 
 
-def _assert_stress(calc, structures, ref):
+def _assert_stress(calc, structures, ref, tol):
     worst_maxae = 0.0
     n_tested = 0
     for atoms, ref_data in zip(structures, ref):
@@ -117,7 +125,7 @@ def _assert_stress(calc, structures, ref):
         worst_maxae = max(worst_maxae, float(np.max(np.abs(stress - ref_data["stress"]))))
         n_tested += 1
     if n_tested > 0:
-        assert worst_maxae < 5e-3, f"worst stress maxAE = {worst_maxae:.2e}"
+        assert worst_maxae < tol["stress"], f"worst stress maxAE = {worst_maxae:.2e}"
 
 
 # -- CI (mini) tests --
@@ -127,21 +135,21 @@ def test_mini_energies(mini_release):
     checkpoint, dataset, conservative, _ = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
-    _assert_energies(get_calc(checkpoint), structures, ref)
+    _assert_energies(get_calc(checkpoint), structures, ref, MINI_TOL)
 
 
 def test_mini_forces(mini_release):
     checkpoint, dataset, conservative, _ = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
-    _assert_forces(get_calc(checkpoint), structures, ref)
+    _assert_forces(get_calc(checkpoint), structures, ref, MINI_TOL)
 
 
 def test_mini_stress(mini_release):
     checkpoint, dataset, conservative, _ = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
-    _assert_stress(get_calc(checkpoint), structures, ref)
+    _assert_stress(get_calc(checkpoint), structures, ref, MINI_TOL)
 
 
 def test_reference_dataset_mismatch_detected(tmp_path, mini_xyz):
@@ -200,17 +208,17 @@ def extended_combo(request):
 
 def test_extended_energies(extended_combo):
     calc, ref, structures = extended_combo
-    _assert_energies(calc, structures, ref)
+    _assert_energies(calc, structures, ref, EXTENDED_TOL)
 
 
 def test_extended_forces(extended_combo):
     calc, ref, structures = extended_combo
-    _assert_forces(calc, structures, ref)
+    _assert_forces(calc, structures, ref, EXTENDED_TOL)
 
 
 def test_extended_stress(extended_combo):
     calc, ref, structures = extended_combo
-    _assert_stress(calc, structures, ref)
+    _assert_stress(calc, structures, ref, EXTENDED_TOL)
 
 
 # -- non-conservative heads --
@@ -220,18 +228,18 @@ def test_mini_direct_energy(mini_release):
     checkpoint, dataset, _, direct = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
-    _assert_energies(get_calc(checkpoint, direct=True), structures, ref)
+    _assert_energies(get_calc(checkpoint, direct=True), structures, ref, MINI_TOL)
 
 
 def test_mini_direct_forces(mini_release):
     checkpoint, dataset, _, direct = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
-    _assert_forces(get_calc(checkpoint, direct=True), structures, ref)
+    _assert_forces(get_calc(checkpoint, direct=True), structures, ref, MINI_TOL)
 
 
 def test_mini_direct_stress(mini_release):
     checkpoint, dataset, _, direct = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
-    _assert_stress(get_calc(checkpoint, direct=True), structures, ref)
+    _assert_stress(get_calc(checkpoint, direct=True), structures, ref, MINI_TOL)
