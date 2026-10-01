@@ -1,4 +1,4 @@
-Create a new release of pet-jax on PyPI. Optional argument: version bump level (`patch`, `minor`, or `major`).
+Create a new release of pet-jax on PyPI. Optional argument: EffVer bump level (`micro`, `meso`, or `macro`).
 
 ## Steps
 
@@ -21,8 +21,9 @@ Create a new release of pet-jax on PyPI. Optional argument: version bump level (
 ### 3. Determine version
 
 - Find the latest git tag with `git describe --tags --abbrev=0` (or note if there are no tags yet; the first release is then `0.1.0` unless the user says otherwise)
-- If a bump level was given ($ARGUMENTS), compute the new version following semver (e.g., `0.1.0` → `0.1.1` for patch, `0.2.0` for minor, `1.0.0` for major)
-- If NO bump level was given, review the changelog (step 4) first, then discuss with the user what the appropriate level should be based on the nature of the changes (breaking → major, new features → minor, fixes/maintenance → patch)
+- pet-jax uses [EffVer](https://jacobtomlinson.dev/effver/) (`MACRO.MESO.MICRO`), not semver: the bump reflects how much effort users need to upgrade, not whether anything is technically breaking. Micro: little to no effort. Meso: some small effort (e.g. a renamed keyword, a changed default). Macro: significant effort. On `0.x.y`, `x` acts as macro and `y` as meso.
+- If a bump level was given ($ARGUMENTS: `micro`, `meso`, or `macro`), compute the new version accordingly (on `0.x.y`: meso → `0.x.(y+1)`, macro → `0.(x+1).0`; micro is not separately expressible there, so treat it as meso)
+- If NO bump level was given, review the changelog (step 4) first, then discuss with the user what the appropriate level should be, judged by the effort the changes impose on existing users
 - Confirm the new version with the user before proceeding
 
 ### 4. Finalise the changelog
