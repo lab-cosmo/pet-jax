@@ -21,7 +21,7 @@ src/petjax/
 
 ## Installation
 
-`pet-jax` needs Python ≥ 3.10. Install it from PyPI:
+`pet-jax` needs Python ≥ 3.11. Install it from PyPI:
 
 ```bash
 pip install pet-jax
