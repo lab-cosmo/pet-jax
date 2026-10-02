@@ -23,11 +23,8 @@ from petjax import UPETCalculator, load_checkpoint
 
 ASSETS = Path(__file__).parent / "assets"
 
-# Worst deviations from the references, in eV/atom, eV/Å and eV/Å³. On the
-# mini sets fp32 agreement reaches ~4e-6, ~2e-4 and ~2e-5 (direct stress);
-# these sit ~5-10x above that, so a real numerical change fails. The extended
-# sets accumulate fp32 drift over thousands of edges (stress up to ~1e-3 on
-# test_l), hence the looser bounds there.
+# Max deviations (eV/atom, eV/Å, eV/Å³). Extended sets are looser: fp32 drift
+# grows with system size.
 MINI_TOL = {"energy": 2e-5, "forces": 2e-3, "stress": 2e-4}
 EXTENDED_TOL = {"energy": 1e-3, "forces": 1e-2, "stress": 5e-3}
 
