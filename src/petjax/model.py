@@ -3,6 +3,8 @@
 import jax
 import jax.numpy as jnp
 
+from collections.abc import Callable
+
 import flax.linen as nn
 from flax.linen import attention as flax_attention
 
@@ -129,6 +131,11 @@ class Backbone(nn.Module):
     its structure's value, so a batch of several structures needs no extra
     index); absent inputs fall back to charge 0 / multiplicity 1, as upstream
     does for systems without the data.
+
+    ``node_features`` ``[N, d_node]``, if given, replace the species embedding
+    as initial node features (e.g. FlashMD's species + momenta encoder);
+    ``cutoff_function(r, cutoff, width)`` gives the per-pair cutoff factor
+    (``cutoff_bump`` for PET-MAD, ``cutoff_cosine`` for FlashMD).
     """
 
     d_pet: int = 128
@@ -144,6 +151,7 @@ class Backbone(nn.Module):
     system_conditioning: bool = False
     max_charge: int = 10
     max_spin_multiplicity: int = 10
+    cutoff_function: Callable = cutoff_bump
 
     @nn.compact
     def __call__(
@@ -158,6 +166,7 @@ class Backbone(nn.Module):
         pair_cutoffs=None,
         charge=None,
         spin_multiplicity=None,
+        node_features=None,
     ):
         d_pet = self.d_pet
         d_node = self.d_node
@@ -186,7 +195,7 @@ class Backbone(nn.Module):
         # Per-edge cutoff factor (used at readout, and at attention after
         # prepending the central-token slot)
         cutoff = pair_cutoffs if pair_cutoffs is not None else self.cutoff
-        cutoffs = cutoff_bump(r_ij, cutoff, self.cutoff_width) * pair_mask
+        cutoffs = self.cutoff_function(r_ij, cutoff, self.cutoff_width) * pair_mask
 
         # Token-level cutoffs + mask [N, 1+n], node slot prepended. Central
         # cutoff is atom_mask itself (1 for real atoms, 0 for padded).
@@ -200,8 +209,12 @@ class Backbone(nn.Module):
         messages = edge_embed(atomic_numbers)[neighbors] * pair_mask[..., None]
 
         # Node embedding (feedforward: persists across layers)
-        node_embed = nn.Embed(self.max_atomic_number + 1, d_node, name="node_embedders_0")
-        node = node_embed(atomic_numbers)[:, None, :] * atom_mask[:, None, None]
+        if node_features is None:
+            node_embed = nn.Embed(
+                self.max_atomic_number + 1, d_node, name="node_embedders_0"
+            )
+            node_features = node_embed(atomic_numbers)
+        node = node_features[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
             # Geometric features

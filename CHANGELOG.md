@@ -6,6 +6,10 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Added
+
+- `Backbone` takes optional `node_features` (replacing the species embedding as initial node features) and a `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`). Both default to the current behaviour; they let architectures built on the PET backbone, such as FlashMD, reuse it unchanged.
+
 ### Fixed
 
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.

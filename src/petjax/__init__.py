@@ -21,7 +21,7 @@ from .select import (
     truncate_edges,
 )
 from .structure import to_structure
-from .utils import cutoff_bump
+from .utils import cutoff_bump, cutoff_cosine
 
 __all__ = [
     "UPET",
@@ -33,6 +33,7 @@ __all__ = [
     "MLP",
     "UPETCalculator",
     "cutoff_bump",
+    "cutoff_cosine",
     "get_adaptive_cutoffs",
     "get_adaptive_cutoffs_solver",
     "load_checkpoint",
