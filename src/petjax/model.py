@@ -131,10 +131,11 @@ class Backbone(nn.Module):
     does for systems without the data.
 
     ``final_message_passing=False`` skips the reverse-edge message passing
-    after the last GNN layer, so the returned features have a receptive field
-    of ``num_gnn_layers`` × cutoff instead of ``num_gnn_layers + 1`` × cutoff
-    (with one layer, strictly local). Message passing between earlier layers
-    is unchanged. A training-time option: metatrain's PET has no equivalent,
+    after the last GNN layer. The returned edge messages then reach
+    ``num_gnn_layers`` × cutoff from their center, like the node features,
+    instead of one cutoff further (with one layer, strictly local). Message
+    passing between earlier layers is unchanged, and the node features are not
+    affected. A training-time option: metatrain's PET has no equivalent,
     so such a model cannot be exported. Its parameter tree lacks the last
     layer's ``comb_norms_*`` / ``comb_mlps_*``; loading a checkpoint that has
     them leaves those entries silently unused.
