@@ -1,9 +1,11 @@
-"""`Backbone` hooks (`node_features`, `cutoff_function`): checkpoint-free checks on
-a tiny randomly initialised backbone."""
+"""`Backbone` hooks (`species_embedding` / `node_features`, `cutoff_function`):
+checkpoint-free checks on a tiny randomly initialised backbone."""
 
 import numpy as np
 import jax
 import jax.numpy as jnp
+
+import pytest
 
 from petjax import Backbone, cutoff_cosine
 
@@ -40,12 +42,29 @@ def test_node_features_reproduce_species_embedding():
     inputs = _inputs()
     model = Backbone(**CONFIG)
     params = model.init(jax.random.key(0), **inputs)
-    table = params["params"]["node_embedders_0"]["embedding"]
-
     reference = model.apply(params, **inputs)
-    injected = model.apply(params, **inputs, node_features=table[inputs["atomic_numbers"]])
+
+    # The external-features backbone owns everything but the species table,
+    # so the default model's params minus that table must fit it exactly.
+    table = params["params"].pop("node_embedders_0")["embedding"]
+    external = Backbone(**CONFIG, species_embedding=False)
+    features = table[inputs["atomic_numbers"]]
+    assert (
+        "node_embedders_0"
+        not in external.init(jax.random.key(0), **inputs, node_features=features)["params"]
+    )
+    injected = external.apply(params, **inputs, node_features=features)
     for a, b in zip(reference, injected):
         np.testing.assert_array_equal(a, b)
+
+
+def test_node_features_must_match_species_embedding():
+    inputs = _inputs()
+    features = jnp.zeros((3, CONFIG["d_node"]))
+    with pytest.raises(ValueError, match="species_embedding=False"):
+        Backbone(**CONFIG).init(jax.random.key(0), **inputs, node_features=features)
+    with pytest.raises(ValueError, match="needs node_features"):
+        Backbone(**CONFIG, species_embedding=False).init(jax.random.key(0), **inputs)
 
 
 def test_cutoff_function_is_used():

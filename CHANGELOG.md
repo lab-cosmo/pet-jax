@@ -8,7 +8,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ### Added
 
-- `Backbone` takes optional `node_features` (replacing the species embedding as initial node features) and a `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`). Both default to the current behaviour; they let architectures built on the PET backbone, such as FlashMD, reuse it unchanged.
+- `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
 
 ### Fixed
 

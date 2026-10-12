@@ -132,10 +132,14 @@ class Backbone(nn.Module):
     index); absent inputs fall back to charge 0 / multiplicity 1, as upstream
     does for systems without the data.
 
-    ``node_features`` ``[N, d_node]``, if given, replace the species embedding
-    as initial node features (e.g. FlashMD's species + momenta encoder);
-    ``cutoff_function(r, cutoff, width)`` gives the per-pair cutoff factor
-    (``cutoff_bump`` for PET-MAD, ``cutoff_cosine`` for FlashMD).
+    Two hooks let architectures built on the PET backbone (FlashMD) reuse it.
+    With ``species_embedding=False`` the backbone owns no species embedding
+    table and the caller passes the initial node features ``[N, d_node]`` as
+    ``node_features`` (e.g. FlashMD's species + momenta encoder). This is a
+    construction-time switch rather than an input check so that the parameter
+    tree is fixed by the config alone, not by what ``init`` happened to be
+    called with. ``cutoff_function(r, cutoff, width)`` gives the per-pair
+    cutoff factor (``cutoff_bump`` for PET-MAD, ``cutoff_cosine`` for FlashMD).
     """
 
     d_pet: int = 128
@@ -152,6 +156,7 @@ class Backbone(nn.Module):
     max_charge: int = 10
     max_spin_multiplicity: int = 10
     cutoff_function: Callable = cutoff_bump
+    species_embedding: bool = True
 
     @nn.compact
     def __call__(
@@ -209,11 +214,21 @@ class Backbone(nn.Module):
         messages = edge_embed(atomic_numbers)[neighbors] * pair_mask[..., None]
 
         # Node embedding (feedforward: persists across layers)
-        if node_features is None:
+        if self.species_embedding:
+            if node_features is not None:
+                raise ValueError(
+                    "node_features given, but this Backbone embeds species itself; "
+                    "construct it with species_embedding=False to pass your own"
+                )
             node_embed = nn.Embed(
                 self.max_atomic_number + 1, d_node, name="node_embedders_0"
             )
             node_features = node_embed(atomic_numbers)
+        elif node_features is None:
+            raise ValueError(
+                "this Backbone was constructed with species_embedding=False "
+                "and needs node_features [N, d_node]"
+            )
         node = node_features[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
