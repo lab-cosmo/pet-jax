@@ -6,6 +6,10 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Added
+
+- `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped, so the features have a receptive field of `num_gnn_layers` × cutoff rather than one more: strictly local with a single layer. A training-time option for architectures that put a long-range model on top of the PET trunk; `metatrain` has no equivalent, so such models are not exportable.
+
 ### Fixed
 
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.

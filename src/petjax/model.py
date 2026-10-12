@@ -129,6 +129,15 @@ class Backbone(nn.Module):
     its structure's value, so a batch of several structures needs no extra
     index); absent inputs fall back to charge 0 / multiplicity 1, as upstream
     does for systems without the data.
+
+    ``final_message_passing=False`` skips the reverse-edge message passing
+    after the last GNN layer, so the returned features have a receptive field
+    of ``num_gnn_layers`` × cutoff instead of ``num_gnn_layers + 1`` × cutoff
+    (with one layer, strictly local). Message passing between earlier layers
+    is unchanged. A training-time option: metatrain's PET has no equivalent,
+    so such a model cannot be exported. Its parameter tree lacks the last
+    layer's ``comb_norms_*`` / ``comb_mlps_*``; loading a checkpoint that has
+    them leaves those entries silently unused.
     """
 
     d_pet: int = 128
@@ -144,6 +153,7 @@ class Backbone(nn.Module):
     system_conditioning: bool = False
     max_charge: int = 10
     max_spin_multiplicity: int = 10
+    final_message_passing: bool = True
 
     @nn.compact
     def __call__(
@@ -257,12 +267,15 @@ class Backbone(nn.Module):
 
             # Message passing (feedforward mixing)
             edge_flat = edge.reshape(P, d_pet) * pair_mask[..., None]
-            reversed_flat = edge_flat[reverse]
-            combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
-            combined = nn.LayerNorm(epsilon=1e-5, name=f"comb_norms_{layer_idx}")(combined)
-            combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
-            combined = combined * pair_mask[..., None]
-            messages = messages + edge_flat + combined
+            messages = messages + edge_flat
+            if layer_idx < self.num_gnn_layers - 1 or self.final_message_passing:
+                reversed_flat = edge_flat[reverse]
+                combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
+                combined = nn.LayerNorm(epsilon=1e-5, name=f"comb_norms_{layer_idx}")(
+                    combined
+                )
+                combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
+                messages = messages + combined * pair_mask[..., None]
 
         node = node[:, 0, :] * atom_mask[:, None]
         return node, messages, cutoffs
