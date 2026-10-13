@@ -6,6 +6,10 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Added
+
+- `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
+
 ### Fixed
 
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.
