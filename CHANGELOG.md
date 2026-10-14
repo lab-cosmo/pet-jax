@@ -8,11 +8,13 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ### Added
 
+- `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
 
 ### Fixed
 
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.
+- The RMSNorm and LayerNorm epsilons now match `torch`'s defaults (`finfo(dtype).eps` and `1e-5`) instead of `flax`'s (`1e-6`). Predictions move by ~1e-7 relative; in fp64, agreement with `metatrain` improves by an order of magnitude.
 
 ## [0.1.0] - 2026-10-01
 

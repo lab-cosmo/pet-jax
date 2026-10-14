@@ -132,6 +132,16 @@ class Backbone(nn.Module):
     index); absent inputs fall back to charge 0 / multiplicity 1, as upstream
     does for systems without the data.
 
+    ``final_message_passing=False`` skips the reverse-edge message passing
+    after the last GNN layer. The returned edge messages then reach
+    ``num_gnn_layers`` × cutoff from their center, like the node features,
+    instead of one cutoff further (with one layer, strictly local). Message
+    passing between earlier layers is unchanged, and the node features are not
+    affected. A training-time option: metatrain's PET has no equivalent,
+    so such a model cannot be exported. Its parameter tree lacks the last
+    layer's ``comb_norms_*`` / ``comb_mlps_*``; loading a checkpoint that has
+    them leaves those entries silently unused.
+
     Two hooks let architectures built on the PET backbone (FlashMD) reuse it.
     With ``species_embedding=False`` the backbone owns no species embedding
     table and the caller passes the initial node features ``[N, d_node]`` as
@@ -155,6 +165,7 @@ class Backbone(nn.Module):
     system_conditioning: bool = False
     max_charge: int = 10
     max_spin_multiplicity: int = 10
+    final_message_passing: bool = True
     cutoff_function: Callable = cutoff_bump
     species_embedding: bool = True
 
@@ -285,12 +296,15 @@ class Backbone(nn.Module):
 
             # Message passing (feedforward mixing)
             edge_flat = edge.reshape(P, d_pet) * pair_mask[..., None]
-            reversed_flat = edge_flat[reverse]
-            combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
-            combined = nn.LayerNorm(name=f"comb_norms_{layer_idx}")(combined)
-            combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
-            combined = combined * pair_mask[..., None]
-            messages = messages + edge_flat + combined
+            messages = messages + edge_flat
+            if layer_idx < self.num_gnn_layers - 1 or self.final_message_passing:
+                reversed_flat = edge_flat[reverse]
+                combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
+                combined = nn.LayerNorm(epsilon=1e-5, name=f"comb_norms_{layer_idx}")(
+                    combined
+                )
+                combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
+                messages = messages + combined * pair_mask[..., None]
 
         node = node[:, 0, :] * atom_mask[:, None]
         return node, messages, cutoffs
@@ -447,18 +461,18 @@ class TransformerLayer(nn.Module):
 
         # PreLN transformer
         attn = Attention(self.num_heads, self.temperature)(
-            nn.RMSNorm(name="norm_attn")(tokens), cutoffs, mask
+            rms_norm(tokens, name="norm_attn"), cutoffs, mask
         )
         out_node, out_edge = attn[:, :1], attn[:, 1:]
 
         if expanded:
             out_node = node + nn.Dense(d_node, name="center_expand")(out_node)
-            out_node = out_node + center_mlp(nn.RMSNorm(name="norm_center")(out_node))
+            out_node = out_node + center_mlp(rms_norm(out_node, name="norm_center"))
         else:
             out_node = node + out_node
 
         out_edge = edge + out_edge
-        out_edge = out_edge + edge_mlp(nn.RMSNorm(name="norm_mlp")(out_edge))
+        out_edge = out_edge + edge_mlp(rms_norm(out_edge, name="norm_mlp"))
 
         return out_node, out_edge
 
@@ -526,6 +540,11 @@ class MLP2(nn.Module):
         x = nn.Dense(self.output)(x)
         x = jax.nn.silu(x)
         return x
+
+
+def rms_norm(x, name):
+    """RMSNorm with torch's default epsilon, ``finfo(dtype).eps`` (flax: 1e-6)."""
+    return nn.RMSNorm(epsilon=float(jnp.finfo(x.dtype).eps), name=name)(x)
 
 
 def masked(fn, x, mask, fn_value=0.0, return_value=0.0):
