@@ -5,8 +5,12 @@ Runs upstream `metatrain` (never `pet-jax`) on a dataset and writes an `.npz` of
 (n_structures, 3, 3), and `natoms` (n_structures,). Numbers only — the geometry
 stays in the dataset file, and `natoms` is what lets
 `test_predictions.load_reference` split the forces back up and check that the
-reference belongs to the dataset it is compared against. Non-periodic frames
-get a zero stress placeholder; the stress assertions skip them anyway.
+reference belongs to the dataset it is compared against. The model runs in
+fp64 so the references are exact to ~1e-14 and the fp64 tests can pin
+`pet-jax` to them bit for bit; fp32 tests compare to the same files. Frames
+that are not periodic in all three directions get a zero stress placeholder,
+because `metatrain` zeroes its direct stress head there; the stress assertions
+skip such frames in both modes.
 
 Two files per checkpoint, one per force/stress mode:
 
@@ -40,10 +44,8 @@ def predict(calculator, frames):
         driven.calc = calculator
         energy.append(driven.get_potential_energy())
         forces.append(driven.get_forces())
-        # ASE refuses stress without periodicity; the reference format wants a
-        # value on every frame, and the stress assertions skip aperiodic ones.
         stress.append(
-            driven.get_stress(voigt=False) if driven.pbc.any() else np.zeros((3, 3))
+            driven.get_stress(voigt=False) if driven.pbc.all() else np.zeros((3, 3))
         )
 
     return {
@@ -71,10 +73,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    import torch
     from metatomic.torch.ase_calculator import MetatomicCalculator
     from metatrain.utils.io import load_model
 
-    exported = load_model(str(args.ckpt)).export()
+    model = load_model(str(args.ckpt))
+    # PET-MAD ships inside an LLPR wrapper whose export is fp32-only; the
+    # wrapped PET itself exports at any dtype.
+    if type(model).__name__ == "LLPRUncertaintyModel":
+        model = model.model
+    exported = model.to(torch.float64).export()
     frames = read(str(args.dataset), index=":")
     stem = args.dataset.stem
 
