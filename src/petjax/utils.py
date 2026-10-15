@@ -12,6 +12,12 @@ def cutoff_bump(r, cutoff, width=0.5):
     return jnp.where(x <= 0, 1.0, jnp.where(x >= 1, 0.0, bump))
 
 
+def cutoff_cosine(r, cutoff, width=0.5):
+    """Cosine cutoff function (FlashMD, older PET checkpoints)."""
+    x = jnp.clip((r - (cutoff - width)) / width, 0.0, 1.0)
+    return 0.5 * (1 + jnp.cos(jnp.pi * x))
+
+
 def edge_displacements(positions, centers, others, cell_shifts, cell):
     """Per-edge displacement vectors ``R_j - R_i + S @ h`` in Cartesian coords."""
     return positions[others] - positions[centers] + cell_shifts @ cell
