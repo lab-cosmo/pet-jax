@@ -43,27 +43,27 @@ def test_node_features_reproduce_species_embedding():
     model = Backbone(**CONFIG)
     params = model.init(jax.random.key(0), **inputs)
     reference = model.apply(params, **inputs)
+    features = params["params"]["node_embedders_0"]["embedding"][inputs["atomic_numbers"]]
 
-    # The external-features backbone owns everything but the species table,
+    # Passed explicitly, the table's own rows override it with no effect
+    overridden = model.apply(params, **inputs, node_features=features)
+    # ... and the external-features backbone owns everything but the table,
     # so the default model's params minus that table must fit it exactly.
-    table = params["params"].pop("node_embedders_0")["embedding"]
+    params["params"].pop("node_embedders_0")
     external = Backbone(**CONFIG, species_embedding=False)
-    features = table[inputs["atomic_numbers"]]
     assert (
         "node_embedders_0"
         not in external.init(jax.random.key(0), **inputs, node_features=features)["params"]
     )
     injected = external.apply(params, **inputs, node_features=features)
-    for a, b in zip(reference, injected):
+    for a, b, c in zip(reference, overridden, injected):
         np.testing.assert_array_equal(a, b)
+        np.testing.assert_array_equal(a, c)
 
 
-def test_node_features_must_match_species_embedding():
+def test_external_features_required():
     inputs = _inputs()
-    features = jnp.zeros((3, CONFIG["d_node"]))
-    with pytest.raises(ValueError, match="species_embedding=False"):
-        Backbone(**CONFIG).init(jax.random.key(0), **inputs, node_features=features)
-    with pytest.raises(ValueError, match="needs node_features"):
+    with pytest.raises(AssertionError, match="needs node_features"):
         Backbone(**CONFIG, species_embedding=False).init(jax.random.key(0), **inputs)
 
 

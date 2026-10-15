@@ -145,7 +145,8 @@ class Backbone(nn.Module):
     Two hooks let architectures built on the PET backbone (FlashMD) reuse it.
     With ``species_embedding=False`` the backbone owns no species embedding
     table and the caller passes the initial node features ``[N, d_node]`` as
-    ``node_features`` (e.g. FlashMD's species + momenta encoder). This is a
+    ``node_features`` (e.g. FlashMD's species + momenta encoder); with the
+    table present, ``node_features`` overrides it for that call. This is a
     construction-time switch rather than an input check so that the parameter
     tree is fixed by the config alone, not by what ``init`` happened to be
     called with. ``cutoff_function(r, cutoff, width)`` gives the per-pair
@@ -224,22 +225,15 @@ class Backbone(nn.Module):
         edge_embed = nn.Embed(self.max_atomic_number + 1, d_pet, name="edge_embedder")
         messages = edge_embed(atomic_numbers)[neighbors] * pair_mask[..., None]
 
-        # Node embedding (feedforward: persists across layers)
+        # Node embedding
         if self.species_embedding:
-            if node_features is not None:
-                raise ValueError(
-                    "node_features given, but this Backbone embeds species itself; "
-                    "construct it with species_embedding=False to pass your own"
-                )
-            node_embed = nn.Embed(
-                self.max_atomic_number + 1, d_node, name="node_embedders_0"
+            embedded = nn.Embed(self.max_atomic_number + 1, d_node, name="node_embedders_0")
+            node_features = (
+                embedded(atomic_numbers) if node_features is None else node_features
             )
-            node_features = node_embed(atomic_numbers)
-        elif node_features is None:
-            raise ValueError(
-                "this Backbone was constructed with species_embedding=False "
-                "and needs node_features [N, d_node]"
-            )
+        assert node_features is not None, (
+            "species_embedding=False needs node_features [N, d_node]"
+        )
         node = node_features[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
