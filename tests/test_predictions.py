@@ -1,14 +1,16 @@
 """Cross-check petjax predictions against reference predictions.
 
 Default (CI) mode compares against `tests/assets/predictions/test_mini_*.npz`
-for every release in `conftest.MINI_RELEASES` — the PET-MAD v1.5 and v1.6
-pet-mad-xs checkpoints, whose readout heads are named differently, and the
-charge/spin conditioned PET-OMol-S on a mini set carrying a (charge,
-multiplicity) pair per frame in `atoms.info`, which the calculator reads
-exactly as `metatrain`'s ASE calculator does. Extended
+(`metatrain` run in fp64, see `generate_references.py`) for every release in
+`conftest.MINI_RELEASES` — the PET-MAD v1.5 and v1.6 pet-mad-xs checkpoints,
+whose readout heads are named differently, and the charge/spin conditioned
+PET-OMol-S on a mini set carrying a (charge, multiplicity) pair per frame in
+`atoms.info`, which the calculator reads exactly as `metatrain`'s ASE
+calculator does. Each mini test runs twice: in fp32, bounding fp32 noise,
+and in fp64, where `pet-jax` must reproduce `metatrain` to ~1e-14. Extended
 mode additionally runs the full test_s / test_m / test_l datasets for both
-pet-mad-xs and pet-mad-s; those assets are local-only and skipped when
-missing.
+pet-mad-xs and pet-mad-s in fp32; those assets are local-only and skipped
+when missing.
 """
 
 import numpy as np
@@ -23,10 +25,16 @@ from petjax import UPETCalculator, load_checkpoint
 
 ASSETS = Path(__file__).parent / "assets"
 
-# Max deviations (eV/atom, eV/Å, eV/Å³). Extended sets are looser: fp32 drift
-# grows with system size.
-MINI_TOL = {"energy": 2e-5, "forces": 2e-3, "stress": 2e-4}
+# Max deviations (eV/atom, eV/Å, eV/Å³) from the fp64 metatrain references:
+# fp32 bounds fp32 noise, fp64 sits 1e3 above the measured ~1e-14 and 1e3
+# below any real discrepancy. Extended sets are looser: fp32 drift grows
+# with system size.
+MINI_TOL = {
+    "float32": {"energy": 2e-5, "forces": 2e-3, "stress": 2e-4},
+    "float64": {"energy": 1e-11, "forces": 1e-10, "stress": 1e-11},
+}
 EXTENDED_TOL = {"energy": 1e-3, "forces": 1e-2, "stress": 5e-3}
+DTYPES = ["float32", "float64"]
 
 
 # -- reference parsing --
@@ -61,11 +69,11 @@ def load_reference(path, structures):
 _CALC_CACHE = {}
 
 
-def get_calc(ckpt_dir, direct=False):
+def get_calc(ckpt_dir, direct=False, dtype="float32"):
     """Direct mode reads every non-conservative head the checkpoint carries;
     a checkpoint with a force head only (PET-OMol) keeps the strain-derivative
     stress, as the reference generator does."""
-    key = (str(ckpt_dir), direct)
+    key = (str(ckpt_dir), direct, dtype)
     if key not in _CALC_CACHE:
         extra = {}
         if direct:
@@ -75,7 +83,7 @@ def get_calc(ckpt_dir, direct=False):
                 "direct_stress": "stress_head" in params["params"],
             }
         _CALC_CACHE[key] = UPETCalculator.from_checkpoint(
-            str(ckpt_dir), stress=True, **extra
+            str(ckpt_dir), stress=True, default_dtype=dtype, **extra
         )
     return _CALC_CACHE[key]
 
@@ -88,7 +96,7 @@ def run_single(calc, atoms):
     atoms.calc = calc
     energy = atoms.get_potential_energy()
     forces = atoms.get_forces()
-    if atoms.pbc.any():
+    if atoms.pbc.all():
         stress = voigt_6_to_full_3x3_stress(atoms.get_stress())
     else:
         stress = None
@@ -116,7 +124,7 @@ def _assert_stress(calc, structures, ref, tol):
     worst_maxae = 0.0
     n_tested = 0
     for atoms, ref_data in zip(structures, ref):
-        if not atoms.pbc.any():
+        if not atoms.pbc.all():
             continue
         _, _, stress = run_single(calc, atoms)
         worst_maxae = max(worst_maxae, float(np.max(np.abs(stress - ref_data["stress"]))))
@@ -128,25 +136,28 @@ def _assert_stress(calc, structures, ref, tol):
 # -- CI (mini) tests --
 
 
-def test_mini_energies(mini_release):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mini_energies(mini_release, dtype):
     checkpoint, dataset, conservative, _ = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
-    _assert_energies(get_calc(checkpoint), structures, ref, MINI_TOL)
+    _assert_energies(get_calc(checkpoint, dtype=dtype), structures, ref, MINI_TOL[dtype])
 
 
-def test_mini_forces(mini_release):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mini_forces(mini_release, dtype):
     checkpoint, dataset, conservative, _ = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
-    _assert_forces(get_calc(checkpoint), structures, ref, MINI_TOL)
+    _assert_forces(get_calc(checkpoint, dtype=dtype), structures, ref, MINI_TOL[dtype])
 
 
-def test_mini_stress(mini_release):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mini_stress(mini_release, dtype):
     checkpoint, dataset, conservative, _ = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(conservative, structures)
-    _assert_stress(get_calc(checkpoint), structures, ref, MINI_TOL)
+    _assert_stress(get_calc(checkpoint, dtype=dtype), structures, ref, MINI_TOL[dtype])
 
 
 def test_reference_dataset_mismatch_detected(tmp_path, mini_xyz):
@@ -221,22 +232,28 @@ def test_extended_stress(extended_combo):
 # -- non-conservative heads --
 
 
-def test_mini_direct_energy(mini_release):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mini_direct_energy(mini_release, dtype):
     checkpoint, dataset, _, direct = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
-    _assert_energies(get_calc(checkpoint, direct=True), structures, ref, MINI_TOL)
+    calc = get_calc(checkpoint, direct=True, dtype=dtype)
+    _assert_energies(calc, structures, ref, MINI_TOL[dtype])
 
 
-def test_mini_direct_forces(mini_release):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mini_direct_forces(mini_release, dtype):
     checkpoint, dataset, _, direct = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
-    _assert_forces(get_calc(checkpoint, direct=True), structures, ref, MINI_TOL)
+    calc = get_calc(checkpoint, direct=True, dtype=dtype)
+    _assert_forces(calc, structures, ref, MINI_TOL[dtype])
 
 
-def test_mini_direct_stress(mini_release):
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_mini_direct_stress(mini_release, dtype):
     checkpoint, dataset, _, direct = mini_release
     structures = read(str(dataset), index=":")
     ref = load_reference(direct, structures)
-    _assert_stress(get_calc(checkpoint, direct=True), structures, ref, MINI_TOL)
+    calc = get_calc(checkpoint, direct=True, dtype=dtype)
+    _assert_stress(calc, structures, ref, MINI_TOL[dtype])
