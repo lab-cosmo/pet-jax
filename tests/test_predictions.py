@@ -25,13 +25,10 @@ from petjax import UPETCalculator, load_checkpoint
 
 ASSETS = Path(__file__).parent / "assets"
 
-# Max deviations (eV/atom, eV/Å, eV/Å³) from the fp64 metatrain references.
-# fp32 bounds fp32 noise (~2e-6 / 1e-4 measured); fp64 pins parity itself,
-# a thousand times above the measured ~1e-14 / 1e-13 and a thousand times
-# below what any real discrepancy (a norm epsilon, a rounded scale) produces.
-# An fp64 calculator switches JAX's x64 mode on for the whole process, which
-# moves later fp32 results by ~1e-6; the fp32 bounds absorb that.
-# Extended sets are looser: fp32 drift grows with system size.
+# Max deviations (eV/atom, eV/Å, eV/Å³) from the fp64 metatrain references:
+# fp32 bounds fp32 noise, fp64 sits 1e3 above the measured ~1e-14 and 1e3
+# below any real discrepancy. Extended sets are looser: fp32 drift grows
+# with system size.
 MINI_TOL = {
     "float32": {"energy": 2e-5, "forces": 2e-3, "stress": 2e-4},
     "float64": {"energy": 1e-11, "forces": 1e-10, "stress": 1e-11},
