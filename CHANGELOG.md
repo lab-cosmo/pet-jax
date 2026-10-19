@@ -15,6 +15,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.
 - The RMSNorm and LayerNorm epsilons now match `torch`'s defaults (`finfo(dtype).eps` and `1e-5`) instead of `flax`'s (`1e-6`). Predictions move by ~1e-7 relative; in fp64, agreement with `metatrain` improves by an order of magnitude.
+- `petjax-convert` keeps the energy, force and stress scales in fp64 instead of rounding them to fp32. Checkpoints converted before this carry the rounded scales; reconvert with the new `--force` flag (the converter otherwise leaves existing output alone) to get fp64 predictions that match `metatrain` to ~1e-14 eV/atom instead of ~1e-7. fp32 inference is unchanged.
 
 ## [0.1.0] - 2026-10-01
 

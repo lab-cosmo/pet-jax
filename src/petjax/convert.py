@@ -101,14 +101,17 @@ def convert_checkpoint(ckpt_path, output_dir):
 
     # Scales live in the parameter tree, not metadata. force_scale is
     # per-species (scattered to Z rows); energy/stress scales are scalars.
+    # Upstream keeps them in fp64, so they stay fp64 here (the loader casts
+    # to the working dtype): rounding them to fp32 is the one thing that
+    # kept fp64 predictions from matching metatrain beyond ~1e-7 eV/atom.
     rows = np.asarray([int(z) for z in meta["atomic_types"]])
-    flat["energy_scale"] = jnp.array([meta["energy_scale"]], dtype=jnp.float32)
+    flat["energy_scale"] = np.array([meta["energy_scale"]], dtype=np.float64)
     if meta["force_scale"] is not None:
-        force_scale = np.zeros(n_rows, dtype=np.float32)
+        force_scale = np.zeros(n_rows, dtype=np.float64)
         force_scale[rows] = meta["force_scale"]
-        flat["force_scale"] = jnp.array(force_scale)
+        flat["force_scale"] = force_scale
     if meta["stress_scale"] is not None:
-        flat["stress_scale"] = jnp.array([meta["stress_scale"]], dtype=jnp.float32)
+        flat["stress_scale"] = np.array([meta["stress_scale"]], dtype=np.float64)
     params = _unflatten(flat)
 
     write_msgpack(output_dir / "model.msgpack", params)
