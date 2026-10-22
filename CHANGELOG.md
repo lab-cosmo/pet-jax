@@ -6,6 +6,10 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Changed
+
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag: the per-atom and per-pair cutoffs, the selected mask, the selected count per center, and `overflow`, mirroring what `select_edges` reports host-side. Callers that unpacked the flag read `.overflow`; the counts let a driver size `k_sel` without leaving jit.
+
 ### Added
 
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
