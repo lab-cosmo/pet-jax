@@ -8,6 +8,8 @@ from collections.abc import Callable
 import flax.linen as nn
 from flax.linen import attention as flax_attention
 
+from typing import NamedTuple
+
 from .utils import cutoff_bump, safe_norm
 
 
@@ -45,6 +47,11 @@ class UPET(nn.Module):
     max_spin_multiplicity: int = 10
     direct_forces: bool = False
     direct_stress: bool = False
+    # Token layout and attention tiling (``express.Express``); see ``Backbone``.
+    tokens: str = "padded"
+    attention_tile: int | None = None
+    fold_extra_block: bool = False
+    reverse_unique: bool = False
 
     @nn.compact
     def __call__(
@@ -59,6 +66,8 @@ class UPET(nn.Module):
         pair_cutoffs=None,
         charge=None,
         spin_multiplicity=None,
+        tile_tokens=None,
+        extra_atoms=None,
     ):
         node, edge, cutoffs = Backbone(
             d_pet=self.d_pet,
@@ -74,6 +83,10 @@ class UPET(nn.Module):
             system_conditioning=self.system_conditioning,
             max_charge=self.max_charge,
             max_spin_multiplicity=self.max_spin_multiplicity,
+            tokens=self.tokens,
+            attention_tile=self.attention_tile,
+            fold_extra_block=self.fold_extra_block,
+            reverse_unique=self.reverse_unique,
             name="backbone",
         )(
             R_ij,
@@ -86,10 +99,15 @@ class UPET(nn.Module):
             pair_cutoffs,
             charge,
             spin_multiplicity,
+            tile_tokens=tile_tokens,
+            extra_atoms=extra_atoms,
         )
+        # The readouts sum each atom's edges: a reshape on the padded layout,
+        # a sorted segment sum by center on the flat one.
+        segments = centers if self.tokens == "flat" else None
 
         predictions = Energy(d_head=self.d_head, name="energy_head")(
-            node, edge, cutoffs, pair_mask, atom_mask
+            node, edge, cutoffs, pair_mask, atom_mask, segments
         )
 
         energy_scale = self.param("energy_scale", nn.initializers.ones, (1,))
@@ -103,7 +121,7 @@ class UPET(nn.Module):
         out = {"energy": energy}
         if self.direct_forces:
             forces = DirectForces(d_head=self.d_head, name="forces_head")(
-                node, edge, cutoffs, pair_mask, atom_mask
+                node, edge, cutoffs, pair_mask, atom_mask, segments
             )
             force_scale = self.param(
                 "force_scale", nn.initializers.ones, (self.max_atomic_number + 1,)
@@ -113,7 +131,7 @@ class UPET(nn.Module):
             )
         if self.direct_stress:
             stress = DirectStress(d_head=self.d_head, name="stress_head")(
-                node, edge, cutoffs, pair_mask, atom_mask
+                node, edge, cutoffs, pair_mask, atom_mask, segments
             )
             stress_scale = self.param("stress_scale", nn.initializers.ones, (1,))
             out["stress"] = stress * stress_scale * atom_mask[:, None, None]
@@ -151,6 +169,15 @@ class Backbone(nn.Module):
     tree is fixed by the config alone, not by what ``init`` happened to be
     called with. ``cutoff_function(r, cutoff, width)`` gives the per-pair
     cutoff factor (``cutoff_bump`` for PET-MAD, ``cutoff_cosine`` for FlashMD).
+
+    Token layout. ``tokens="padded"`` (stock) takes the pairs in the
+    rectangular ``[N * n]`` layout. ``tokens="flat"`` takes one compacted,
+    center-sorted token list ``[P]`` of any static length plus the attention
+    tile maps ``tile_tokens`` / ``extra_atoms`` (``select._token_tiles``):
+    every per-token layer and the reverse gather run on the flat list, and only
+    the attention core gathers tiles of width ``W = tile_tokens.shape[1] + 1``
+    (centre in slot 0), one of ``k_sel + 1`` per atom. The result is the
+    padded layout's to summation order, with the same parameter tree.
     """
 
     d_pet: int = 128
@@ -169,6 +196,10 @@ class Backbone(nn.Module):
     final_message_passing: bool = True
     cutoff_function: Callable = cutoff_bump
     species_embedding: bool = True
+    tokens: str = "padded"
+    attention_tile: int | None = None
+    fold_extra_block: bool = False
+    reverse_unique: bool = False
 
     @nn.compact
     def __call__(
@@ -184,12 +215,18 @@ class Backbone(nn.Module):
         charge=None,
         spin_multiplicity=None,
         node_features=None,
+        tile_tokens=None,
+        extra_atoms=None,
     ):
         d_pet = self.d_pet
         d_node = self.d_node
         P = R_ij.shape[0]
         N = atomic_numbers.shape[0]
         n = P // N
+        flat = self.tokens == "flat"
+        assert flat == (tile_tokens is not None), "tokens='flat' needs the tile maps"
+        if self.attention_tile is not None:
+            assert flat and tile_tokens.shape[1] + 1 == self.attention_tile
 
         # Computed once, added to the node features after every GNN layer
         # (upstream adds it to the layer's output node embeddings).
@@ -217,8 +254,14 @@ class Backbone(nn.Module):
         # Token-level cutoffs + mask [N, 1+n], node slot prepended. Central
         # cutoff is atom_mask itself (1 for real atoms, 0 for padded).
         central = atom_mask[:, None].astype(cutoffs.dtype)
-        cutoffs_tokens = jnp.concatenate([central, cutoffs.reshape(N, n)], axis=1)
-        mask = jnp.concatenate([atom_mask[:, None], pair_mask.reshape(N, n)], axis=1)
+        if flat:
+            tiles = token_tiles(tile_tokens, extra_atoms, atom_mask, P)
+            cutoffs_tokens = tiles.gather(jnp.concatenate([central[:, 0], cutoffs]))
+            mask = tiles.mask
+        else:
+            tiles = None
+            cutoffs_tokens = jnp.concatenate([central, cutoffs.reshape(N, n)], axis=1)
+            mask = jnp.concatenate([atom_mask[:, None], pair_mask.reshape(N, n)], axis=1)
 
         # Initial edge features; species embeddings index by atomic number Z
         # (table size max_atomic_number + 1, row 0 unused).
@@ -272,7 +315,7 @@ class Backbone(nn.Module):
                     pair_mask,
                 )
 
-            edge = tokens_flat.reshape(N, n, d_pet)
+            edge = tokens_flat if flat else tokens_flat.reshape(N, n, d_pet)
 
             # Transformer layers
             for attn_idx in range(self.num_attention_layers):
@@ -283,7 +326,7 @@ class Backbone(nn.Module):
                     num_heads=self.num_heads,
                     temperature=self.attention_temperature,
                     name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
-                )(node, edge, cutoffs_tokens, mask)
+                )(node, edge, cutoffs_tokens, mask, tiles)
 
             if conditioning is not None:
                 node = node + conditioning[:, None, :]
@@ -308,14 +351,15 @@ class Energy(nn.Module):
     """Energy readout: node + cutoff-weighted edge contributions -> per-atom E.
 
     Single readout of final features, following current uPET hypers.
+    ``segments`` (the centers) switches the per-atom edge sum from the
+    rectangular reshape to a sorted segment sum, for the flat token layout.
     """
 
     d_head: int = 128
 
     @nn.compact
-    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask):
+    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask, segments=None):
         N = node.shape[0]
-        n = edge.shape[0] // N
 
         # Node head
         node_h = masked(
@@ -330,7 +374,7 @@ class Energy(nn.Module):
         edge_out = masked(nn.Dense(1, name="edge_last_0"), edge_h, pair_mask)[:, 0]
 
         # Weighted edge sum per atom
-        edge_contrib = (edge_out * cutoffs).reshape(N, n).sum(axis=1)
+        edge_contrib = per_atom_sum(edge_out * cutoffs, N, segments)
         return node_contrib + edge_contrib
 
 
@@ -341,9 +385,8 @@ class DirectForces(nn.Module):
     d_head: int = 128
 
     @nn.compact
-    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask):
+    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask, segments=None):
         N = node.shape[0]
-        n = edge.shape[0] // N
 
         node_h = masked(
             MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask
@@ -355,7 +398,7 @@ class DirectForces(nn.Module):
         )
         edge_out = masked(nn.Dense(3, name="edge_last_0"), edge_h, pair_mask)
 
-        edge_contrib = (edge_out * cutoffs[:, None]).reshape(N, n, 3).sum(axis=1)
+        edge_contrib = per_atom_sum(edge_out * cutoffs[:, None], N, segments)
         return node_out + edge_contrib
 
 
@@ -366,9 +409,8 @@ class DirectStress(nn.Module):
     d_head: int = 128
 
     @nn.compact
-    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask):
+    def __call__(self, node, edge, cutoffs, pair_mask, atom_mask, segments=None):
         N = node.shape[0]
-        n = edge.shape[0] // N
 
         node_h = masked(
             MLP2(self.d_head, self.d_head, name="node_heads_0"), node, atom_mask
@@ -380,7 +422,7 @@ class DirectStress(nn.Module):
         )
         edge_out = masked(nn.Dense(9, name="edge_last_0"), edge_h, pair_mask)
 
-        edge_contrib = (edge_out * cutoffs[:, None]).reshape(N, n, 9).sum(axis=1)
+        edge_contrib = per_atom_sum(edge_out * cutoffs[:, None], N, segments)
         per_atom = (node_out + edge_contrib).reshape(N, 3, 3)
         return 0.5 * (per_atom + jnp.swapaxes(per_atom, 1, 2))
 
@@ -431,7 +473,10 @@ class TransformerLayer(nn.Module):
     temperature: float = 1.0
 
     @nn.compact
-    def __call__(self, node, edge, cutoffs, mask):
+    def __call__(self, node, edge, cutoffs, mask, tiles=None):
+        """``edge`` is ``[N, n, d_pet]``, or the flat ``[P, d_pet]`` with
+        ``tiles`` (``TokenTiles``); then the centre and edge tokens run as one
+        ``[N + P]`` list through the same row-wise layers."""
         d_pet, d_node = self.d_pet, self.d_node
         d_ff = self.d_ff
         expanded = d_node != d_pet
@@ -440,7 +485,10 @@ class TransformerLayer(nn.Module):
             proj = nn.Dense(d_pet, name="center_contract")(node)
         else:
             proj = node
-        tokens = jnp.concatenate([proj, edge], axis=1)
+        if tiles is None:
+            tokens = jnp.concatenate([proj, edge], axis=1)
+        else:
+            tokens = jnp.concatenate([proj[:, 0], edge], axis=0)
 
         def edge_mlp(x):
             h = nn.Dense(2 * d_ff, name="mlp_in")(x)
@@ -455,9 +503,13 @@ class TransformerLayer(nn.Module):
 
         # PreLN transformer
         attn = Attention(self.num_heads, self.temperature)(
-            rms_norm(tokens, name="norm_attn"), cutoffs, mask
+            rms_norm(tokens, name="norm_attn"), cutoffs, mask, tiles
         )
-        out_node, out_edge = attn[:, :1], attn[:, 1:]
+        if tiles is None:
+            out_node, out_edge = attn[:, :1], attn[:, 1:]
+        else:
+            N = node.shape[0]
+            out_node, out_edge = attn[:N, None], attn[N:]
 
         if expanded:
             out_node = node + nn.Dense(d_node, name="center_expand")(out_node)
@@ -472,13 +524,21 @@ class TransformerLayer(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-head scaled dot-product attention with cutoff weighting."""
+    """Multi-head scaled dot-product attention with cutoff weighting.
+
+    ``x`` is ``[N, T, F]``, one row of tokens per atom; or, with ``tiles``,
+    the flat token list ``[N + P, F]`` whose projections run unpadded and only
+    the attention core sees the tiles (``cutoffs`` / ``mask`` then in the
+    tile frame).
+    """
 
     num_heads: int
     temperature: float = 1.0
 
     @nn.compact
-    def __call__(self, x, cutoffs, mask):
+    def __call__(self, x, cutoffs, mask, tiles=None):
+        if tiles is not None:
+            return self._tiled(x, cutoffs, mask, tiles)
         N, T, F = x.shape
         H = self.num_heads
         d = F // H
@@ -502,6 +562,94 @@ class Attention(nn.Module):
         out = out.reshape(N, T, F)
 
         return nn.Dense(F, name="out")(out)
+
+    def _tiled(self, x, cutoffs, mask, tiles):
+        _, F = x.shape
+        H = self.num_heads
+        d = F // H
+
+        qkv = tiles.gather(nn.Dense(3 * F, name="qkv")(x))
+        T, W, _ = qkv.shape
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = q.reshape(T, W, H, d) / self.temperature
+        k = k.reshape(T, W, H, d)
+        v = v.reshape(T, W, H, d)
+        bias = jnp.log(jnp.clip(cutoffs, 1e-15, None))
+
+        # One tile per atom: the padded layout's attention at T = W.
+        out = flax_attention.dot_product_attention(
+            q, k, v, bias=bias[:, None, None, :], mask=mask[:, None, None, :]
+        )
+
+        # Back to the flat list before the output projection, which runs unpadded.
+        return nn.Dense(F, name="out")(tiles.scatter(out.reshape(T, W, F)))
+
+
+# -- flat tokens: attention tiles --
+
+
+class TokenTiles(NamedTuple):
+    """Index maps between the flat token list ``[N + P]`` (the ``N`` centre
+    tokens, then the ``P`` edge tokens) and the attention tiles ``[T, W]``,
+    ``T = N + E``: tile ``i < N`` is atom ``i``'s first, tile ``N + x`` the
+    ``x``-th extra one. Every map has unique indices, empty entries being
+    distinct out-of-range ones, so each gather's transpose is a scatter
+    without atomics."""
+
+    rows: jax.Array  # [T, W] token behind each tile slot
+    slots: jax.Array  # [N + P] tile slot (in the flattened [T * W]) of each token
+    mask: jax.Array  # [T, W] bool, the slot holds a real token
+    extra_atoms: jax.Array  # [E] atom owning each extra tile
+    extra_of: jax.Array  # [N] extra tile of each atom
+
+    def gather(self, x):
+        """``[N + P, ...]`` -> ``[T, W, ...]``, zero in the empty slots."""
+        return x.at[self.rows].get(mode="fill", fill_value=0, unique_indices=True)
+
+    def scatter(self, y):
+        """``[T, W, ...]`` -> ``[N + P, ...]``, the inverse; zero for a token
+        in no tile."""
+        y = y.reshape((-1,) + y.shape[2:])
+        return y.at[self.slots].get(mode="fill", fill_value=0, unique_indices=True)
+
+
+def token_tiles(tile_tokens, extra_atoms, atom_mask, P):
+    """``TokenTiles`` from the pack's maps (``select._token_tiles``): an entry
+    ``>= P`` of ``tile_tokens`` is an empty slot, one ``>= N`` of
+    ``extra_atoms`` an unused extra tile."""
+    N = atom_mask.shape[0]
+    T, w = tile_tokens.shape
+    W = w + 1
+    E = T - N
+    idx = tile_tokens.dtype
+    tile = jnp.arange(T, dtype=idx)
+
+    centre = jnp.where(tile < N, tile, N + P)[:, None]
+    rows = jnp.concatenate([centre, N + tile_tokens], axis=1)
+    live = rows < N + P
+    rows = jnp.where(live, rows, N + P + jnp.arange(T * W, dtype=idx).reshape(T, W))
+    mask = live & jnp.concatenate(
+        [jnp.pad(atom_mask, (0, E))[:, None], jnp.ones((T, w), bool)], axis=1
+    )
+    slots = jnp.arange(T * W, T * W + N + P, dtype=idx)
+    slots = slots.at[rows.reshape(-1)].set(
+        jnp.arange(T * W, dtype=idx), mode="drop", unique_indices=True
+    )
+
+    x = jnp.arange(E, dtype=idx)
+    extra_atoms = jnp.where(extra_atoms < N, extra_atoms, T + x)
+    extra_of = jnp.arange(E, E + N, dtype=idx)
+    extra_of = extra_of.at[extra_atoms].set(x, mode="drop", unique_indices=True)
+    return TokenTiles(rows, slots, mask, extra_atoms, extra_of)
+
+
+def per_atom_sum(x, N, segments=None):
+    """Sum per-pair ``x`` ``[P, ...]`` over each atom's pairs: a reshape to
+    ``[N, P // N]`` on the padded layout, or with ``segments`` (the centers,
+    sorted) a segment sum on the flat one."""
+    if segments is None:
+        return x.reshape((N, -1) + x.shape[1:]).sum(axis=1)
+    return jax.ops.segment_sum(x, segments, num_segments=N, indices_are_sorted=True)
 
 
 # -- building blocks --

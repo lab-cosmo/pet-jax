@@ -5,6 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+import math
 import sys
 import warnings
 
@@ -134,6 +135,9 @@ class UPETCalculator(BaseCalculator):
         self._N_padded = None
         self._n_pair_padded = None
         self._k_sel = None
+        # Static capacity of the flat token list (empty for the padded
+        # layout), sized next to k_sel.
+        self._token_sizes = {}
         self._structure = None
         self._shift_offset = 0.0
 
@@ -283,6 +287,7 @@ class UPETCalculator(BaseCalculator):
                 k_sel_actual + 1 + self._extra_neighbors, self._k_sel_bucket_strategy
             )
             k_sel_padded = token_padded - 1
+            self._token_sizes = self._size_tokens(selection.counts, k_sel_padded)
         else:
             k_sel_padded = self._k_sel
 
@@ -297,6 +302,11 @@ class UPETCalculator(BaseCalculator):
             **self._conditioning(atoms, N_padded),
             "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
         }
+        # token_sizer carries the flat layout's capacity likewise.
+        if "p_cap" in self._token_sizes:
+            self._structure["token_sizer"] = jnp.zeros(
+                self._token_sizes["p_cap"], dtype=bool
+            )
         max_shift = (
             int(np.max(np.abs(structure["cell_shifts"])))
             if len(structure["cell_shifts"]) > 0
@@ -323,6 +333,27 @@ class UPETCalculator(BaseCalculator):
         )
         self._check_cutoff_override()
 
+    def _size_tokens(self, counts, k_sel):
+        """Capacity of the flat token list (``p_cap``) from the host-side
+        selected counts, sized and widened together with ``k_sel``.
+
+        ``p_cap`` is ``token_margin`` times the selected pairs, bucketed like
+        the pair axis, plus the always-empty sentinel slot: the total is a sum
+        over all atoms and drifts far less than the largest count.
+        """
+        express = self.express
+        if express.tokens != "flat":
+            return {}
+        n_tokens = int(counts.sum())
+        strategy = (
+            self._n_pair_bucket_strategy
+            if self._n_pair_bucket_strategy is not None
+            else self._bucket_strategy
+        )
+        p_cap = _bucket_or(math.ceil(express.token_margin * n_tokens) + 1, strategy)
+        sizes = {"n_tokens": n_tokens, "p_cap": p_cap}
+        return sizes
+
     def _record_debug(
         self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
     ):
@@ -344,6 +375,7 @@ class UPETCalculator(BaseCalculator):
             "retrace": shape_changed,  # predict_fn retraces iff a shape changed
             "overflow_retry": force_recompute_k_sel,
             "express": self.express.as_dict(),
+            "tokens": dict(self._token_sizes),
         }
         if self._debug:
             self._print_debug(self.debug_stats)
