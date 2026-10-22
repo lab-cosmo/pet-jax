@@ -33,6 +33,7 @@ from functools import partial
 from typing import NamedTuple
 
 from .express import Express
+from .structure import neighbor_list
 from .utils import cutoff_bump, edge_displacements, safe_norm
 
 # Per-atom model inputs a structure dict may carry besides the geometry.
@@ -68,11 +69,26 @@ def truncate(
     ``k_sel_sizer`` carrier, delegate to ``truncate_edges``. Per-atom model
     inputs beyond the geometry (``charge``, ``spin_multiplicity``) pass
     through untouched when present. ``express`` selects the performance
-    switches (``Express``); with ``neighbor_list="device"`` the raw list is
-    built here from ``positions`` and ``cell`` instead of read off the dict."""
+    switches (``Express``).
+
+    With ``neighbor_list="device"`` the raw list is built here
+    (``structure.neighbor_list``) from ``positions``, ``cell``, ``pbc`` and the
+    ``lattice_shifts`` window at radius ``neighbor_radius``, into the static
+    capacity read off the ``pair_sizer`` carrier, instead of read off the dict;
+    a real pair that does not fit sets ``overflow``."""
     express = Express.from_any(express)
+    raw_overflow = None
     if express.neighbor_list == "device":
-        raise NotImplementedError("neighbor_list='device' is not implemented yet")
+        nl, raw_overflow = neighbor_list(
+            structure["positions"],
+            structure["cell"],
+            structure["atom_mask"],
+            structure["pbc"],
+            structure["lattice_shifts"],
+            structure["neighbor_radius"],
+            structure["pair_sizer"].shape[-1],
+        )
+        structure = {**structure, **nl}
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],
@@ -99,6 +115,8 @@ def truncate(
     for key in CONDITIONING_KEYS:
         if key in structure:
             truncated[key] = structure[key]
+    if raw_overflow is not None:
+        truncation = truncation._replace(overflow=truncation.overflow | raw_overflow)
     return truncated, truncation
 
 

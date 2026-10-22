@@ -219,6 +219,99 @@ def _lexsort(keys):
     return jax.lax.sort((*keys, position), num_keys=len(keys), is_stable=True)[-1]
 
 
+# -- device-built raw list: the raw NL inside the forward, rebuilt every step --
+
+
+def lattice_shifts(cell, pbc, radius):
+    """The lattice shifts ``neighbor_list`` adds to each pair's minimum image so
+    that it sees every image within ``radius``, as int32 ``[n_shifts, 3]``.
+
+    Along a periodic axis with perpendicular height ``h``, a displacement whose
+    fractional part is the minimum image (``|f| <= 1/2``) plus ``t`` lattice
+    vectors is at least ``|f + t| h`` long, so only ``|t| <= floor(radius / h +
+    1/2)`` can come within ``radius``; that is the window. Non-periodic axes
+    get ``t = 0``, a cell larger than twice the radius only the zero shift.
+    Depends on the cell: recompute it when the cell changes (``n_shifts`` is a
+    jit shape)."""
+    cell = np.asarray(cell, dtype=np.float64)
+    pbc = np.asarray(pbc, dtype=bool)
+    window = np.zeros(3, dtype=int)
+    if pbc.any():
+        volume = abs(np.linalg.det(cell))
+        if volume == 0:
+            raise ValueError("a periodic structure needs a non-degenerate cell")
+        for a in np.flatnonzero(pbc):
+            height = volume / np.linalg.norm(np.cross(cell[(a + 1) % 3], cell[(a + 2) % 3]))
+            window[a] = int(np.floor(radius / height + 0.5))
+    grid = np.meshgrid(*(np.arange(-n, n + 1) for n in window), indexing="ij")
+    return np.stack(grid, axis=-1).reshape(-1, 3).astype(np.int32)
+
+
+def neighbor_list(positions, cell, atom_mask, pbc, shifts, radius, capacity):
+    """The raw flat NL of ``to_structure`` built on the device, by an O(N²)
+    distance evaluation over the static set of lattice ``shifts`` (from
+    ``lattice_shifts``): every ordered pair ``(i, j, S)`` of real atoms with
+    ``|R_j - R_i + S @ cell| < radius``, ``S`` the minimum image of the pair
+    plus a window shift. Meant for N up to about 10⁴.
+
+    The shifts refer to ``positions`` exactly as given (no wrapping), so the
+    model must use the same array: a separately wrapped copy can differ from
+    it by a lattice vector. ``capacity`` is the static length of the pair axis;
+    the layout is ``to_structure``'s (sorted by center, padding on the dummy
+    atom ``N - 1`` with zero shift, reverse = self, the last slot always
+    empty). Returns the five NL arrays and ``overflow``, True iff a real pair
+    did not fit (then the list is invalid)."""
+    positions = jax.lax.stop_gradient(positions)
+    cell = jax.lax.stop_gradient(cell)
+    N = positions.shape[0]
+    n_shifts = shifts.shape[0]
+    if N * N * n_shifts >= 2**31:
+        raise ValueError(f"{N}² atom pairs × {n_shifts} shifts exceed int32 indexing")
+    shifts = shifts.astype(positions.dtype)
+    # pbc gates the minimum image, so a non-periodic (possibly zero) cell
+    # never reaches the result through its inverse.
+    frac = positions @ jnp.linalg.inv(cell)
+
+    def image(i, j):
+        return jnp.where(pbc, -jnp.round(frac[j] - frac[i]), 0.0)
+
+    atoms = jnp.arange(N)
+    base = (
+        positions[None, :]
+        - positions[:, None]
+        + image(atoms[:, None], atoms[None, :]) @ cell
+    )
+    R = base[:, :, None, :] + (shifts @ cell)[None, None]  # [i, j, t, 3]
+    d2 = jnp.sum(R * R, axis=-1)
+    self_image = (atoms[:, None] == atoms[None, :])[:, :, None] & jnp.all(
+        shifts == 0, axis=-1
+    )
+    keep = atom_mask[:, None, None] & atom_mask[None, :, None] & ~self_image
+    keep = (keep & (d2 < radius * radius)).reshape(-1)
+
+    # Row-major candidates (i, j, t) compact into center order, which is
+    # center_order's result already, so no sort.
+    n_candidates = keep.shape[0]
+    (index,) = jnp.nonzero(keep, size=capacity - 1, fill_value=n_candidates)
+    index = jnp.concatenate([index, jnp.full(1, n_candidates, index.dtype)])
+    pair_mask = index < n_candidates
+    index = jnp.where(pair_mask, index, 0)
+    i, j, t = index // (N * n_shifts), (index // n_shifts) % N, index % n_shifts
+
+    dummy = N - 1
+    centers = jnp.where(pair_mask, i, dummy).astype(jnp.int32)
+    others = jnp.where(pair_mask, j, dummy).astype(jnp.int32)
+    cell_shifts = jnp.where(pair_mask[:, None], image(i, j) + shifts[t], 0.0)
+    nl = {
+        "centers": centers,
+        "others": others,
+        "cell_shifts": cell_shifts,
+        "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
+        "pair_mask": pair_mask,
+    }
+    return nl, jnp.sum(keep) > capacity - 1
+
+
 # -- helpers --
 
 

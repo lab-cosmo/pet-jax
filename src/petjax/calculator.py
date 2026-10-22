@@ -1,5 +1,6 @@
-"""ASE calculator for UPET (JAX). Verlet-skin NL cache, JIT'd adaptive
-selection inside the forward, overflow-triggered re-JIT."""
+"""ASE calculator for UPET (JAX). Verlet-skin NL cache (or a raw NL built
+inside the forward), JIT'd adaptive selection inside the forward,
+overflow-triggered re-JIT, optional cutoff guard."""
 
 import numpy as np
 import jax
@@ -14,14 +15,41 @@ from ase.stress import full_3x3_to_voigt_6_stress
 from .express import Express
 from .predict import get_predict_fn
 from .select import select_edges
-from .structure import _bucket_or, conditioning_inputs, read_conditioning, to_structure
+from .structure import (
+    _bucket_or,
+    conditioning_inputs,
+    lattice_shifts,
+    read_conditioning,
+    to_structure,
+)
 from .utils import cast_floats
 
 
 class UPETCalculator(BaseCalculator):
     """ASE calculator for UPET (JAX) with a two-phase NL: raw NL at
     ``cutoff + skin`` (Verlet-cached), adaptive selection inside JIT every
-    step. Overflow triggers a rebuild with larger ``k_sel`` and re-JIT."""
+    step. Overflow triggers a rebuild with larger ``k_sel`` and re-JIT.
+
+    With ``express={"neighbor_list": "device"}`` the raw NL is instead built
+    inside the forward at ``cutoff`` every step (no skin, no Verlet cache, no
+    vesin per step). Its static pair capacity is the padded pair count of a
+    host list at ``cutoff + skin``, built with ``to_structure`` only when the
+    calculator (re)sizes: on the first call, when atom count, species or pbc
+    change, and on overflow. The same host list feeds ``select_edges``, which
+    sizes ``k_sel``. A pair overflow on the device rebuilds that host list from
+    the current geometry, which holds every current pair, so one retry fits.
+
+    With ``express={"cutoff_guard": True}`` and ``cutoff_override`` active, a
+    step whose adaptive cutoffs reach the raw list's radius (the list may have
+    dropped pairs) is discarded: the raw-NL cutoff widens by ``cutoff_widen``
+    (capped at the trained cutoff), the structure is rebuilt and the forward
+    rerun, counted in ``debug_stats["cutoff_guard_events"]``. The condition is
+    exact for the solver method: the truncated selection equals the full one
+    iff every adaptive cutoff lies below the radius the list is complete to,
+    and a violation always shows as a cutoff at or above it. That radius is
+    ``cutoff_override`` for the device list and ``cutoff_override + skin -
+    drift`` for the host list, ``drift`` the Verlet bound on how far any pair
+    distance moved since the build."""
 
     name = "upet-jax"
     parameters = {}
@@ -44,6 +72,7 @@ class UPETCalculator(BaseCalculator):
         extra_neighbors=4,
         num_neighbors_adaptive=None,
         cutoff_override=None,
+        cutoff_widen=0.5,
         add_offset=True,
         debug=False,
         express=None,
@@ -85,15 +114,14 @@ class UPETCalculator(BaseCalculator):
         # the largest adaptive cutoff and the largest selected count. What the
         # cutoff guard and the benchmark driver watch.
         self.call_stats = None
-        if self.express.cutoff_guard:
-            raise NotImplementedError("cutoff_guard is not implemented yet")
-        if self.express.neighbor_list != "host":
-            raise NotImplementedError("neighbor_list='device' is not implemented yet")
+        self._device_nl = self.express.neighbor_list == "device"
+        self._cutoff_widen = cutoff_widen
+        self._cutoff_guard_events = 0
 
-        # cutoff_override narrows ONLY the vesin raw-NL query radius (to
-        # cutoff_override + skin). The UPET model is untouched — the
-        # adaptive-cutoff selection and the cutoff bump all keep using the trained
-        # config["cutoff"]. A performance knob for when the trained cutoff is wider
+        # cutoff_override narrows ONLY the raw-NL radius (to cutoff_override +
+        # skin for the host list, cutoff_override for the device list). The UPET
+        # model is untouched — the adaptive-cutoff selection and the cutoff bump
+        # all keep using the trained config["cutoff"]. A performance knob for when the trained cutoff is wider
         # than the radius adaptive selection actually reaches.
         #
         # CORRECTNESS RISK: the raw NL must still hold every pair the model
@@ -103,7 +131,8 @@ class UPETCalculator(BaseCalculator):
         # starved. Both corrupt energy/forces with no error raised.
         #
         # `_check_cutoff_override` warns (per rebuild) once the measured reach
-        # exceeds cutoff_override — but it is a warning, not a guard.
+        # exceeds cutoff_override — a warning; the cutoff guard (express) is the
+        # guard.
         self._cutoff = (
             cutoff_override if cutoff_override is not None else metadata["config"]["cutoff"]
         )
@@ -123,7 +152,9 @@ class UPETCalculator(BaseCalculator):
         # checkpoint that ships as fp32.
         self._params = cast_floats(params, self._dtype)
 
-        self._nl_cache = NeighborListCache(skin=skin)
+        # The device list is rebuilt every step: the cache only notices atom
+        # count, species and pbc changes.
+        self._nl_cache = NeighborListCache(skin=np.inf if self._device_nl else skin)
         self._predict_fn = get_predict_fn(
             self._model,
             stress=self._stress,
@@ -175,16 +206,15 @@ class UPETCalculator(BaseCalculator):
         else:
             self._update_geometry(atoms)
 
-        results = self._predict_fn(self._params, self._structure)
-
-        if bool(results["overflow"]):
-            self._build_structure(atoms, force_recompute_k_sel=True)
-            results = self._predict_fn(self._params, self._structure)
-            if bool(results["overflow"]):
-                raise RuntimeError(
-                    "UPETCalculator: cannot recover from overflow "
-                    f"after retry (k_sel={self._k_sel})"
+        results = self._predict(atoms)
+        if self.express.cutoff_guard:
+            while self._cutoff_violated(atoms, results):
+                self._cutoff = min(
+                    self._cutoff + self._cutoff_widen, self._metadata["config"]["cutoff"]
                 )
+                self._cutoff_guard_events += 1
+                self._build_structure(atoms, force_recompute_k_sel=True)
+                results = self._predict(atoms)
 
         self.call_stats = {
             "max_cutoff": float(results["max_cutoff"]),
@@ -210,6 +240,32 @@ class UPETCalculator(BaseCalculator):
         return self.results
 
     # -- internals --
+
+    def _predict(self, atoms):
+        """The forward, with one rebuild-and-retry on overflow."""
+        results = self._predict_fn(self._params, self._structure)
+        if bool(results["overflow"]):
+            self._build_structure(atoms, force_recompute_k_sel=True)
+            results = self._predict_fn(self._params, self._structure)
+            if bool(results["overflow"]):
+                raise RuntimeError(
+                    "UPETCalculator: cannot recover from overflow "
+                    f"after retry (k_sel={self._k_sel}, "
+                    f"pair capacity={self._n_pair_padded})"
+                )
+        return results
+
+    def _cutoff_violated(self, atoms, results):
+        """Whether the raw list may have dropped a pair the selection needs:
+        the largest adaptive cutoff at or above the radius the list is
+        complete to. Never with the raw radius at the trained cutoff."""
+        if self._cutoff >= self._metadata["config"]["cutoff"]:
+            return False
+        if self._device_nl:
+            complete_to = self._cutoff
+        else:
+            complete_to = self._cutoff + self._skin - self._nl_cache.pair_drift(atoms)
+        return float(results["max_cutoff"]) >= complete_to
 
     def _to_jax_structure(self, structure):
         return cast_floats(structure, self._dtype)
@@ -292,16 +348,19 @@ class UPETCalculator(BaseCalculator):
 
         # k_sel_sizer carries k_sel into the shape-agnostic predict_fn via its
         # shape; the JIT retraces when k_sel (or any other shape) changes.
+        geometry = self._device_inputs(structure, atoms) if self._device_nl else structure
         self._structure = {
-            **self._to_jax_structure(structure),
+            **self._to_jax_structure(geometry),
             **self._conditioning(atoms, N_padded),
             "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
         }
-        max_shift = (
-            int(np.max(np.abs(structure["cell_shifts"])))
-            if len(structure["cell_shifts"]) > 0
-            else 0
-        )
+        if self._device_nl:
+            # Shifts are rebuilt with the list, so a cell change never stales it.
+            max_shift = 0
+        elif len(structure["cell_shifts"]) > 0:
+            max_shift = int(np.max(np.abs(structure["cell_shifts"])))
+        else:
+            max_shift = 0
         self._nl_cache.save_reference(atoms, max_cell_shift=max_shift)
 
         # Composition shifts are constant w.r.t. positions; Python fp64 sum
@@ -343,6 +402,7 @@ class UPETCalculator(BaseCalculator):
             "cutoff_trained": self._metadata["config"]["cutoff"],
             "retrace": shape_changed,  # predict_fn retraces iff a shape changed
             "overflow_retry": force_recompute_k_sel,
+            "cutoff_guard_events": self._cutoff_guard_events,
             "express": self.express.as_dict(),
         }
         if self._debug:
@@ -360,13 +420,15 @@ class UPETCalculator(BaseCalculator):
         override is active; the reach is read from the last sizing run."""
         co = self._max_selected_cutoff
         override_active = self._cutoff < self._metadata["config"]["cutoff"]
-        if co is None or not override_active or co <= self._cutoff:
+        if self.express.cutoff_guard or co is None or not override_active:
             return
-        raw_nl_radius = self._cutoff + self._skin
+        if co <= self._cutoff:
+            return
+        skin = 0.0 if self._device_nl else self._skin
         warnings.warn(
             f"UPETCalculator: adaptive selection reaches {co:.2f} Å, exceeding "
             f"cutoff_override={self._cutoff:.2f} Å (raw-NL radius "
-            f"{raw_nl_radius:.2f} Å incl. {self._skin:.2f} Å skin). The override "
+            f"{self._cutoff + skin:.2f} Å incl. {skin:.2f} Å skin). The override "
             f"is too small — it eats the Verlet skin and risks silently dropping "
             f"pairs the model needs (corrupting energy/forces). Raise "
             f"cutoff_override toward the trained "
@@ -406,17 +468,35 @@ class UPETCalculator(BaseCalculator):
 
     def _update_geometry(self, atoms):
         """Update positions, cell, and the conditioning inputs without
-        rebuilding the NL."""
+        rebuilding the NL (for the device list, also its shift window)."""
         n_real = len(atoms)
         N_padded = self._N_padded
         positions = np.zeros((N_padded, 3), dtype=np.float64)
         positions[:n_real] = atoms.get_positions()
         cell = np.array(atoms.get_cell()[:], dtype=np.float64)
+        window = {}
+        if self._device_nl and atoms.pbc.any():
+            window["lattice_shifts"] = lattice_shifts(cell, atoms.pbc, self._cutoff)
         self._structure = {
             **self._structure,
             "positions": jnp.array(positions, dtype=self._dtype),
             "cell": jnp.array(cell, dtype=self._dtype),
+            **window,
             **self._conditioning(atoms, N_padded),
+        }
+
+    def _device_inputs(self, structure, atoms):
+        """The structure for the device list: the host list's geometry, with
+        its pair arrays replaced by what ``select.truncate`` builds them from.
+        ``pair_sizer`` carries the pair capacity (the host list's padded pair
+        count) the way ``k_sel_sizer`` carries ``k_sel``."""
+        keys = ("positions", "cell", "atomic_numbers", "atom_mask")
+        return {
+            **{k: structure[k] for k in keys},
+            "pbc": np.asarray(atoms.pbc, dtype=bool),
+            "lattice_shifts": lattice_shifts(structure["cell"], atoms.pbc, self._cutoff),
+            "neighbor_radius": np.asarray(self._cutoff, dtype=np.float64),
+            "pair_sizer": np.zeros(structure["centers"].shape[0], dtype=bool),
         }
 
     def _conditioning(self, atoms, N_padded):
@@ -445,6 +525,20 @@ class NeighborListCache:
         self._ref_numbers = None
         self._max_cell_shift = None
 
+    def pair_drift(self, atoms):
+        """Bound on how far any pair distance (periodic images included) moved
+        since the reference: twice the largest displacement plus the cell
+        change times the largest cell shift."""
+        displacements = atoms.get_positions() - self._ref_positions
+        max_disp = float(np.linalg.norm(displacements, axis=1).max())
+        if self._max_cell_shift is not None and self._max_cell_shift > 0:
+            cell_change = np.array(atoms.get_cell()[:]) - self._ref_cell
+            cell_vector_norms = np.linalg.norm(cell_change, axis=1)
+            max_cell_contrib = float(self._max_cell_shift * cell_vector_norms.sum())
+        else:
+            max_cell_contrib = 0.0
+        return 2 * max_disp + max_cell_contrib
+
     def needs_update(self, atoms):
         if self._ref_positions is None:
             return True
@@ -459,17 +553,7 @@ class NeighborListCache:
             if (atoms.get_cell()[:] != self._ref_cell).any():
                 return True
 
-        displacements = atoms.get_positions() - self._ref_positions
-        max_disp = float(np.linalg.norm(displacements, axis=1).max())
-
-        if self._max_cell_shift is not None and self._max_cell_shift > 0:
-            cell_change = np.array(atoms.get_cell()[:]) - self._ref_cell
-            cell_vector_norms = np.linalg.norm(cell_change, axis=1)
-            max_cell_contrib = float(self._max_cell_shift * cell_vector_norms.sum())
-        else:
-            max_cell_contrib = 0.0
-
-        return bool((2 * max_disp + max_cell_contrib) > self.skin)
+        return bool(self.pair_drift(atoms) > self.skin)
 
     def save_reference(self, atoms, max_cell_shift=None):
         self._ref_positions = atoms.get_positions().copy()

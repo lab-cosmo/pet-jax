@@ -21,6 +21,9 @@ CHECKPOINTS = ("pet-mad-xs", "pet-mad-xs-v1.6")  # grid and solver cutoffs
 CASES = {
     "stock": Express(),
     "reverse_unique": Express(reverse_unique=True),
+    "device_list": Express(neighbor_list="device"),
+    "cutoff_guard": Express(cutoff_guard=True),
+    "device_list_guard": Express(neighbor_list="device", cutoff_guard=True),
 }
 
 RTOL_ENERGY = 1e-11
@@ -119,3 +122,57 @@ def test_express_recorded(checkpoint, frames):
     atoms.calc = calc
     atoms.get_potential_energy()
     assert calc.debug_stats["express"] == Express().as_dict()
+
+
+@pytest.mark.parametrize("neighbor_list", ["host", "device"])
+def test_cutoff_guard(neighbor_list, checkpoint, frames, stock):
+    """An override below the selection's reach silently corrupts the result;
+    the guard sees it, widens the raw list back to the trained cutoff in one
+    event and reproduces the result without override."""
+    index = 3  # periodic, 108 atoms
+    reach = stock[index][3]["max_cutoff"]
+    kwargs = dict(cutoff_override=reach - 1.0, cutoff_widen=10.0)
+    express = {"neighbor_list": neighbor_list}
+
+    with pytest.warns(UserWarning, match="cutoff_override"):
+        unguarded = predictions(checkpoint, frames[index : index + 1], express, **kwargs)
+    assert abs(unguarded[0][0] - stock[index][0]) > 1e-6
+
+    calc = UPETCalculator.from_checkpoint(
+        str(checkpoint),
+        default_dtype="float64",
+        express={**express, "cutoff_guard": True},
+        **kwargs,
+    )
+    atoms = frames[index].copy()
+    atoms.calc = calc
+    energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+    candidate = [(energy, forces, atoms.get_stress(), dict(calc.call_stats))]
+    assert calc.debug_stats["cutoff_guard_events"] == 1
+    assert_equivalent(stock[index : index + 1], candidate)
+
+
+def test_device_list_trajectory(checkpoint, frames):
+    """Between rebuilds the device list follows moving atoms and a deforming
+    cell (its shift window included) with no host list."""
+    rng = np.random.default_rng(0)
+    trajectory = []
+    for index in (0, 3):  # the small cell has a 27-shift window
+        atoms = frames[index].copy()
+        for _ in range(4):
+            atoms.positions += rng.normal(scale=0.05, size=atoms.positions.shape)
+            atoms.set_cell(atoms.cell * (1 + rng.normal(scale=0.01)), scale_atoms=True)
+            trajectory.append(atoms.copy())
+    stock = predictions(checkpoint, trajectory, Express())
+    calc = UPETCalculator.from_checkpoint(
+        str(checkpoint), default_dtype="float64", express={"neighbor_list": "device"}
+    )
+    build, builds = calc._build_structure, []
+    calc._build_structure = lambda *a, **k: builds.append(1) or build(*a, **k)
+    candidate = []
+    for atoms in trajectory:
+        atoms.calc = calc
+        energy, forces = atoms.get_potential_energy(), atoms.get_forces()
+        candidate.append((energy, forces, atoms.get_stress(), dict(calc.call_stats)))
+    assert_equivalent(stock, candidate)
+    assert len(builds) == 2  # one sizing per structure

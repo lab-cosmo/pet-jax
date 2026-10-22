@@ -8,7 +8,7 @@ import pytest
 from ase.build import bulk, molecule
 
 from petjax import center_order, corresponding_edges
-from petjax.structure import to_structure
+from petjax.structure import lattice_shifts, neighbor_list, to_structure
 
 
 @pytest.fixture(params=["primitive", "supercell", "molecule"])
@@ -73,3 +73,76 @@ def test_corresponding_edges_int32_inputs(structure):
     )
     assert got.dtype == jnp.int32
     assert np.array_equal(got, structure["reverse"])
+
+
+# -- device-built raw list against the host list --
+
+
+def _device_list(atoms, cutoff, capacity):
+    host = to_structure(atoms, cutoff=cutoff, skin=0.0)
+    shifts = lattice_shifts(host["cell"], atoms.pbc, cutoff)
+    nl, overflow = jax.jit(neighbor_list, static_argnums=6)(
+        host["positions"],
+        host["cell"],
+        host["atom_mask"],
+        atoms.pbc,
+        shifts,
+        cutoff,
+        capacity,
+    )
+    return host, jax.tree.map(np.asarray, nl), bool(overflow)
+
+
+def _pair_set(nl):
+    mask = nl["pair_mask"]
+    shifts = np.rint(nl["cell_shifts"][mask]).astype(int)
+    return set(zip(nl["centers"][mask], nl["others"][mask], *shifts.T))
+
+
+def _device_cases(mini_xyz):
+    from ase.io import read
+
+    yield from ((read(str(mini_xyz), index=i), 4.5) for i in range(12))
+    # Past half the perpendicular lengths: several images per pair, self-images.
+    yield bulk("NaCl", crystalstructure="rocksalt", a=5.64), 6.0
+    yield bulk("Si", cubic=False), 7.5  # skewed primitive cell
+    slab = bulk("Cu", cubic=True) * [2, 2, 1]
+    slab.pbc = [True, True, False]
+    slab.positions += np.random.default_rng(0).normal(scale=0.3, size=slab.positions.shape)
+    yield slab, 5.0  # mixed pbc, unwrapped positions
+
+
+def test_neighbor_list_matches_host(mini_xyz):
+    """The device list holds the host list's pair set in its layout: sorted by
+    center, padding last on the dummy atom, the last slot empty, and a reverse
+    map that pairs (i, j, S) with (j, i, -S) as an involution."""
+    for atoms, cutoff in _device_cases(mini_xyz):
+        n_pairs = int(to_structure(atoms, cutoff=cutoff, skin=0.0)["pair_mask"].sum())
+        host, nl, overflow = _device_list(atoms, cutoff, n_pairs + 7)
+        assert not overflow
+        assert _pair_set(nl) == _pair_set(host)
+
+        mask = nl["pair_mask"]
+        n_real = int(mask.sum())
+        assert n_real == n_pairs and mask[:n_real].all() and not mask[n_real:].any()
+        assert np.all(np.diff(nl["centers"][:n_real]) >= 0)
+        dummy = host["positions"].shape[0] - 1
+        assert (nl["centers"][n_real:] == dummy).all() and (
+            nl["others"][n_real:] == dummy
+        ).all()
+        assert not nl["cell_shifts"][n_real:].any()
+
+        rev = nl["reverse"]
+        real = np.arange(n_real)
+        assert np.array_equal(rev[rev], np.arange(rev.shape[0]))
+        assert np.array_equal(nl["centers"][rev[real]], nl["others"][real])
+        assert np.array_equal(nl["cell_shifts"][rev[real]], -nl["cell_shifts"][real])
+        assert np.array_equal(rev[n_real:], np.arange(n_real, rev.shape[0]))
+
+
+def test_neighbor_list_overflow():
+    """One slot short (the last slot stays empty) is an overflow; exact fit is not."""
+    atoms, cutoff = bulk("NaCl", crystalstructure="rocksalt", a=5.64), 6.0
+    n_pairs = int(to_structure(atoms, cutoff=cutoff, skin=0.0)["pair_mask"].sum())
+    assert not _device_list(atoms, cutoff, n_pairs + 1)[2]
+    assert _device_list(atoms, cutoff, n_pairs)[2]
