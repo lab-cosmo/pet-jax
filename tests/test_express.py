@@ -21,6 +21,11 @@ CHECKPOINTS = ("pet-mad-xs", "pet-mad-xs-v1.6")  # grid and solver cutoffs
 CASES = {
     "stock": Express(),
     "flat": Express(tokens="flat"),
+    # k_sel fits one tile: no extra tiles in the graph
+    "flat-tile32": Express(tokens="flat", attention_tile=32),
+    # narrow enough that most atoms need an extra tile (all 108 of the large
+    # frame on the 16-neighbour checkpoint), while the widest atom (21) fits two
+    "flat-tile12": Express(tokens="flat", attention_tile=12),
 }
 
 RTOL_ENERGY = 1e-11

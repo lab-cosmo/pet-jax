@@ -176,8 +176,11 @@ class Backbone(nn.Module):
     tile maps ``tile_tokens`` / ``extra_atoms`` (``select._token_tiles``):
     every per-token layer and the reverse gather run on the flat list, and only
     the attention core gathers tiles of width ``W = tile_tokens.shape[1] + 1``
-    (centre in slot 0), one of ``k_sel + 1`` per atom. The result is the
-    padded layout's to summation order, with the same parameter tree.
+    (centre in slot 0). Without ``attention_tile`` that is one tile of
+    ``k_sel + 1``; with it, an atom spilling past ``W - 1`` neighbours has one
+    extra tile and its softmax runs across both (``_attention_tiles``).
+    Either way the result is the padded layout's to
+    summation order, with the same parameter tree.
     """
 
     d_pet: int = 128
@@ -576,10 +579,13 @@ class Attention(nn.Module):
         v = v.reshape(T, W, H, d)
         bias = jnp.log(jnp.clip(cutoffs, 1e-15, None))
 
-        # One tile per atom: the padded layout's attention at T = W.
-        out = flax_attention.dot_product_attention(
-            q, k, v, bias=bias[:, None, None, :], mask=mask[:, None, None, :]
-        )
+        if tiles.extra_atoms.shape[0] == 0:
+            # One tile per atom: the padded layout's attention at T = W.
+            out = flax_attention.dot_product_attention(
+                q, k, v, bias=bias[:, None, None, :], mask=mask[:, None, None, :]
+            )
+        else:
+            out = _attention_tiles(q, k, v, bias, mask, tiles)
 
         # Back to the flat list before the output projection, which runs unpadded.
         return nn.Dense(F, name="out")(tiles.scatter(out.reshape(T, W, F)))
@@ -641,6 +647,72 @@ def token_tiles(tile_tokens, extra_atoms, atom_mask, P):
     extra_of = jnp.arange(E, E + N, dtype=idx)
     extra_of = extra_of.at[extra_atoms].set(x, mode="drop", unique_indices=True)
     return TokenTiles(rows, slots, mask, extra_atoms, extra_of)
+
+
+def _attention_tiles(q, k, v, bias, mask, tiles):
+    """Attention over tiles where an atom may own two, ``q, k, v`` ``[T, W, H, d]``
+    (``q`` already over the temperature), ``bias`` / ``mask`` ``[T, W]`` of
+    the key slots; returns ``[T, W, H, d]``.
+
+    A query sees all of its atom's keys: the diagonal blocks (first tile
+    against itself) are one rectangular pass over the first ``N`` tiles; an
+    atom with an extra tile adds the blocks (first, extra), (extra, first) and
+    (extra, extra), computed on the ``E`` extra tiles only.
+
+    Each query row's softmax spans its blocks in two passes: block maxima,
+    then with the final maximum ``m`` (``stop_gradient``, as in
+    ``jax.nn.softmax``) ``out = sum exp(s - m) v / sum exp(s - m)``. Scores
+    get the bias and the ``finfo.min`` mask as in ``flax``'s
+    ``dot_product_attention``, so a fully masked row (padding) comes out
+    uniform and finite like there, and the result is the one-tile softmax to
+    summation order.
+    """
+    T, W, H, d = q.shape
+    E = tiles.extra_atoms.shape[0]
+    N = T - E
+    q = q / jnp.sqrt(d).astype(q.dtype)
+    big_neg = jnp.finfo(q.dtype).min
+
+    def scores(qb, kb, bias_k, mask_k):
+        s = jnp.einsum("...qhd,...khd->...hqk", qb, kb) + bias_k[..., None, None, :]
+        return jnp.where(mask_k[..., None, None, :], s, big_neg)
+
+    def first_of_extra(x, fill=0):
+        # [T, ...] -> [E, ...]: the first tile of each extra tile's atom
+        return x.at[tiles.extra_atoms].get(
+            mode="fill", fill_value=fill, unique_indices=True
+        )
+
+    def extra_of_atom(x, fill):
+        # [E, ...] -> [N, ...]: the extra tile of each atom
+        return x.at[tiles.extra_of].get(mode="fill", fill_value=fill, unique_indices=True)
+
+    def accumulate(s, m, vb):
+        p = jnp.exp(s - m[..., None])
+        return p.sum(axis=-1), jnp.einsum("...hqk,...khd->...qhd", p, vb)
+
+    q_a, k_a, v_a = first_of_extra(q), first_of_extra(k), first_of_extra(v)
+    bias_a, mask_a = first_of_extra(bias), first_of_extra(mask, False)
+    q_x, k_x, v_x, bias_x, mask_x = q[N:], k[N:], v[N:], bias[N:], mask[N:]
+
+    s_d = scores(q[:N], k[:N], bias[:N], mask[:N])  # [N, H, W, W]
+    s_ax = scores(q_a, k_x, bias_x, mask_x)  # (first, extra), [E, H, W, W]
+    s_xa = scores(q_x, k_a, bias_a, mask_a)  # (extra, first)
+    s_xx = scores(q_x, k_x, bias_x, mask_x)  # (extra, extra)
+    m_d, m_ax, m_xa = s_d.max(axis=-1), s_ax.max(axis=-1), s_xa.max(axis=-1)
+    m_xx = s_xx.max(axis=-1)
+
+    m_first = jax.lax.stop_gradient(jnp.maximum(m_d[:N], extra_of_atom(m_ax, big_neg)))
+    m_extra = jax.lax.stop_gradient(jnp.maximum(m_xa, m_xx))
+
+    l_d, o_d = accumulate(s_d, m_first, v[:N])
+    l_ax, o_ax = accumulate(s_ax, first_of_extra(m_first), v_x)
+    l_xa, o_xa = accumulate(s_xa, m_extra, v_a)
+    l_xx, o_xx = accumulate(s_xx, m_extra, v_x)
+
+    l = jnp.concatenate([l_d[:N] + extra_of_atom(l_ax, 0), l_xa + l_xx])  # [T, H, W]
+    o = jnp.concatenate([o_d[:N] + extra_of_atom(o_ax, 0), o_xa + o_xx])  # [T, W, H, d]
+    return o / jnp.swapaxes(l, 1, 2)[..., None]
 
 
 def per_atom_sum(x, N, segments=None):

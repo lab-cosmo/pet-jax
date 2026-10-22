@@ -174,9 +174,10 @@ def truncate_edges(
         slot, sel_to_pair, pair_mask_sel, counts, offsets, packed, overflow = (
             _pack_selected_to_tokens(selected, centers, N, k_sel, token_capacity)
         )
-        if express.attention_tile is not None:
-            raise NotImplementedError("attention_tile is not implemented yet")
-        width, tile_capacity = k_sel + 1, 0
+        if express.attention_tile is None:
+            width, tile_capacity = k_sel + 1, 0
+        else:
+            width = express.attention_tile
         tile_tokens, extra_atoms, tile_overflow = _token_tiles(
             offsets, packed, token_capacity, width, tile_capacity
         )
