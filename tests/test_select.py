@@ -232,3 +232,106 @@ def test_masked_slots_carry_no_features(structure):
     params = backbone.init(jax.random.key(0), **inputs, pair_cutoffs=None)
     _, messages, _ = backbone.apply(params, **inputs, pair_cutoffs=None)
     assert np.all(np.asarray(messages)[~np.asarray(packed["pair_mask"])] == 0.0)
+
+
+# -- solver variants (Express.solver) against the stock solver --
+
+# (num_neighbors_adaptive, cutoff, cutoff_width_adaptive) of the two solver
+# parameter sets in use: PET-MAD v1.6 and the xs grid checkpoints' values.
+SOLVER_HYPERS = {"k16_w1": (16, 7.5, 1.0), "k8_w05": (8, 7.5, 0.5)}
+
+SOLVER_CASES = {
+    "sorted_segment_sum": dict(solver="sorted_segment_sum"),
+}
+
+
+def _liquid(n=64, rho=0.09, dmin=1.8, seed=0):
+    """Random positions at a dense liquid's density with a minimum distance: no
+    shells, so roots land anywhere between neighbours."""
+    from ase import Atoms
+
+    rng = np.random.default_rng(seed)
+    L = (n / rho) ** (1 / 3)
+    positions = []
+    while len(positions) < n:
+        p = rng.uniform(0, L, 3)
+        if all(np.linalg.norm((p - q + L / 2) % L - L / 2) >= dmin for q in positions):
+            positions.append(p)
+    numbers = rng.choice([40, 8, 8], size=n)
+    return Atoms(numbers=numbers, positions=positions, cell=np.eye(3) * L, pbc=True)
+
+
+def _isolated_and_dimer():
+    from ase import Atoms
+
+    positions = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.74], [20.0, 20.0, 20.0]]
+    return Atoms("H2O", positions=positions)
+
+
+@pytest.fixture(scope="module")
+def solver_structures(mini_xyz):
+    from ase.io import read
+
+    atoms = [read(str(mini_xyz), index=i) for i in (0, 5, 6, 11)]
+    atoms += [_liquid(), _isolated_and_dimer()]
+    return [to_structure(a, cutoff=7.5, skin=0.0) for a in atoms]
+
+
+def _solve(structure, hypers, dtype, express=None):
+    """Cutoffs, selection and d(sum_i c_i r_i)/d positions of ``_select_edges``."""
+    import jax.numpy as jnp
+
+    from petjax.select import _select_edges
+    from petjax.utils import edge_displacements
+
+    k, cutoff, width = hypers
+    N = structure["positions"].shape[0]
+    weights = jnp.asarray(np.random.default_rng(1).uniform(0.5, 1.5, N), dtype)
+
+    def cutoffs(positions):
+        R_ij = edge_displacements(
+            positions,
+            structure["centers"],
+            structure["others"],
+            jnp.asarray(structure["cell_shifts"], dtype),
+            jnp.asarray(structure["cell"], dtype),
+        )
+        out = _select_edges(
+            R_ij,
+            structure["centers"],
+            structure["others"],
+            structure["pair_mask"],
+            N,
+            k,
+            cutoff,
+            width,
+            method="solver",
+            express=express,
+        )
+        return jnp.sum(weights * out[0]), out
+
+    positions = jnp.asarray(structure["positions"], dtype)
+    grad, out = jax.grad(cutoffs, has_aux=True)(positions)
+    return np.asarray(out[0]), np.asarray(out[2]), np.asarray(grad)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("hypers", list(SOLVER_HYPERS), ids=list(SOLVER_HYPERS))
+@pytest.mark.parametrize("case", list(SOLVER_CASES))
+def test_solver_variant_matches_stock(case, hypers, dtype, solver_structures):
+    """Same root (1 ulp in float32, a few in float64), same selected pairs, and
+    the same IFT gradient as the stock solver, on the mini frames, a dense
+    liquid, and an isolated atom next to a dimer."""
+    from petjax.express import Express
+
+    express = Express(**SOLVER_CASES[case])
+    with jax.enable_x64(dtype == "float64"):
+        for structure in solver_structures:
+            c0, s0, g0 = _solve(structure, SOLVER_HYPERS[hypers], dtype)
+            c1, s1, g1 = _solve(structure, SOLVER_HYPERS[hypers], dtype, express)
+            ulps = 1 if dtype == "float32" else 4
+            np.testing.assert_array_less(np.abs(c1 - c0), ulps * np.spacing(c0) * 1.001)
+            assert np.array_equal(s1, s0)
+            scale = np.abs(g0).max()
+            rtol = 1e-5 if dtype == "float32" else 1e-11
+            np.testing.assert_allclose(g1, g0, rtol=0, atol=rtol * scale)

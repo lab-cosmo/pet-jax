@@ -20,6 +20,7 @@ CHECKPOINTS = ("pet-mad-xs", "pet-mad-xs-v1.6")  # grid and solver cutoffs
 
 CASES = {
     "stock": Express(),
+    "sorted_segment_sum": Express(solver="sorted_segment_sum"),
 }
 
 RTOL_ENERGY = 1e-11

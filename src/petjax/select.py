@@ -225,18 +225,25 @@ def select_edges(
     cutoff,
     cutoff_width_adaptive,
     method="grid",
+    express=None,
 ):
     """Run the adaptive selection on a structure dict on CPU and return what it
     produced, as host arrays. The calculator sizes ``k_sel`` from it once per
     NL rebuild; ``selected`` is the model's actual adjacency for anything
-    downstream (e.g. a Hessian sparsity pattern)."""
+    downstream (e.g. a Hessian sparsity pattern). ``express`` picks the solver
+    variant, as in the forward, so that sizing and forward agree."""
     # Only what the kernel reads: extra dict keys would change the jit cache key.
     keys = ("positions", "cell", "centers", "others", "cell_shifts", "pair_mask")
     # Resolved per call, not at import: importing petjax must not init a JAX backend.
     cpu = jax.devices("cpu")[0]
     cpu_structure = jax.device_put({k: structure[k] for k in keys}, cpu)
     out = _select_edges_kernel(
-        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method=method
+        cpu_structure,
+        num_neighbors_adaptive,
+        cutoff,
+        cutoff_width_adaptive,
+        method=method,
+        express=Express.from_any(express),
     )
     return Selection(*(np.asarray(x) for x in out))
 
@@ -253,6 +260,7 @@ def select_edges(
         "cutoff",
         "cutoff_width_adaptive",
         "method",
+        "express",
     ),
 )
 def _select_edges_kernel(
@@ -261,6 +269,7 @@ def _select_edges_kernel(
     cutoff,
     cutoff_width_adaptive,
     method="grid",
+    express=None,
 ):
     centers = structure["centers"]
     N = structure["positions"].shape[0]
@@ -281,6 +290,7 @@ def _select_edges_kernel(
         cutoff,
         cutoff_width_adaptive,
         method=method,
+        express=express,
     )
     counts = jax.ops.segment_sum(
         selected.astype(int), centers, num_segments=N, indices_are_sorted=True
@@ -326,7 +336,14 @@ def get_adaptive_cutoffs(
 
 
 def get_adaptive_cutoffs_solver(
-    centers, r_ij, pair_mask, num_neighbors, num_atoms, cutoff, cutoff_width
+    centers,
+    r_ij,
+    pair_mask,
+    num_neighbors,
+    num_atoms,
+    cutoff,
+    cutoff_width,
+    segment_sum=None,
 ):
     """Per-atom adaptive cutoffs via a Newton-bisection root find on the
     smoothed neighbor count (metatrain's "solver" method, the default for
@@ -339,7 +356,13 @@ def get_adaptive_cutoffs_solver(
     implicit-function-theorem step re-attaches gradients through the residual,
     so the backward never differentiates through the solver loop. As in the
     grid method, ``cutoff_width`` is the checkpoint's ``cutoff_width_adaptive``.
+
+    ``segment_sum`` maps a per-pair array to per-center sums (``x -> [N]``);
+    ``None`` is ``jax.ops.segment_sum`` over ``centers`` (``_per_center_sum``
+    builds the variants).
     """
+    if segment_sum is None:
+        segment_sum = _per_center_sum("segment_sum", centers, num_atoms)
     inv_cutoff = 1.0 / cutoff
     r_ij_d = jax.lax.stop_gradient(r_ij)
 
@@ -376,6 +399,7 @@ def get_adaptive_cutoffs_solver(
             cutoff_width,
             inv_cutoff,
             num_neighbors,
+            segment_sum,
         )
         f = n - num_neighbors
         below = f <= 0
@@ -387,7 +411,15 @@ def get_adaptive_cutoffs_solver(
 
     _, _, r = jax.lax.fori_loop(0, 10, newton_bisection_step, (r_lo, r_hi, 0.5 * r_hi))
     _, dn_root = _n_total_and_dn_dr(
-        r, r_ij_d, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+        r,
+        r_ij_d,
+        centers,
+        pair_mask,
+        num_atoms,
+        cutoff_width,
+        inv_cutoff,
+        num_neighbors,
+        segment_sum,
     )
 
     # IFT step: r and dn_root are constants; gradients attach only through the
@@ -396,7 +428,15 @@ def get_adaptive_cutoffs_solver(
     # physical lower bound on the adapted cutoff.
     n_residual = (
         _n_total(
-            r, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+            r,
+            r_ij,
+            centers,
+            pair_mask,
+            num_atoms,
+            cutoff_width,
+            inv_cutoff,
+            num_neighbors,
+            segment_sum,
         )
         - num_neighbors
     )
@@ -404,19 +444,37 @@ def get_adaptive_cutoffs_solver(
 
 
 def _n_total(
-    r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+    r_per_atom,
+    r_ij,
+    centers,
+    pair_mask,
+    num_atoms,
+    cutoff_width,
+    inv_cutoff,
+    num_neighbors,
+    segment_sum=None,
 ):
     """Smoothed neighbor count plus cubic baseline, evaluated at per-atom
     cutoff ``r_per_atom``. Padded pairs are masked out (upstream has no
     padding; the mask is the only deviation)."""
+    if segment_sum is None:
+        segment_sum = _per_center_sum("segment_sum", centers, num_atoms)
     per_edge = cutoff_bump(r_ij, r_per_atom[centers], cutoff_width) * pair_mask
-    n = jax.ops.segment_sum(per_edge, centers, num_atoms)
+    n = segment_sum(per_edge)
     x = r_per_atom * inv_cutoff
     return n + num_neighbors * x**3
 
 
 def _n_total_and_dn_dr(
-    r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+    r_per_atom,
+    r_ij,
+    centers,
+    pair_mask,
+    num_atoms,
+    cutoff_width,
+    inv_cutoff,
+    num_neighbors,
+    segment_sum,
 ):
     """``n_total`` and its analytic d/dr in one pass, for the Newton steps.
 
@@ -441,13 +499,31 @@ def _n_total_and_dn_dr(
         0.0,
     )
 
-    n = jax.ops.segment_sum(f, centers, num_atoms)
-    dn = jax.ops.segment_sum(df_dr, centers, num_atoms)
+    n = segment_sum(f)
+    dn = segment_sum(df_dr)
 
     x = r_per_atom * inv_cutoff
     n = n + num_neighbors * x**3
     dn = dn + 3.0 * num_neighbors * x**2 * inv_cutoff
     return n, dn
+
+
+# -- per-center sums over the center-sorted flat list --
+
+
+def _per_center_sum(solver, centers, num_atoms):
+    """``x -> [num_atoms]`` per-center sums for the ``Express.solver`` variant.
+    ``centers`` must be non-decreasing for every variant but the stock one."""
+    if solver == "segment_sum":
+        return partial(jax.ops.segment_sum, segment_ids=centers, num_segments=num_atoms)
+    if solver == "sorted_segment_sum":
+        return partial(
+            jax.ops.segment_sum,
+            segment_ids=centers,
+            num_segments=num_atoms,
+            indices_are_sorted=True,
+        )
+    raise ValueError(f"no per-center sum for solver {solver!r}")
 
 
 # -- selection mask: adaptive cutoffs, r_ij <= pair_cutoff --
@@ -478,12 +554,17 @@ def _select_edges(
     if method == "grid":
         adaptive_fn = get_adaptive_cutoffs
     elif method == "solver":
-        if express.solver != "segment_sum" or express.seed_cutoffs:
+        if express.solver not in ("segment_sum", "sorted_segment_sum") or (
+            express.seed_cutoffs
+        ):
             raise NotImplementedError(
                 f"solver={express.solver!r}, seed_cutoffs={express.seed_cutoffs} "
                 "is not implemented yet"
             )
-        adaptive_fn = get_adaptive_cutoffs_solver
+        adaptive_fn = partial(
+            get_adaptive_cutoffs_solver,
+            segment_sum=_per_center_sum(express.solver, centers, num_atoms),
+        )
     else:
         raise ValueError(
             f"adaptive_cutoff_method must be 'grid' or 'solver', got {method!r}"

@@ -271,6 +271,7 @@ class UPETCalculator(BaseCalculator):
                 self._model.cutoff,
                 self._model.cutoff_width_adaptive,
                 method=self._model.adaptive_cutoff_method,
+                express=self.express,
             )
             k_sel_actual = max(int(selection.counts.max()), 1)
             # The selection's real reach, for tuning cutoff_override.
