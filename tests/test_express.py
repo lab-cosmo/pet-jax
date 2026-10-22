@@ -26,6 +26,7 @@ CASES = {
     # narrow enough that most atoms need an extra tile (all 108 of the large
     # frame on the 16-neighbour checkpoint), while the widest atom (21) fits two
     "flat-tile12": Express(tokens="flat", attention_tile=12),
+    "flat-tile12-fold": Express(tokens="flat", attention_tile=12, fold_extra_block=True),
 }
 
 RTOL_ENERGY = 1e-11

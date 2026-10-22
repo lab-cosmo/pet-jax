@@ -178,9 +178,10 @@ class Backbone(nn.Module):
     the attention core gathers tiles of width ``W = tile_tokens.shape[1] + 1``
     (centre in slot 0). Without ``attention_tile`` that is one tile of
     ``k_sel + 1``; with it, an atom spilling past ``W - 1`` neighbours has one
-    extra tile and its softmax runs across both (``_attention_tiles``).
-    Either way the result is the padded layout's to
-    summation order, with the same parameter tree.
+    extra tile and its softmax runs across both (``_attention_tiles``);
+    ``fold_extra_block`` computes the extra tiles' own block in the
+    rectangular pass. Either way the result is the padded layout's to summation
+    order, with the same parameter tree.
     """
 
     d_pet: int = 128
@@ -328,6 +329,7 @@ class Backbone(nn.Module):
                     d_ff=self.d_feedforward,
                     num_heads=self.num_heads,
                     temperature=self.attention_temperature,
+                    fold_extra_block=self.fold_extra_block,
                     name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
                 )(node, edge, cutoffs_tokens, mask, tiles)
 
@@ -474,6 +476,7 @@ class TransformerLayer(nn.Module):
     d_ff: int
     num_heads: int
     temperature: float = 1.0
+    fold_extra_block: bool = False
 
     @nn.compact
     def __call__(self, node, edge, cutoffs, mask, tiles=None):
@@ -505,7 +508,7 @@ class TransformerLayer(nn.Module):
             return nn.Dense(d_node, name="center_mlp_out")(v * jax.nn.sigmoid(g))
 
         # PreLN transformer
-        attn = Attention(self.num_heads, self.temperature)(
+        attn = Attention(self.num_heads, self.temperature, self.fold_extra_block)(
             rms_norm(tokens, name="norm_attn"), cutoffs, mask, tiles
         )
         if tiles is None:
@@ -537,6 +540,7 @@ class Attention(nn.Module):
 
     num_heads: int
     temperature: float = 1.0
+    fold_extra_block: bool = False
 
     @nn.compact
     def __call__(self, x, cutoffs, mask, tiles=None):
@@ -585,7 +589,7 @@ class Attention(nn.Module):
                 q, k, v, bias=bias[:, None, None, :], mask=mask[:, None, None, :]
             )
         else:
-            out = _attention_tiles(q, k, v, bias, mask, tiles)
+            out = _attention_tiles(q, k, v, bias, mask, tiles, self.fold_extra_block)
 
         # Back to the flat list before the output projection, which runs unpadded.
         return nn.Dense(F, name="out")(tiles.scatter(out.reshape(T, W, F)))
@@ -649,7 +653,7 @@ def token_tiles(tile_tokens, extra_atoms, atom_mask, P):
     return TokenTiles(rows, slots, mask, extra_atoms, extra_of)
 
 
-def _attention_tiles(q, k, v, bias, mask, tiles):
+def _attention_tiles(q, k, v, bias, mask, tiles, fold):
     """Attention over tiles where an atom may own two, ``q, k, v`` ``[T, W, H, d]``
     (``q`` already over the temperature), ``bias`` / ``mask`` ``[T, W]`` of
     the key slots; returns ``[T, W, H, d]``.
@@ -657,7 +661,8 @@ def _attention_tiles(q, k, v, bias, mask, tiles):
     A query sees all of its atom's keys: the diagonal blocks (first tile
     against itself) are one rectangular pass over the first ``N`` tiles; an
     atom with an extra tile adds the blocks (first, extra), (extra, first) and
-    (extra, extra), computed on the ``E`` extra tiles only.
+    (extra, extra), computed on the ``E`` extra tiles only. ``fold`` runs the
+    (extra, extra) block inside the rectangular pass instead, over all ``T``.
 
     Each query row's softmax spans its blocks in two passes: block maxima,
     then with the final maximum ``m`` (``stop_gradient``, as in
@@ -670,6 +675,7 @@ def _attention_tiles(q, k, v, bias, mask, tiles):
     T, W, H, d = q.shape
     E = tiles.extra_atoms.shape[0]
     N = T - E
+    D = T if fold else N
     q = q / jnp.sqrt(d).astype(q.dtype)
     big_neg = jnp.finfo(q.dtype).min
 
@@ -695,20 +701,27 @@ def _attention_tiles(q, k, v, bias, mask, tiles):
     bias_a, mask_a = first_of_extra(bias), first_of_extra(mask, False)
     q_x, k_x, v_x, bias_x, mask_x = q[N:], k[N:], v[N:], bias[N:], mask[N:]
 
-    s_d = scores(q[:N], k[:N], bias[:N], mask[:N])  # [N, H, W, W]
+    s_d = scores(q[:D], k[:D], bias[:D], mask[:D])  # [D, H, W, W]
     s_ax = scores(q_a, k_x, bias_x, mask_x)  # (first, extra), [E, H, W, W]
     s_xa = scores(q_x, k_a, bias_a, mask_a)  # (extra, first)
-    s_xx = scores(q_x, k_x, bias_x, mask_x)  # (extra, extra)
     m_d, m_ax, m_xa = s_d.max(axis=-1), s_ax.max(axis=-1), s_xa.max(axis=-1)
-    m_xx = s_xx.max(axis=-1)
+    if fold:
+        m_xx = m_d[N:]
+    else:
+        s_xx = scores(q_x, k_x, bias_x, mask_x)  # (extra, extra)
+        m_xx = s_xx.max(axis=-1)
 
     m_first = jax.lax.stop_gradient(jnp.maximum(m_d[:N], extra_of_atom(m_ax, big_neg)))
     m_extra = jax.lax.stop_gradient(jnp.maximum(m_xa, m_xx))
 
-    l_d, o_d = accumulate(s_d, m_first, v[:N])
+    m_rows = jnp.concatenate([m_first, m_extra]) if fold else m_first
+    l_d, o_d = accumulate(s_d, m_rows, v[:D])
     l_ax, o_ax = accumulate(s_ax, first_of_extra(m_first), v_x)
     l_xa, o_xa = accumulate(s_xa, m_extra, v_a)
-    l_xx, o_xx = accumulate(s_xx, m_extra, v_x)
+    if fold:
+        l_xx, o_xx = l_d[N:], o_d[N:]
+    else:
+        l_xx, o_xx = accumulate(s_xx, m_extra, v_x)
 
     l = jnp.concatenate([l_d[:N] + extra_of_atom(l_ax, 0), l_xa + l_xx])  # [T, H, W]
     o = jnp.concatenate([o_d[:N] + extra_of_atom(o_ax, 0), o_xa + o_xx])  # [T, W, H, d]

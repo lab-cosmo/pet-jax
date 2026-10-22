@@ -107,11 +107,13 @@ def test_extra_path_absent(checkpoint, atoms, monkeypatch):
     assert calc._structure["tile_sizer"].shape == (0,)
 
 
-def test_forward_over_reverse(checkpoint, atoms):
+@pytest.mark.parametrize("fold", [False, True])
+def test_forward_over_reverse(checkpoint, atoms, fold):
     """``jax.jvp`` of ``jax.grad`` (Hessian-vector products) goes through the
     tiles and the cross-tile softmax and matches the padded layout's."""
+    express = Express(tokens="flat", attention_tile=12, fold_extra_block=fold)
     hvps = []
-    for ex in (Express(), TILED):
+    for ex in (Express(), express):
         calc, _ = calculator(checkpoint, atoms, ex)
         model, structure = calc._model, calc._structure
 
