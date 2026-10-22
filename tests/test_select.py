@@ -280,7 +280,7 @@ def solver_structures(mini_xyz):
     return [to_structure(a, cutoff=7.5, skin=0.0) for a in atoms]
 
 
-def _solve(structure, hypers, dtype, express=None):
+def _solve(structure, hypers, dtype, express=None, seed=None):
     """Cutoffs, selection and d(sum_i c_i r_i)/d positions of ``_select_edges``."""
     import jax.numpy as jnp
 
@@ -310,6 +310,7 @@ def _solve(structure, hypers, dtype, express=None):
             width,
             method="solver",
             express=express,
+            seed=seed,
         )
         return jnp.sum(weights * out[0]), out
 
@@ -443,3 +444,60 @@ def test_sorted_window_overflow(solver_structures):
             1
         ].overflow
     )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("hypers", list(SOLVER_HYPERS), ids=list(SOLVER_HYPERS))
+@pytest.mark.parametrize(
+    "solver", ["segment_sum", "sorted_segment_sum", "blocked_prefix_sum"]
+)
+def test_seeded_solve(solver, hypers, dtype, solver_structures):
+    """Seeded with a frame's cutoffs, the solve on that frame after a small
+    random step converges in 3 Newton steps to the unseeded root, with the
+    same selection and gradient (5 steps in float64 at w=0.5); a seed with
+    ``inf`` displacement is ignored.
+    The reference takes 40 steps: in float64 at w=0.5 the stock 10 can stop
+    short (a shoulder between shells makes Newton bisect). The blocked sum's
+    root is defined only to its own rounding, so two iteration paths may land
+    up to twice that apart."""
+    from petjax.express import Express
+
+    unseeded = Express(solver=solver, solver_iterations=40)
+    rng = np.random.default_rng(3)
+    if solver == "blocked_prefix_sum":
+        atol = 8e-6 if dtype == "float32" else 4e-14
+    with jax.enable_x64(dtype == "float64"):
+        for structure in solver_structures:
+            seed, _, _ = _solve(structure, SOLVER_HYPERS[hypers], dtype, unseeded)
+            step = rng.normal(scale=0.01, size=structure["positions"].shape)
+            step *= structure["atom_mask"][:, None]
+            displaced = {**structure, "positions": structure["positions"] + step}
+            delta = np.linalg.norm(step, axis=1).max()
+
+            def solve(iterations, delta=delta):
+                express = Express(
+                    solver=solver, seed_cutoffs=True, solver_iterations=iterations
+                )
+                return _solve(
+                    displaced, SOLVER_HYPERS[hypers], dtype, express, seed=(seed, delta)
+                )
+
+            c0, s0, g0 = _solve(displaced, SOLVER_HYPERS[hypers], dtype, unseeded)
+            if solver != "blocked_prefix_sum":
+                atol = 2 * np.spacing(c0)
+            c1, s1, g1 = solve(3)
+            np.testing.assert_array_less(np.abs(c1 - c0), atol * 1.001)
+            assert np.array_equal(s1, s0)
+            if (dtype, hypers) == ("float64", "k8_w05"):
+                # The IFT step makes the value exact, but takes its slope at
+                # the iterate: the float64 gradient at w=0.5 wants 5 steps.
+                _, _, g1 = solve(5)
+            gtol = 1e-4 if dtype == "float32" else 1e-12
+            np.testing.assert_allclose(g1, g0, rtol=0, atol=gtol * np.abs(g0).max())
+
+            # Ignored: the stock 10 steps from [0, cutoff], whatever was asked.
+            c2, _, _ = solve(3, delta=np.inf)
+            c3, _, _ = _solve(
+                displaced, SOLVER_HYPERS[hypers], dtype, Express(solver=solver)
+            )
+            np.testing.assert_array_equal(c2, c3)

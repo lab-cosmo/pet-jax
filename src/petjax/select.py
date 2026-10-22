@@ -69,7 +69,9 @@ def truncate(
     inputs beyond the geometry (``charge``, ``spin_multiplicity``) pass
     through untouched when present. ``express`` selects the performance
     switches (``Express``); with ``neighbor_list="device"`` the raw list is
-    built here from ``positions`` and ``cell`` instead of read off the dict."""
+    built here from ``positions`` and ``cell`` instead of read off the dict.
+    With ``seed_cutoffs``, the optional ``cutoff_seed`` / ``seed_displacement``
+    entries are passed on to ``truncate_edges``."""
     express = Express.from_any(express)
     if express.neighbor_list == "device":
         raise NotImplementedError("neighbor_list='device' is not implemented yet")
@@ -95,6 +97,8 @@ def truncate(
         method=method,
         no_shadow=no_shadow,
         express=express,
+        cutoff_seed=structure.get("cutoff_seed"),
+        seed_displacement=structure.get("seed_displacement"),
     )
     for key in CONDITIONING_KEYS:
         if key in structure:
@@ -117,6 +121,8 @@ def truncate_edges(
     method="grid",
     no_shadow=False,
     express=None,
+    cutoff_seed=None,
+    seed_displacement=None,
 ):
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
@@ -137,10 +143,18 @@ def truncate_edges(
     ``express`` picks the solver and the token layout (``Express``); the
     ``sorted_window`` solver and the ``flat`` layout pack from the sorted
     candidate prefix instead of ``_pack_selected_to_flat``.
+
+    With ``express.seed_cutoffs``, ``cutoff_seed`` (``[N]``, the cutoffs of an
+    earlier call) and ``seed_displacement`` (scalar ``delta``: no pair distance
+    changed by more than ``2 delta`` since) start the solve near the old root;
+    either ``None`` means no seed. See ``get_adaptive_cutoffs_solver``.
     """
     express = Express.from_any(express)
     N = atomic_numbers.shape[0]
 
+    seed = None
+    if cutoff_seed is not None and seed_displacement is not None:
+        seed = (cutoff_seed, seed_displacement)
     atomic_cutoffs, pair_cutoffs, selected, sorted_pairs, solver_overflow = _select_edges(
         R_ij,
         centers,
@@ -153,6 +167,7 @@ def truncate_edges(
         method=method,
         no_shadow=no_shadow,
         express=express,
+        seed=seed,
     )
     if express.tokens != "padded":
         raise NotImplementedError(f"tokens={express.tokens!r} is not implemented yet")
@@ -356,6 +371,7 @@ def get_adaptive_cutoffs_solver(
     cutoff_width,
     segment_sum=None,
     iterations=10,
+    seed=None,
 ):
     """Per-atom adaptive cutoffs via a Newton-bisection root find on the
     smoothed neighbor count (metatrain's "solver" method, the default for
@@ -373,6 +389,17 @@ def get_adaptive_cutoffs_solver(
     ``None`` is ``jax.ops.segment_sum`` over ``centers`` (``_per_center_sum``
     builds the variants). ``iterations`` is the number of Newton-bisection
     steps.
+
+    ``seed = (r_old, delta)`` starts from earlier cutoffs ``r_old``, with
+    ``delta`` such that no pair distance changed by more than ``2 delta``
+    since. The bump is non-increasing in the distance and the baseline
+    increasing in ``r``, so the root then moved by less than ``2 delta``: the
+    bracket is ``[r_old - 2 delta, r_old + 2 delta]`` within ``[0, cutoff]``
+    and the iteration starts at ``r_old``. The root is unique, so this changes
+    the path, not the result. A seed with ``2 delta`` beyond the bump width
+    (or ``inf``, for none) is ignored, since ``iterations`` sized for a seeded
+    solve need not converge from that far; an unseeded solve takes at least
+    the stock 10 steps.
     """
     if segment_sum is None:
         segment_sum = _per_center_sum("segment_sum", centers, num_atoms)
@@ -395,6 +422,17 @@ def get_adaptive_cutoffs_solver(
     r_hi = jax.lax.pcast(
         jnp.full(num_atoms, cutoff, dtype=r_ij.dtype), varying, to="varying"
     )
+    r_start = 0.5 * r_hi
+    if seed is not None:
+        r_old, delta = (jax.lax.stop_gradient(jnp.asarray(x, r_ij.dtype)) for x in seed)
+        seeded = 2 * delta <= cutoff_width
+        # A cutoff clamped at cutoff/16 is not a root; the root is below it.
+        r_lo = jnp.where(
+            seeded & (r_old > cutoff / 16), jnp.maximum(r_old - 2 * delta, 0), r_lo
+        )
+        r_hi = jnp.where(seeded, jnp.minimum(r_old + 2 * delta, cutoff), r_hi)
+        r_start = jnp.where(seeded, r_old, r_start)
+        iterations = jnp.where(seeded, iterations, max(iterations, 10))
 
     # 10 iterations converge to fp32 precision (upstream's choice). Newton
     # steps that would leave the bracket (flat shoulders between bumps) fall
@@ -422,9 +460,7 @@ def get_adaptive_cutoffs_solver(
         inside = (r_newton >= r_lo) & (r_newton <= r_hi)
         return r_lo, r_hi, jnp.where(inside, r_newton, 0.5 * (r_lo + r_hi))
 
-    _, _, r = jax.lax.fori_loop(
-        0, iterations, newton_bisection_step, (r_lo, r_hi, 0.5 * r_hi)
-    )
+    _, _, r = jax.lax.fori_loop(0, iterations, newton_bisection_step, (r_lo, r_hi, r_start))
     _, dn_root = _n_total_and_dn_dr(
         r,
         r_ij_d,
@@ -756,6 +792,7 @@ def _select_edges(
     method="grid",
     no_shadow=False,
     express=None,
+    seed=None,
 ):
     """Shared selection core: consumed by ``_select_edges_kernel`` (host-side)
     and ``truncate_edges`` (forward). Returns a ``_Selected``: ``(atomic_cutoffs,
@@ -764,11 +801,12 @@ def _select_edges(
 
     ``method`` picks the per-atom cutoff algorithm (a trace-time branch);
     grid and solver take the same arguments. ``express.solver`` picks the
-    variant of the solver method; the grid method has none."""
+    variant of the solver method; the grid method has none. ``seed`` (see
+    ``get_adaptive_cutoffs_solver``) is read only with ``express.seed_cutoffs``
+    and by the segment-sum variants: the window solver has its own bracket,
+    and seeding it is a no-op."""
     express = Express.from_any(express)
     r_ij = safe_norm(R_ij, axis=-1)
-    if express.seed_cutoffs and method == "solver":
-        raise NotImplementedError("seed_cutoffs is not implemented yet")
     sorted_pairs, overflow = None, False
     if method == "grid":
         adaptive_fn = get_adaptive_cutoffs
@@ -787,12 +825,15 @@ def _select_edges(
         )
         adaptive_fn = None
     elif method == "solver":
+        iterations = express.solver_iterations
+        iterations = 10 if iterations is None else iterations
+        if express.seed_cutoffs and seed is None:
+            iterations = max(iterations, 10)
         adaptive_fn = partial(
             get_adaptive_cutoffs_solver,
             segment_sum=_per_center_sum(express.solver, centers, num_atoms),
-            iterations=10
-            if express.solver_iterations is None
-            else express.solver_iterations,
+            iterations=iterations,
+            seed=seed if express.seed_cutoffs else None,
         )
     else:
         raise ValueError(

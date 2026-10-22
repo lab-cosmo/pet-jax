@@ -112,6 +112,8 @@ def get_predict_fn(
         }
         if stress:
             result["stress"] = stress_out
+        if express.seed_cutoffs:
+            result["atomic_cutoffs"] = jax.lax.stop_gradient(aux["atomic_cutoffs"])
         return result
 
     return predict_fn
@@ -162,6 +164,8 @@ def _select_and_predict(
         "max_cutoff": jnp.max(jnp.where(atom_mask, truncation.atomic_cutoffs, 0.0)),
         "k_max": jnp.max(jnp.where(atom_mask, truncation.counts, 0)),
     }
+    if express is not None and Express.from_any(express).seed_cutoffs:
+        aux["atomic_cutoffs"] = truncation.atomic_cutoffs
     if isinstance(out, dict):
         energy = jnp.sum(out["energy"])
         if "forces" in out:

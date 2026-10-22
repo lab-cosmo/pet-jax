@@ -23,6 +23,11 @@ CASES = {
     "sorted_segment_sum": Express(solver="sorted_segment_sum"),
     "blocked_prefix_sum": Express(solver="blocked_prefix_sum"),
     "sorted_window": Express(solver="sorted_window"),
+    "seed_cutoffs": Express(seed_cutoffs=True, solver_iterations=3),
+    "blocked_seeded": Express(
+        solver="blocked_prefix_sum", seed_cutoffs=True, solver_iterations=3
+    ),
+    "sorted_window_seeded": Express(solver="sorted_window", seed_cutoffs=True),
 }
 
 RTOL_ENERGY = 1e-11
@@ -76,6 +81,37 @@ def stock(checkpoint, frames):
 @pytest.mark.parametrize("name", [n for n in CASES if n != "stock"])
 def test_express_matches_stock(name, checkpoint, frames, stock):
     assert_equivalent(stock, predictions(checkpoint, frames, CASES[name]))
+
+
+@pytest.fixture(scope="module")
+def trajectory(frames):
+    """The periodic 108-atom frame, then small random steps and one strain:
+    what a seeded solve sees in MD or a relaxation."""
+    rng = np.random.default_rng(0)
+    atoms = frames[-1].copy()
+    out = [atoms.copy()]
+    for _ in range(3):
+        atoms.positions += rng.normal(scale=0.01, size=atoms.positions.shape)
+        out.append(atoms.copy())
+    atoms.set_cell(atoms.cell[:] * 1.002, scale_atoms=True)
+    out.append(atoms.copy())
+    return out
+
+
+@pytest.mark.parametrize("name", ["seed_cutoffs", "blocked_seeded", "sorted_window_seeded"])
+def test_seeded_trajectory(name, checkpoint, trajectory):
+    """Seeded from the previous call along a trajectory, the solve reproduces
+    the stock path; the seed is actually in use after the first call."""
+    stock = predictions(checkpoint, trajectory, Express())
+    assert_equivalent(stock, predictions(checkpoint, trajectory, CASES[name]))
+
+    calc = UPETCalculator.from_checkpoint(str(checkpoint), express=CASES[name])
+    for atoms in trajectory[:2]:
+        atoms = atoms.copy()
+        atoms.calc = calc
+        atoms.get_potential_energy()
+    delta = float(calc._structure["seed_displacement"])
+    assert 0 < delta < 0.1
 
 
 def test_call_stats(checkpoint, frames, stock):

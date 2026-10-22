@@ -85,6 +85,8 @@ class UPETCalculator(BaseCalculator):
         # the largest adaptive cutoff and the largest selected count. What the
         # cutoff guard and the benchmark driver watch.
         self.call_stats = None
+        # (cutoffs, positions, cell) of the last call, for express.seed_cutoffs.
+        self._seed = None
         if self.express.cutoff_guard:
             raise NotImplementedError("cutoff_guard is not implemented yet")
         if self.express.neighbor_list != "host":
@@ -190,6 +192,9 @@ class UPETCalculator(BaseCalculator):
             "max_cutoff": float(results["max_cutoff"]),
             "k_max": int(results["k_max"]),
         }
+        if self.express.seed_cutoffs:
+            cell = np.array(atoms.get_cell()[:])
+            self._seed = (results["atomic_cutoffs"], atoms.get_positions().copy(), cell)
 
         n_real = len(atoms)
         energy = float(results["energy"])
@@ -293,16 +298,17 @@ class UPETCalculator(BaseCalculator):
 
         # k_sel_sizer carries k_sel into the shape-agnostic predict_fn via its
         # shape; the JIT retraces when k_sel (or any other shape) changes.
-        self._structure = {
-            **self._to_jax_structure(structure),
-            **self._conditioning(atoms, N_padded),
-            "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
-        }
         max_shift = (
             int(np.max(np.abs(structure["cell_shifts"])))
             if len(structure["cell_shifts"]) > 0
             else 0
         )
+        self._structure = {
+            **self._to_jax_structure(structure),
+            **self._conditioning(atoms, N_padded),
+            **self._seed_inputs(atoms, N_padded, max_shift),
+            "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
+        }
         self._nl_cache.save_reference(atoms, max_cell_shift=max_shift)
 
         # Composition shifts are constant w.r.t. positions; Python fp64 sum
@@ -418,6 +424,27 @@ class UPETCalculator(BaseCalculator):
             "positions": jnp.array(positions, dtype=self._dtype),
             "cell": jnp.array(cell, dtype=self._dtype),
             **self._conditioning(atoms, N_padded),
+            **self._seed_inputs(atoms, N_padded, self._nl_cache._max_cell_shift),
+        }
+
+    def _seed_inputs(self, atoms, N_padded, max_cell_shift):
+        """``cutoff_seed`` and ``seed_displacement`` for ``seed_cutoffs``: the
+        last call's cutoffs and half the largest change of any pair distance
+        since (atom displacements plus the cell change through the largest
+        image shift). Always present, so the forward is traced once; ``inf``
+        when there is no seed (first call, other atoms)."""
+        if not self.express.seed_cutoffs:
+            return {}
+        cutoffs, delta = jnp.zeros(N_padded, self._dtype), np.inf
+        if self._seed is not None and self._seed[0].shape[0] == N_padded:
+            cutoffs, positions, cell = self._seed
+            if len(positions) == len(atoms):
+                moved = np.linalg.norm(atoms.get_positions() - positions, axis=1).max()
+                strained = np.linalg.norm(atoms.get_cell()[:] - cell, axis=1).sum()
+                delta = moved + 0.5 * (max_cell_shift or 0) * strained
+        return {
+            "cutoff_seed": cutoffs,
+            "seed_displacement": jnp.asarray(delta, self._dtype),
         }
 
     def _conditioning(self, atoms, N_padded):
