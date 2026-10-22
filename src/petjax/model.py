@@ -45,6 +45,7 @@ class UPET(nn.Module):
     max_spin_multiplicity: int = 10
     direct_forces: bool = False
     direct_stress: bool = False
+    reverse_unique: bool = False  # see Backbone
 
     @nn.compact
     def __call__(
@@ -74,6 +75,7 @@ class UPET(nn.Module):
             system_conditioning=self.system_conditioning,
             max_charge=self.max_charge,
             max_spin_multiplicity=self.max_spin_multiplicity,
+            reverse_unique=self.reverse_unique,
             name="backbone",
         )(
             R_ij,
@@ -151,6 +153,11 @@ class Backbone(nn.Module):
     tree is fixed by the config alone, not by what ``init`` happened to be
     called with. ``cutoff_function(r, cutoff, width)`` gives the per-pair
     cutoff factor (``cutoff_bump`` for PET-MAD, ``cutoff_cosine`` for FlashMD).
+
+    ``reverse_unique=True`` gathers the reverse messages through an involution
+    (mutual real pairs swap, every other slot maps to itself and gets a zero
+    partner message, as the masked sentinel gives it otherwise), so the gather
+    has unique indices and its transpose needs no scatter-add.
     """
 
     d_pet: int = 128
@@ -169,6 +176,7 @@ class Backbone(nn.Module):
     final_message_passing: bool = True
     cutoff_function: Callable = cutoff_bump
     species_embedding: bool = True
+    reverse_unique: bool = False
 
     @nn.compact
     def __call__(
@@ -219,6 +227,11 @@ class Backbone(nn.Module):
         central = atom_mask[:, None].astype(cutoffs.dtype)
         cutoffs_tokens = jnp.concatenate([central, cutoffs.reshape(N, n)], axis=1)
         mask = jnp.concatenate([atom_mask[:, None], pair_mask.reshape(N, n)], axis=1)
+
+        if self.reverse_unique:
+            idx = jnp.arange(P)
+            paired = pair_mask & pair_mask[reverse] & (reverse[reverse] == idx)
+            reverse = jnp.where(paired, reverse, idx)
 
         # Initial edge features; species embeddings index by atomic number Z
         # (table size max_atomic_number + 1, row 0 unused).
@@ -292,7 +305,11 @@ class Backbone(nn.Module):
             edge_flat = edge.reshape(P, d_pet) * pair_mask[..., None]
             messages = messages + edge_flat
             if layer_idx < self.num_gnn_layers - 1 or self.final_message_passing:
-                reversed_flat = edge_flat[reverse]
+                if self.reverse_unique:
+                    reversed_flat = edge_flat.at[reverse].get(unique_indices=True)
+                    reversed_flat = reversed_flat * paired[..., None]
+                else:
+                    reversed_flat = edge_flat[reverse]
                 combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
                 combined = nn.LayerNorm(epsilon=1e-5, name=f"comb_norms_{layer_idx}")(
                     combined

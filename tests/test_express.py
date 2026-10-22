@@ -20,6 +20,7 @@ CHECKPOINTS = ("pet-mad-xs", "pet-mad-xs-v1.6")  # grid and solver cutoffs
 
 CASES = {
     "stock": Express(),
+    "reverse_unique": Express(reverse_unique=True),
 }
 
 RTOL_ENERGY = 1e-11
