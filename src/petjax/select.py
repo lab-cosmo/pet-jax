@@ -32,6 +32,7 @@ from functools import partial
 
 from typing import NamedTuple
 
+from .express import Express
 from .utils import cutoff_bump, edge_displacements, safe_norm
 
 # Per-atom model inputs a structure dict may carry besides the geometry.
@@ -60,12 +61,18 @@ def truncate(
     cutoff_width_adaptive,
     method="grid",
     no_shadow=False,
+    express=None,
 ):
     """Adaptive selection + pack for a single-structure dict: derive ``R_ij``
     from ``(positions, cell_shifts, cell)``, read ``k_sel`` off the
     ``k_sel_sizer`` carrier, delegate to ``truncate_edges``. Per-atom model
     inputs beyond the geometry (``charge``, ``spin_multiplicity``) pass
-    through untouched when present."""
+    through untouched when present. ``express`` selects the performance
+    switches (``Express``); with ``neighbor_list="device"`` the raw list is
+    built here from ``positions`` and ``cell`` instead of read off the dict."""
+    express = Express.from_any(express)
+    if express.neighbor_list == "device":
+        raise NotImplementedError("neighbor_list='device' is not implemented yet")
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],
@@ -87,6 +94,7 @@ def truncate(
         cutoff_width_adaptive,
         method=method,
         no_shadow=no_shadow,
+        express=express,
     )
     for key in CONDITIONING_KEYS:
         if key in structure:
@@ -108,6 +116,7 @@ def truncate_edges(
     cutoff_width_adaptive,
     method="grid",
     no_shadow=False,
+    express=None,
 ):
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
@@ -124,7 +133,12 @@ def truncate_edges(
     ones (atoms sample-contiguous, padding at the tail), since the selection
     couples pairs only through their center/other atoms. Requires ``centers``
     non-decreasing; ``k_sel`` must be a static int under jit.
+
+    ``express`` picks the solver and the token layout (``Express``); the
+    ``sorted_window`` solver and the ``flat`` layout pack from the sorted
+    candidate prefix instead of ``_pack_selected_to_flat``.
     """
+    express = Express.from_any(express)
     N = atomic_numbers.shape[0]
 
     atomic_cutoffs, pair_cutoffs, selected = _select_edges(
@@ -138,7 +152,10 @@ def truncate_edges(
         cutoff_width_adaptive,
         method=method,
         no_shadow=no_shadow,
+        express=express,
     )
+    if express.tokens != "padded":
+        raise NotImplementedError(f"tokens={express.tokens!r} is not implemented yet")
     slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
         selected, centers, N, k_sel
     )
@@ -447,17 +464,25 @@ def _select_edges(
     cutoff_width_adaptive,
     method="grid",
     no_shadow=False,
+    express=None,
 ):
     """Shared selection core: consumed by ``_select_edges_kernel`` (host-side)
     and ``truncate_edges`` (forward). Returns ``(atomic_cutoffs, pair_cutoffs,
     selected)``.
 
     ``method`` picks the per-atom cutoff algorithm (a trace-time branch);
-    grid and solver take the same arguments."""
+    grid and solver take the same arguments. ``express.solver`` picks the
+    variant of the solver method; the grid method has none."""
+    express = Express.from_any(express)
     r_ij = safe_norm(R_ij, axis=-1)
     if method == "grid":
         adaptive_fn = get_adaptive_cutoffs
     elif method == "solver":
+        if express.solver != "segment_sum" or express.seed_cutoffs:
+            raise NotImplementedError(
+                f"solver={express.solver!r}, seed_cutoffs={express.seed_cutoffs} "
+                "is not implemented yet"
+            )
         adaptive_fn = get_adaptive_cutoffs_solver
     else:
         raise ValueError(

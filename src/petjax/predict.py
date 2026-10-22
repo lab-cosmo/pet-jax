@@ -13,12 +13,15 @@ argnums=0)(params, batch)`` comes for free.
 import jax
 import jax.numpy as jnp
 
+from .express import Express
 from .select import truncate
 
 # -- predict_fn factory --
 
 
-def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=None):
+def get_predict_fn(
+    model, stress=True, no_shadow=False, num_neighbors_adaptive=None, express=None
+):
     """Build a JIT-compiled ``predict_fn(params, structure) -> dict``.
 
     Shape-agnostic: shapes are read off the input arrays (``positions.shape[0]``
@@ -35,8 +38,16 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     side must be passed the same value. Energy returned already includes the
     energy scale; composition shifts are the caller's
     responsibility (applied post-JIT in fp64 by ``UPETCalculator``). See
-    ``_select_and_predict`` for ``no_shadow``.
+    ``_select_and_predict`` for ``no_shadow``. ``express`` (an ``Express``, a
+    dict of its fields, or ``None`` for the stock path) selects the
+    performance switches; the model must carry the matching attributes
+    (``Express.model_updates``), which ``UPETCalculator`` arranges.
+
+    Besides energy, forces, stress and ``overflow``, the result carries the
+    selection's reach for the caller's guards: ``max_cutoff`` (largest adaptive
+    cutoff of a real atom) and ``k_max`` (largest selected count).
     """
+    express = Express.from_any(express)
     if num_neighbors_adaptive is None:
         num_neighbors_adaptive = model.num_neighbors_adaptive
     cutoff_width_adaptive = model.cutoff_width_adaptive
@@ -60,6 +71,7 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
             adaptive_cutoff_method,
             epsilon=epsilon,
             no_shadow=no_shadow,
+            express=express,
         )
 
     def strained_energy_fn(p, s, eps):
@@ -91,7 +103,13 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
             forces = aux["forces"]
             stress_out = aux.get("stress")
 
-        result = {"energy": energy, "forces": forces, "overflow": aux["overflow"]}
+        result = {
+            "energy": energy,
+            "forces": forces,
+            "overflow": aux["overflow"],
+            "max_cutoff": aux["max_cutoff"],
+            "k_max": aux["k_max"],
+        }
         if stress:
             result["stress"] = stress_out
         return result
@@ -112,11 +130,12 @@ def _select_and_predict(
     adaptive_cutoff_method,
     epsilon=None,
     no_shadow=False,
+    express=None,
 ):
     """Thin: (optional) strain → truncate → model → (energy, aux).
 
-    Returns ``(total_energy, aux)`` where ``aux`` always carries ``overflow``
-    and, for a direct-head model, the per-call ``forces`` (``[N, 3]``) and
+    Returns ``(total_energy, aux)`` where ``aux`` always carries ``overflow``,
+    ``max_cutoff`` and ``k_max`` and, for a direct-head model, the per-call ``forces`` (``[N, 3]``) and
     ``stress`` (``[3, 3]``, summed over atoms). Composition shifts are applied
     post-JIT by the caller in fp64. ``no_shadow=True`` cuts gradients through
     the adaptive-cutoff function while leaving its values in the forward pass.
@@ -134,9 +153,15 @@ def _select_and_predict(
         cutoff_width_adaptive,
         method=adaptive_cutoff_method,
         no_shadow=no_shadow,
+        express=express,
     )
     out = model.apply(params, **truncated)
-    aux = {"overflow": truncation.overflow}
+    atom_mask = structure["atom_mask"]
+    aux = {
+        "overflow": truncation.overflow,
+        "max_cutoff": jnp.max(jnp.where(atom_mask, truncation.atomic_cutoffs, 0.0)),
+        "k_max": jnp.max(jnp.where(atom_mask, truncation.counts, 0)),
+    }
     if isinstance(out, dict):
         energy = jnp.sum(out["energy"])
         if "forces" in out:

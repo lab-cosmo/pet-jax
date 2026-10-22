@@ -11,6 +11,7 @@ import warnings
 from ase.calculators.calculator import BaseCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
+from .express import Express
 from .predict import get_predict_fn
 from .select import select_edges
 from .structure import _bucket_or, conditioning_inputs, read_conditioning, to_structure
@@ -45,10 +46,15 @@ class UPETCalculator(BaseCalculator):
         cutoff_override=None,
         add_offset=True,
         debug=False,
+        express=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self._model = model
+        # Performance switches (see express.py); the model-level ones become
+        # module attributes, so the stock model is untouched when all are off.
+        self.express = Express.from_any(express)
+        updates = self.express.model_updates()
+        self._model = model.clone(**updates) if updates else model
         self._metadata = metadata
         self._skin = skin
         self._stress = stress
@@ -75,6 +81,14 @@ class UPETCalculator(BaseCalculator):
         # Cached max selected adaptive cutoff from the last sizing pass;
         # carried across rebuilds that reuse k_sel (which skip the sizing run).
         self._max_selected_cutoff = None
+        # Per-call reach of the selection, read off the forward every step:
+        # the largest adaptive cutoff and the largest selected count. What the
+        # cutoff guard and the benchmark driver watch.
+        self.call_stats = None
+        if self.express.cutoff_guard:
+            raise NotImplementedError("cutoff_guard is not implemented yet")
+        if self.express.neighbor_list != "host":
+            raise NotImplementedError("neighbor_list='device' is not implemented yet")
 
         # cutoff_override narrows ONLY the vesin raw-NL query radius (to
         # cutoff_override + skin). The UPET model is untouched — the
@@ -115,6 +129,7 @@ class UPETCalculator(BaseCalculator):
             stress=self._stress,
             no_shadow=self._no_shadow,
             num_neighbors_adaptive=self._num_neighbors_adaptive,
+            express=self.express,
         )
         self._N_padded = None
         self._n_pair_padded = None
@@ -170,6 +185,11 @@ class UPETCalculator(BaseCalculator):
                     "UPETCalculator: cannot recover from overflow "
                     f"after retry (k_sel={self._k_sel})"
                 )
+
+        self.call_stats = {
+            "max_cutoff": float(results["max_cutoff"]),
+            "k_max": int(results["k_max"]),
+        }
 
         n_real = len(atoms)
         energy = float(results["energy"])
@@ -323,6 +343,7 @@ class UPETCalculator(BaseCalculator):
             "cutoff_trained": self._metadata["config"]["cutoff"],
             "retrace": shape_changed,  # predict_fn retraces iff a shape changed
             "overflow_retry": force_recompute_k_sel,
+            "express": self.express.as_dict(),
         }
         if self._debug:
             self._print_debug(self.debug_stats)

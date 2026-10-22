@@ -2,6 +2,7 @@
 
 from .calculator import UPETCalculator
 from .convert import convert_checkpoint, load_checkpoint
+from .express import Express
 from .model import (
     MLP,
     UPET,
@@ -32,6 +33,7 @@ __all__ = [
     "SystemConditioning",
     "MLP",
     "UPETCalculator",
+    "Express",
     "cutoff_bump",
     "cutoff_cosine",
     "get_adaptive_cutoffs",
