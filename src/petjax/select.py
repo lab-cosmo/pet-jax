@@ -523,7 +523,53 @@ def _per_center_sum(solver, centers, num_atoms):
             num_segments=num_atoms,
             indices_are_sorted=True,
         )
+    if solver == "blocked_prefix_sum":
+        queries = jnp.arange(num_atoms + 1)
+        bounds = jnp.searchsorted(
+            jnp.asarray(centers), queries, side="left", method="scan_unrolled"
+        )
+        return partial(_blocked_prefix_sum, bounds=bounds)
     raise ValueError(f"no per-center sum for solver {solver!r}")
+
+
+def _blocked_prefix_sum(x, bounds, block=1024):
+    """Sums of ``x`` over the contiguous segments ``[bounds[c], bounds[c + 1])``
+    from a two-level prefix sum: an inclusive cumsum inside blocks of ``block``
+    entries plus an exclusive cumsum of the block totals.
+
+    A segment spanning at most two blocks (any segment of at most ``block``
+    entries) never differences the long prefix: the outer term is the same
+    float twice, exactly zero. Its rounding is then bounded by the running sum
+    over one block, not over the list. A plain prefix-sum difference is not:
+    at the end of a long fp32 list both prefixes are large, and their
+    difference loses the low bits of the segment's sum (cutoffs off by ~1e-4 A).
+    The bound is still looser than the scatter's when a block holds many short
+    segments (a molecule's list fits in one block), by about the number of
+    segments per block."""
+    P = x.shape[0]
+    pad = (-P) % block
+    if pad:
+        x = jnp.concatenate([x, jnp.zeros(pad, x.dtype)])
+    num_blocks = x.shape[0] // block
+    inner = jnp.cumsum(x.reshape(num_blocks, block), axis=1)
+    totals = inner[:, -1]
+    inner = inner.reshape(-1)
+    outer = jnp.concatenate([jnp.zeros(1, x.dtype), jnp.cumsum(totals)])
+
+    starts, ends = bounds[:-1], bounds[1:]
+    nonempty = ends > starts
+    last = jnp.where(nonempty, ends - 1, 0)
+    first_block, last_block = starts // block, last // block
+    at_boundary = starts % block == 0
+    before = jnp.where(at_boundary, 0.0, inner[jnp.where(at_boundary, 0, starts - 1)])
+    through = inner[last]
+    between = (
+        outer[jnp.minimum(last_block, num_blocks)]
+        - outer[jnp.minimum(first_block + 1, num_blocks)]
+    )
+    within = through - before
+    across = (totals[jnp.minimum(first_block, num_blocks - 1)] - before) + through + between
+    return jnp.where(nonempty, jnp.where(first_block == last_block, within, across), 0.0)
 
 
 # -- selection mask: adaptive cutoffs, r_ij <= pair_cutoff --
@@ -554,9 +600,7 @@ def _select_edges(
     if method == "grid":
         adaptive_fn = get_adaptive_cutoffs
     elif method == "solver":
-        if express.solver not in ("segment_sum", "sorted_segment_sum") or (
-            express.seed_cutoffs
-        ):
+        if express.solver == "sorted_window" or express.seed_cutoffs:
             raise NotImplementedError(
                 f"solver={express.solver!r}, seed_cutoffs={express.seed_cutoffs} "
                 "is not implemented yet"

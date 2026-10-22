@@ -242,6 +242,7 @@ SOLVER_HYPERS = {"k16_w1": (16, 7.5, 1.0), "k8_w05": (8, 7.5, 0.5)}
 
 SOLVER_CASES = {
     "sorted_segment_sum": dict(solver="sorted_segment_sum"),
+    "blocked_prefix_sum": dict(solver="blocked_prefix_sum"),
 }
 
 
@@ -319,9 +320,11 @@ def _solve(structure, hypers, dtype, express=None):
 @pytest.mark.parametrize("hypers", list(SOLVER_HYPERS), ids=list(SOLVER_HYPERS))
 @pytest.mark.parametrize("case", list(SOLVER_CASES))
 def test_solver_variant_matches_stock(case, hypers, dtype, solver_structures):
-    """Same root (1 ulp in float32, a few in float64), same selected pairs, and
-    the same IFT gradient as the stock solver, on the mini frames, a dense
-    liquid, and an isolated atom next to a dimer."""
+    """Same root, same selected pairs and the same IFT gradient as the stock
+    solver, on the mini frames, a dense liquid, and an isolated atom next to a
+    dimer. The root differs only by summation order: F is summed in another
+    order, and its rounding divided by dF/dr lands on the cutoff (a few ulps
+    where the count is flat, as in a molecule)."""
     from petjax.express import Express
 
     express = Express(**SOLVER_CASES[case])
@@ -329,9 +332,7 @@ def test_solver_variant_matches_stock(case, hypers, dtype, solver_structures):
         for structure in solver_structures:
             c0, s0, g0 = _solve(structure, SOLVER_HYPERS[hypers], dtype)
             c1, s1, g1 = _solve(structure, SOLVER_HYPERS[hypers], dtype, express)
-            ulps = 1 if dtype == "float32" else 4
-            np.testing.assert_array_less(np.abs(c1 - c0), ulps * np.spacing(c0) * 1.001)
+            atol, gtol = (4e-6, 1e-4) if dtype == "float32" else (1e-14, 1e-12)
+            np.testing.assert_allclose(c1, c0, rtol=0, atol=atol)
             assert np.array_equal(s1, s0)
-            scale = np.abs(g0).max()
-            rtol = 1e-5 if dtype == "float32" else 1e-11
-            np.testing.assert_allclose(g1, g0, rtol=0, atol=rtol * scale)
+            np.testing.assert_allclose(g1, g0, rtol=0, atol=gtol * np.abs(g0).max())
