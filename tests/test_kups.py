@@ -241,6 +241,79 @@ def test_conditioned_matches_calculator(assets_dir, index):
     np.testing.assert_allclose(-out.gradients.positions.data, forces, atol=2e-4)
 
 
+def test_nve_matches_ase(frames, mliap, calculator):
+    """A few velocity-Verlet steps through kUPS's MD propagator land where
+    ASE's do, with the forces seeded on the state the way the first half-kick
+    expects them (kUPS's own driver starts from zero and warms up)."""
+    from ase import units
+    from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
+    from ase.md.verlet import VelocityVerlet
+    from kups.application.md.data import MdParameters, MdState, md_state_from_ase
+    from kups.application.md.simulation import make_md_propagator
+    from kups.application.utils.propagate import make_cycle_function
+    from kups.core.lens import bind, identity_lens
+    from kups.core.propagator import propagate_and_fix
+    from kups.core.utils.jax import key_chain
+
+    @dataclass
+    class MDState(MdState):
+        upet_params: UPETParameters
+
+    steps, dt = 5, 1.0
+    atoms = frames[PERIODIC[0]].copy()
+    MaxwellBoltzmannDistribution(atoms, temperature_K=300.0, rng=np.random.default_rng(0))
+    Stationary(atoms)
+
+    reference = atoms.copy()
+    reference.calc = calculator
+    VelocityVerlet(reference, dt * units.fs).run(steps)
+
+    config = MdParameters(
+        temperature=300.0,
+        time_step=dt,
+        friction_coefficient=0.0,
+        thermostat_time_constant=1e10,
+        target_pressure=0.0,
+        pressure_coupling_time=1e10,
+        compressibility=1e-5,
+        minimum_scale_factor=1.0,
+        integrator="verlet",
+    )
+    particles, systems = md_state_from_ase(atoms, config)
+    # kUPS's time unit is ASE's, so the momenta carry over as they are.
+    particles = bind(particles, lambda t: t.data.momenta).set(
+        jnp.asarray(atoms.get_momenta())
+    )
+    cutoffs = Table.arange(jnp.full(1, mliap.model.cutoff), label=SystemId)
+    nl_params = UniversalNeighborlistParameters.estimate(
+        particles.data.system.counts, systems, cutoffs
+    )
+    state = MDState(particles, systems, nl_params, jnp.array([0]), UPETParameters(k_sel=1))
+    state_lens = identity_lens(MDState)
+    potential = make_upet_from_state(
+        state_lens, parameters=mliap, gradient=POSITIONS_AND_CELL
+    )
+    out, state = _evaluate(potential, state)
+    state = bind(state, lambda s: s.particles.data.position_gradients).set(
+        out.gradients.positions.data
+    )
+
+    cycle = make_cycle_function(make_md_propagator(state_lens, "verlet", potential))
+    chain = key_chain(jax.random.key(0))
+    for _ in range(steps):
+        state = propagate_and_fix(cycle, next(chain), state)
+
+    cell = atoms.cell.array
+    frac = (
+        np.asarray(state.particles.data.positions) - reference.positions
+    ) @ np.linalg.inv(cell)
+    frac -= np.round(frac)  # kUPS wraps positions into the cell
+    assert np.abs(frac @ cell).max() < 1e-4
+    np.testing.assert_allclose(
+        np.asarray(state.particles.data.momenta), reference.get_momenta(), atol=1e-4
+    )
+
+
 def test_overflow_grows_k_sel(frames, mliap, potential):
     """Starting from k_sel=1 the first call fails its assertion; the fix grows
     k_sel to cover the largest selected count and the rerun holds, with the
