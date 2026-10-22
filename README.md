@@ -138,6 +138,43 @@ For the design rationale and more details, see [`src/petjax/README.md`](src/petj
 - **Charge and spin conditioning**: a checkpoint trained with `system_conditioning` embeds the total charge and the spin multiplicity of each structure and adds them to the node features after every GNN layer, so the same geometry can give different predictions for different electronic states. The calculator reads them from `atoms.info["charge"]` and `atoms.info["spin_multiplicity"]`, the keys `metatrain`'s readers use; a missing key means neutral (0) or singlet (1), as upstream defaults, and a change in either invalidates the cached results like a change in positions would. Values must be integers within the checkpoint's `max_charge` / `max_spin_multiplicity` range, checked host-side. Unconditioned checkpoints ignore both keys.
 - **Non-conservative forces/stress**: PET-MAD checkpoints also carry direct force/stress heads. Pass `direct_forces=True` / `direct_stress=True` to `from_checkpoint` to read forces/stress straight from those heads (skipping autodiff — cheaper, no double-backward) instead of differentiating the energy. The default stays conservative (autodiff). Both reproduce the metatrain reference to fp32; for forces the per-structure mean is subtracted to remove the spurious net force the direct head would otherwise leave (matching metatrain's calculator).
 
+## Running under kUPS
+
+[kUPS](https://github.com/cusp-ai-oss/kups) is CuspAI's JAX simulation toolkit: MD, relaxation and Monte Carlo loops that run entirely on the device, with the neighbour list rebuilt there every step and many independent systems batched into one program. `petjax.kups` runs a converted checkpoint as a kUPS potential. It is an optional extra, and kUPS needs Python 3.12:
+
+```bash
+pip install "pet-jax[kups]"
+```
+
+The adapter takes a kUPS state that carries, next to kUPS's own `particles`, `systems` and `neighborlist_params`, a `UPETParameters` with the packed neighbour count `k_sel`:
+
+```python
+from kups.application.potential.filter import POSITIONS_AND_CELL
+from kups.core.lens import lens
+from kups.core.result import as_result_function
+from petjax.kups import UPETMliap, UPETParameters, make_upet_from_state
+
+model = UPETMliap.from_checkpoint("checkpoints/pet-mad-xs")
+potential = make_upet_from_state(
+    lens(lambda s: s, cls=MyState), parameters=model, gradient=POSITIONS_AND_CELL
+)
+
+evaluate = as_result_function(potential)
+result = evaluate(state)
+state = result.fix_or_raise(state)  # grows k_sel (and kUPS's list capacities) if needed
+out = evaluate(state).value.data   # per-system energies, dE/dr, dE/dcell
+```
+
+Inside kUPS's propagators the same assertion-and-fix loop runs automatically, so `k_sel` is sized the way kUPS sizes its own neighbour-list capacities: start it small, it grows on the first overflow. There is no host-side sizing pass and no Verlet skin; the raw list comes from kUPS at the checkpoint's cutoff. Several systems in one state are evaluated together, each getting its own energy and gradients, and must share their periodicity (a kUPS `Cell` has one periodicity mask).
+
+What to know:
+
+- kUPS keeps cells lower-triangular; build the state with `kups.application.utils.particles.particles_from_ase` or rotate yourself with `kups.core.cell.to_lower_triangular`. Energies are invariant, forces come back in that frame.
+- The cell gradient lives on the six lower-triangular entries of the cell. For a rotation-invariant model that fixes the whole (symmetric) virial; PET is not one, and its raw strain derivative is slightly asymmetric. kUPS's stress observable mirrors the lower triangle, the calculator's Voigt stress averages the two triangles, and they differ by the model's rotational non-invariance (0.4 % of the shear components on the mini set). The lower triangle agrees to fp32 rounding.
+- kUPS applications enable x64; checkpoints ship fp32. `UPETMliap.from_checkpoint(dtype=...)` sets the working dtype the params are cast to and inputs are cast to at the boundary.
+- A conditioned checkpoint needs `conditioning`, a function reading per-system `charge` and `spin_multiplicity` arrays off the systems table; values are validated by you.
+- Composition shifts are added inside the energy function (`add_offset=False` for raw model energies). A species the checkpoint was not trained on gives NaN.
+
 ## Checkpoint format
 
 `pet-jax` checkpoints are a directory with two files:
@@ -226,9 +263,9 @@ PRs that change anything user-visible add a line to the **Unreleased** section o
 
 ## Status
 
-Working: inference, forces, stress, BFGS/FIRE relaxations, cell optimization, `metatrain` checkpoint conversion, charge/spin conditioning, parity with upstream PET.
+Working: inference, forces, stress, BFGS/FIRE relaxations, cell optimization, `metatrain` checkpoint conversion, charge/spin conditioning, parity with upstream PET, running as a kUPS potential (batched systems, device-side MD and relaxation loops).
 
-Not yet: training (use `metatrain` directly), batched multi-structure inference in the calculator (single-structure only), GPU performance tuning.
+Not yet: training (use `metatrain` directly), batched multi-structure inference in the calculator (single-structure only; batch through kUPS), GPU performance tuning.
 
 ## License
 

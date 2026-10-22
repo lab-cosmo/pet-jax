@@ -22,6 +22,13 @@ The top-level README explains the 2-phase split (outside JIT = build + size; ins
 - The reverse-pair map is built via the index chain `raw_to_sel[reverse_raw[sel_to_raw]]`, not by search-by-value. The latter is ambiguous when an atom is its own neighbour through multiple periodic images.
 - `value_and_grad(..., argnums=(positions, strain))` gives forces and the virial stress in one pass. Composition shifts (linear in atomic numbers) are added post-JIT in Python fp64 so they contribute zero to forces with no precision loss.
 
+**Under kUPS** — `kups.upet_energy`, traced inside kUPS's jitted propagator
+
+- The energy function reuses the in-JIT half only: `Edges.difference_vectors` for `R_ij` (per-system cells), `center_order` and `corresponding_edges` for the layout, `truncate_edges` for selection and pack, `model.apply` for the forward. kUPS's out-of-bounds sentinel index is the atom count, so padding the particle arrays by one row makes it pet-jax's dummy atom with no index arithmetic.
+- The outside-JIT half is replaced by kUPS's capacity machinery: `k_sel` is a static field on the state (`UPETParameters`), read through a `LensCapacity`, and `Truncation.counts.max()` feeds `generate_assertion`. On overflow kUPS's runner applies the fix (next power of `growth_base` above the count), the propagator retraces at the new static `k_sel` and the block reruns. This is why `truncate_edges` returns the counts.
+- Gradients come from kUPS's `PotentialFromEnergy` (`jax.vjp` over positions and the cell's frame parameters), so the implicit-function-theorem step of the cutoff solve is inside the gradient as in `predict_fn`. The cell gradient is w.r.t. the six lower-triangular entries kUPS parametrises; see the top-level README for why that differs from the calculator's Voigt stress for a non-equivariant model.
+- `jit` placement: none in `kups.py`. kUPS jits the propagator and `PotentialFromEnergy.__call__`; the energy function is plain.
+
 **Per-step orchestration** — `UPETCalculator.calculate`
 
 - The Verlet skin check skips the raw-NL rebuild while displacements stay below the skin. Position-only updates re-derive `R_ij` inside JIT from cached cell shifts and avoid all host-side work.

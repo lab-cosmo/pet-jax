@@ -12,6 +12,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ### Added
 
+- `petjax.kups`, an adapter that runs a converted checkpoint as a [kUPS](https://github.com/cusp-ai-oss/kups) potential (`pip install "pet-jax[kups]"`, Python ≥ 3.12): the raw neighbour list is built on the device by kUPS, several systems batch in one program, and `k_sel` grows through kUPS's capacity-fix loop. Energies, forces and cell gradients agree with `UPETCalculator`.
 - `center_order` and `corresponding_edges`: jit-safe twins of the two layout steps `to_structure` does on the host (sort a padded flat neighbour list by center with padding last, and build the reverse map by stable multi-key sorts on int32 keys), for raw neighbour lists built on the device.
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
