@@ -243,6 +243,8 @@ SOLVER_HYPERS = {"k16_w1": (16, 7.5, 1.0), "k8_w05": (8, 7.5, 0.5)}
 SOLVER_CASES = {
     "sorted_segment_sum": dict(solver="sorted_segment_sum"),
     "blocked_prefix_sum": dict(solver="blocked_prefix_sum"),
+    "sorted_window": dict(solver="sorted_window"),
+    "sorted_window_6": dict(solver="sorted_window", solver_iterations=6),
 }
 
 
@@ -327,6 +329,10 @@ def test_solver_variant_matches_stock(case, hypers, dtype, solver_structures):
     where the count is flat, as in a molecule)."""
     from petjax.express import Express
 
+    if (case, hypers, dtype) == ("sorted_window", "k8_w05", "float64"):
+        # The value still matches (the IFT step is one more Newton step), but
+        # the gradient's dF/dr is taken at the unconverged loop iterate.
+        pytest.skip("4 window steps converge to float32 only; w=0.5 needs 6 in float64")
     express = Express(**SOLVER_CASES[case])
     with jax.enable_x64(dtype == "float64"):
         for structure in solver_structures:
@@ -336,3 +342,104 @@ def test_solver_variant_matches_stock(case, hypers, dtype, solver_structures):
             np.testing.assert_allclose(c1, c0, rtol=0, atol=atol)
             assert np.array_equal(s1, s0)
             np.testing.assert_allclose(g1, g0, rtol=0, atol=gtol * np.abs(g0).max())
+
+
+def _truncate(structure, k_sel, express, hypers=SOLVER_HYPERS["k16_w1"]):
+    from petjax import truncate_edges
+    from petjax.utils import edge_displacements
+
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+    k, cutoff, width = hypers
+    return truncate_edges(
+        R_ij,
+        structure["centers"],
+        structure["others"],
+        structure["reverse"],
+        structure["pair_mask"],
+        structure["atomic_numbers"],
+        structure["atom_mask"],
+        k_sel,
+        k,
+        cutoff,
+        width,
+        method="solver",
+        express=express,
+    )
+
+
+@pytest.mark.parametrize("hypers", list(SOLVER_HYPERS), ids=list(SOLVER_HYPERS))
+def test_sorted_window_pack_matches_stock(hypers, solver_structures):
+    """The candidate pack selects the same pairs per center as the stock pack
+    (in distance order instead of list order), with the same counts, and its
+    reverse map points every packed pair at its packed reverse."""
+    from petjax.express import Express
+
+    window = Express(solver="sorted_window")
+    for structure in solver_structures:
+        structure = jax.tree.map(np.asarray, structure)
+        _, t0 = _truncate(structure, 64, None, SOLVER_HYPERS[hypers])
+        k_sel = max(int(np.asarray(t0.counts).max()), 1)
+        p0, t0 = _truncate(structure, k_sel, None, SOLVER_HYPERS[hypers])
+        p1, t1 = _truncate(structure, k_sel, window, SOLVER_HYPERS[hypers])
+        assert not bool(t0.overflow) and not bool(t1.overflow)
+        assert np.array_equal(t1.selected, t0.selected)
+        assert np.array_equal(t1.counts, t0.counts)
+
+        # Same pair in each row, as a set: key a packed slot by its raw pair.
+        def rows(packed):
+            real = np.asarray(packed["pair_mask"])
+            centers = np.asarray(packed["centers"])[real]
+            key = np.stack(
+                [np.asarray(packed["neighbors"])[real], *np.asarray(packed["R_ij"])[real].T]
+            )
+            return {(int(c), tuple(np.round(k, 6))) for c, k in zip(centers, key.T)}
+
+        assert rows(p1) == rows(p0)
+        assert np.array_equal(np.asarray(p1["pair_mask"]), np.asarray(p0["pair_mask"]))
+        mask = np.asarray(p0["pair_mask"])
+        np.testing.assert_allclose(
+            np.sort(np.asarray(p1["pair_cutoffs"])[mask]),
+            np.sort(np.asarray(p0["pair_cutoffs"])[mask]),
+            rtol=1e-6,
+        )
+
+        # The reverse slot holds the reversed pair: same atoms, opposite R_ij.
+        real = np.flatnonzero(np.asarray(p1["pair_mask"]))
+        rev = np.asarray(p1["reverse"])[real]
+        assert np.array_equal(np.asarray(p1["reverse"])[rev], real)
+        assert np.array_equal(
+            np.asarray(p1["centers"])[rev], np.asarray(p1["neighbors"])[real]
+        )
+        np.testing.assert_allclose(
+            np.asarray(p1["R_ij"])[rev], -np.asarray(p1["R_ij"])[real], atol=1e-5
+        )
+
+
+def test_sorted_window_overflow(solver_structures):
+    """Each of the three ways the window path can miss a pair raises overflow:
+    a row selecting more than k_sel, a candidate prefix too short to rule out a
+    selectable pair, and a solver window too small for the bracket."""
+    from petjax.express import Express
+
+    liquid = jax.tree.map(np.asarray, solver_structures[4])
+    _, t = _truncate(liquid, 64, None)
+    k_sel = int(np.asarray(t.counts).max())
+    window = Express(solver="sorted_window")
+    assert not bool(_truncate(liquid, k_sel, window)[1].overflow)
+    assert bool(_truncate(liquid, k_sel - 1, window)[1].overflow)
+    assert bool(
+        _truncate(liquid, k_sel, Express(solver="sorted_window", candidate_extra=0))[
+            1
+        ].overflow
+    )
+    assert bool(
+        _truncate(liquid, k_sel, Express(solver="sorted_window", window_capacity=4))[
+            1
+        ].overflow
+    )

@@ -22,6 +22,7 @@ CASES = {
     "stock": Express(),
     "sorted_segment_sum": Express(solver="sorted_segment_sum"),
     "blocked_prefix_sum": Express(solver="blocked_prefix_sum"),
+    "sorted_window": Express(solver="sorted_window"),
 }
 
 RTOL_ENERGY = 1e-11
