@@ -6,6 +6,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+import math
 import sys
 import warnings
 
@@ -165,6 +166,9 @@ class UPETCalculator(BaseCalculator):
         self._N_padded = None
         self._n_pair_padded = None
         self._k_sel = None
+        # Static capacities of the flat token list and the extra attention
+        # tiles (empty for the padded layout), sized next to k_sel.
+        self._token_sizes = {}
         self._structure = None
         self._shift_offset = 0.0
 
@@ -339,6 +343,7 @@ class UPETCalculator(BaseCalculator):
                 k_sel_actual + 1 + self._extra_neighbors, self._k_sel_bucket_strategy
             )
             k_sel_padded = token_padded - 1
+            self._token_sizes = self._size_tokens(selection.counts, k_sel_padded)
         else:
             k_sel_padded = self._k_sel
 
@@ -354,6 +359,10 @@ class UPETCalculator(BaseCalculator):
             **self._conditioning(atoms, N_padded),
             "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
         }
+        # token_sizer / tile_sizer carry the flat layout's capacities likewise.
+        for key, size in (("token_sizer", "p_cap"), ("tile_sizer", "e_cap")):
+            if size in self._token_sizes:
+                self._structure[key] = jnp.zeros(self._token_sizes[size], dtype=bool)
         if self._device_nl:
             # Shifts are rebuilt with the list, so a cell change never stales it.
             max_shift = 0
@@ -382,6 +391,47 @@ class UPETCalculator(BaseCalculator):
         )
         self._check_cutoff_override()
 
+    def _size_tokens(self, counts, k_sel):
+        """Capacities of the flat token list (``p_cap``) and the extra attention
+        tiles (``e_cap``) from the host-side selected counts, sized and widened
+        together with ``k_sel``.
+
+        ``p_cap`` is ``token_margin`` times the selected pairs, bucketed like
+        the pair axis, plus the always-empty sentinel slot: the total is a sum
+        over all atoms and drifts far less than the largest count. ``e_cap``
+        is ``tile_margin`` times the atoms spilling past the tile, at least
+        ``tile_floor``, so one atom crossing the tile width does not overflow
+        every step; it is 0 (no extra path in the graph) when ``k_sel`` fits
+        in one tile. An atom past two tiles cannot be fixed by resizing, so it
+        raises here.
+        """
+        express = self.express
+        if express.tokens != "flat":
+            return {}
+        n_tokens = int(counts.sum())
+        strategy = (
+            self._n_pair_bucket_strategy
+            if self._n_pair_bucket_strategy is not None
+            else self._bucket_strategy
+        )
+        p_cap = _bucket_or(math.ceil(express.token_margin * n_tokens) + 1, strategy)
+        sizes = {"n_tokens": n_tokens, "p_cap": p_cap}
+        width = express.attention_tile
+        if width is not None:
+            k_max = int(counts.max())
+            if k_max > 2 * (width - 1):
+                raise ValueError(
+                    f"UPETCalculator: an atom selects {k_max} neighbours, more than "
+                    f"the {2 * (width - 1)} that two attention tiles of width "
+                    f"{width} hold; use attention_tile >= {math.ceil(k_max / 2) + 1}."
+                )
+            n_extra = int((counts > width - 1).sum())
+            e_cap = 0
+            if k_sel > width - 1:
+                e_cap = max(express.tile_floor, math.ceil(express.tile_margin * n_extra))
+            sizes.update(n_extra=n_extra, e_cap=e_cap)
+        return sizes
+
     def _record_debug(
         self, atoms, structure, k_sel_actual, shape_changed, force_recompute_k_sel
     ):
@@ -404,6 +454,7 @@ class UPETCalculator(BaseCalculator):
             "overflow_retry": force_recompute_k_sel,
             "cutoff_guard_events": self._cutoff_guard_events,
             "express": self.express.as_dict(),
+            "tokens": dict(self._token_sizes),
         }
         if self._debug:
             self._print_debug(self.debug_stats)

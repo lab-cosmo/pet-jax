@@ -24,6 +24,21 @@ CASES = {
     "device_list": Express(neighbor_list="device"),
     "cutoff_guard": Express(cutoff_guard=True),
     "device_list_guard": Express(neighbor_list="device", cutoff_guard=True),
+    "flat": Express(tokens="flat"),
+    # k_sel fits one tile: no extra tiles in the graph
+    "flat-tile32": Express(tokens="flat", attention_tile=32),
+    # narrow enough that most atoms need an extra tile (all 108 of the large
+    # frame on the 16-neighbour checkpoint), while the widest atom (21) fits two
+    "flat-tile12": Express(tokens="flat", attention_tile=12),
+    "flat-tile12-fold": Express(tokens="flat", attention_tile=12, fold_extra_block=True),
+    # the streams combined
+    "device_flat_tile": Express(
+        neighbor_list="device",
+        cutoff_guard=True,
+        tokens="flat",
+        attention_tile=12,
+        reverse_unique=True,
+    ),
 }
 
 RTOL_ENERGY = 1e-11

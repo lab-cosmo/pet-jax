@@ -52,7 +52,7 @@ class Truncation(NamedTuple):
     pair_cutoffs: jax.Array | None  # [n_pair_padded] mean of the two endpoint cutoffs
     selected: jax.Array  # [n_pair_padded] bool, r_ij <= pair_cutoff; False on padding
     counts: jax.Array  # [N] selected pairs per center, unclipped; k_sel must cover its max
-    overflow: jax.Array  # scalar bool, True iff counts.max() > k_sel
+    overflow: jax.Array  # scalar bool, counts.max() > k_sel or a flat capacity exceeded
 
 
 def truncate(
@@ -111,6 +111,8 @@ def truncate(
         method=method,
         no_shadow=no_shadow,
         express=express,
+        token_capacity=_sizer(structure, "token_sizer"),
+        tile_capacity=_sizer(structure, "tile_sizer") or 0,
     )
     for key in CONDITIONING_KEYS:
         if key in structure:
@@ -118,6 +120,10 @@ def truncate(
     if raw_overflow is not None:
         truncation = truncation._replace(overflow=truncation.overflow | raw_overflow)
     return truncated, truncation
+
+
+def _sizer(structure, key):
+    return structure[key].shape[-1] if key in structure else None
 
 
 def truncate_edges(
@@ -135,6 +141,8 @@ def truncate_edges(
     method="grid",
     no_shadow=False,
     express=None,
+    token_capacity=None,
+    tile_capacity=0,
 ):
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
@@ -152,9 +160,14 @@ def truncate_edges(
     couples pairs only through their center/other atoms. Requires ``centers``
     non-decreasing; ``k_sel`` must be a static int under jit.
 
-    ``express`` picks the solver and the token layout (``Express``); the
-    ``sorted_window`` solver and the ``flat`` layout pack from the sorted
-    candidate prefix instead of ``_pack_selected_to_flat``.
+    ``express`` picks the solver and the token layout (``Express``). With
+    ``tokens="flat"`` the survivors go into one compacted list of static
+    length ``token_capacity`` instead (``_pack_selected_to_tokens``; the last
+    slot stays empty as the sentinel, so at most ``token_capacity - 1`` tokens
+    fit), and the dict gains the attention tile maps ``tile_tokens`` and
+    ``extra_atoms`` (``_token_tiles``): tiles of width ``k_sel + 1``, or of
+    ``express.attention_tile`` with up to ``tile_capacity`` extra tiles.
+    ``overflow`` then also covers the token capacity and the tiles.
     """
     express = Express.from_any(express)
     N = atomic_numbers.shape[0]
@@ -172,11 +185,26 @@ def truncate_edges(
         no_shadow=no_shadow,
         express=express,
     )
-    if express.tokens != "padded":
-        raise NotImplementedError(f"tokens={express.tokens!r} is not implemented yet")
-    slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
-        selected, centers, N, k_sel
-    )
+    tiles = {}
+    if express.tokens == "flat":
+        if token_capacity is None:
+            raise ValueError("tokens='flat' needs a static token_capacity")
+        slot, sel_to_pair, pair_mask_sel, counts, offsets, packed, overflow = (
+            _pack_selected_to_tokens(selected, centers, N, k_sel, token_capacity)
+        )
+        if express.attention_tile is None:
+            width, tile_capacity = k_sel + 1, 0
+        else:
+            width = express.attention_tile
+        tile_tokens, extra_atoms, tile_overflow = _token_tiles(
+            offsets, packed, token_capacity, width, tile_capacity
+        )
+        overflow = overflow | tile_overflow
+        tiles = {"tile_tokens": tile_tokens, "extra_atoms": extra_atoms}
+    else:
+        slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
+            selected, centers, N, k_sel
+        )
 
     # Reverse map in P_sel space. Under overflow a pair can fit while its
     # reverse does not; then slot[reverse] = P_sel - 1 (the masked sentinel).
@@ -189,6 +217,7 @@ def truncate_edges(
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,
         "pair_cutoffs": pair_cutoffs[sel_to_pair],
+        **tiles,
     }
     return truncated, Truncation(atomic_cutoffs, pair_cutoffs, selected, counts, overflow)
 
@@ -574,3 +603,100 @@ def _pack_selected_to_flat(selected, centers, N_padded, k_sel):
     sel_to_pair = sel_to_pair.at[slot].set(jnp.arange(N_pair_padded, dtype=centers.dtype))
 
     return slot, sel_to_pair, pair_mask_sel, count_per_center, overflow
+
+
+# -- pack flat selection into one compacted token list, plus the attention tiles --
+
+
+def _pack_selected_to_tokens(selected, centers, N_padded, k_sel, capacity):
+    """Pack a flat selection mask over sorted-by-center pairs into one
+    compacted token list of static length ``capacity``: atom-contiguous, no
+    holes, the token of atom ``i``'s ``c``-th selected pair at slot
+    ``offsets[i] + c``, where ``offsets`` is the exclusive cumsum of the
+    per-atom counts (clipped to ``k_sel``). Slots past the last token are
+    empty and point at the padded-pair sentinel; the last slot is always
+    empty, so it serves as the masked-out target like ``P_sel - 1`` in
+    ``_pack_selected_to_flat`` and at most ``capacity - 1`` tokens fit.
+
+    Returns:
+      slot:           ``[N_pair_padded]`` — token slot of each selected pair
+                      that fits, ``capacity - 1`` otherwise.
+      sel_to_pair:    ``[capacity]`` — inverse map; empty slots point at
+                      ``N_pair_padded - 1``.
+      pair_mask_sel:  ``[capacity]`` bool, the first ``sum(packed)`` slots.
+      counts:         ``[N_padded]`` — selected pairs per center, unclipped.
+      offsets:        ``[N_padded]`` — first slot of each atom's tokens.
+      packed:         ``[N_padded]`` — tokens per atom that made it into the
+                      list (``counts`` clipped to ``k_sel`` and the capacity).
+      overflow:       scalar bool — a center selected more than ``k_sel``
+                      pairs, or the tokens exceed ``capacity - 1``.
+    """
+    N_pair_padded = selected.shape[0]
+    idx = centers.dtype
+
+    sel_int = selected.astype(idx)
+    counts = jax.ops.segment_sum(
+        sel_int, centers, num_segments=N_padded, indices_are_sorted=True
+    )
+    clipped = jnp.minimum(counts, k_sel)
+    zero = jnp.zeros(1, idx)
+    prefix = jnp.concatenate([zero, jnp.cumsum(counts)[:-1]])
+    offsets = jnp.concatenate([zero, jnp.cumsum(clipped)[:-1]])
+    # Column within the center's row (valid where selected), as in the rectangular pack.
+    column = jnp.cumsum(sel_int) - 1 - prefix[centers]
+    slot = offsets[centers] + column
+
+    usable = capacity - 1
+    fits = selected & (column < k_sel) & (slot < usable)
+    overflow = jnp.any(counts > k_sel) | (jnp.sum(clipped) > usable)
+    slot = jnp.where(fits, slot, usable)
+    packed = jnp.clip(jnp.minimum(clipped, usable - offsets), 0, None)
+
+    sel_to_pair = jnp.full(capacity, N_pair_padded - 1, dtype=idx)
+    sel_to_pair = sel_to_pair.at[jnp.where(fits, slot, capacity)].set(
+        jnp.arange(N_pair_padded, dtype=idx), mode="drop"
+    )
+    pair_mask_sel = jnp.arange(capacity) < jnp.sum(packed)
+    return slot, sel_to_pair, pair_mask_sel, counts, offsets, packed, overflow
+
+
+def _token_tiles(offsets, packed, capacity, width, tile_capacity):
+    """The attention tiles over a compacted token list (``_pack_selected_to_tokens``).
+
+    Tile ``i < N`` belongs to atom ``i``: its centre token in slot 0 (implicit,
+    not in the map) and its first ``width - 1`` tokens in slots
+    ``1 .. width - 1``. An atom with more tokens gets one extra tile, a row
+    ``N + x`` with ``x < tile_capacity``, holding its tokens
+    ``width - 1 .. 2 * width - 3`` in slots ``1 .. width - 1`` (slot 0 empty).
+
+    Returns:
+      tile_tokens:  ``[N + tile_capacity, width - 1]`` — token slot behind
+                    tile slot ``1 + j``; ``capacity`` marks an empty slot.
+      extra_atoms:  ``[tile_capacity]`` — atom owning extra tile ``x``; ``N``
+                    for an unused one.
+      overflow:     scalar bool — more atoms need an extra tile than
+                    ``tile_capacity``, or an atom has more than
+                    ``2 * width - 2`` tokens.
+    """
+    N = offsets.shape[0]
+    idx = offsets.dtype
+    w = width - 1
+    cols = jnp.arange(w, dtype=idx)
+
+    needs = packed > w
+    rank = jnp.cumsum(needs.astype(idx)) - 1
+    overflow = (jnp.sum(needs) > tile_capacity) | jnp.any(packed > 2 * w)
+    extra_atoms = jnp.full(tile_capacity, N, dtype=idx)
+    extra_atoms = extra_atoms.at[jnp.where(needs, rank, tile_capacity)].set(
+        jnp.arange(N, dtype=idx), mode="drop"
+    )
+
+    first = jnp.where(cols[None, :] < packed[:, None], offsets[:, None] + cols, capacity)
+    count_x = packed.at[extra_atoms].get(mode="fill", fill_value=0)
+    offset_x = offsets.at[extra_atoms].get(mode="fill", fill_value=0)
+    column_x = w + cols
+    second = jnp.where(
+        column_x[None, :] < count_x[:, None], offset_x[:, None] + column_x, capacity
+    )
+    tile_tokens = jnp.concatenate([first, second], axis=0)
+    return tile_tokens, extra_atoms, overflow
