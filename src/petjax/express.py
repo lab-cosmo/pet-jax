@@ -32,12 +32,17 @@ class Express:
         window are touched and the selection packs from the sorted candidate
         prefix.
       solver_iterations: Newton-bisection steps; ``None`` means the variant's
-        own default (10 from ``[0, cutoff]``, 4 from the window bracket).
+        own default (10 from ``[0, cutoff]``, 4 from the window bracket). With
+        ``seed_cutoffs``, the steps of a seeded solve.
       window_capacity: pairs per atom the window variant can hold.
       candidate_extra: sorted candidates per atom beyond ``k_sel`` that the
         window variant considers for selection.
       seed_cutoffs: start the solve from the previous call's cutoffs with the
-        Verlet-bound bracket ``[r - 2 delta, r + 2 delta]``.
+        Verlet-bound bracket ``[r - 2 delta, r + 2 delta]``. The calculator
+        supplies the seed; without a usable one (first call, other atoms, a
+        step wider than the bump) the solve takes the stock bracket and at
+        least 10 steps. A no-op for ``sorted_window``, which brackets from the
+        sorted distances.
 
     Raw neighbour list (``structure.py`` / ``calculator.py``):
       neighbor_list: ``host`` (vesin at ``cutoff + skin``, Verlet-cached) or

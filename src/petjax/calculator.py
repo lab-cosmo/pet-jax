@@ -118,6 +118,8 @@ class UPETCalculator(BaseCalculator):
         self._device_nl = self.express.neighbor_list == "device"
         self._cutoff_widen = cutoff_widen
         self._cutoff_guard_events = 0
+        # (cutoffs, positions, cell) of the last call, for express.seed_cutoffs.
+        self._seed = None
 
         # cutoff_override narrows ONLY the raw-NL radius (to cutoff_override +
         # skin for the host list, cutoff_override for the device list). The UPET
@@ -224,6 +226,9 @@ class UPETCalculator(BaseCalculator):
             "max_cutoff": float(results["max_cutoff"]),
             "k_max": int(results["k_max"]),
         }
+        if self.express.seed_cutoffs:
+            cell = np.array(atoms.get_cell()[:])
+            self._seed = (results["atomic_cutoffs"], atoms.get_positions().copy(), cell)
 
         n_real = len(atoms)
         energy = float(results["energy"])
@@ -331,6 +336,7 @@ class UPETCalculator(BaseCalculator):
                 self._model.cutoff,
                 self._model.cutoff_width_adaptive,
                 method=self._model.adaptive_cutoff_method,
+                express=self.express,
             )
             k_sel_actual = max(int(selection.counts.max()), 1)
             # The selection's real reach, for tuning cutoff_override.
@@ -353,24 +359,31 @@ class UPETCalculator(BaseCalculator):
 
         # k_sel_sizer carries k_sel into the shape-agnostic predict_fn via its
         # shape; the JIT retraces when k_sel (or any other shape) changes.
+        # The largest image shift of the host list bounds how far a cell change
+        # moves any pair distance (the seed's Verlet bound and the cache's).
+        max_shift = (
+            int(np.max(np.abs(structure["cell_shifts"])))
+            if len(structure["cell_shifts"]) > 0
+            else 0
+        )
+        self._max_shift = max_shift
         geometry = self._device_inputs(structure, atoms) if self._device_nl else structure
         self._structure = {
             **self._to_jax_structure(geometry),
             **self._conditioning(atoms, N_padded),
+            **self._seed_inputs(atoms, N_padded, max_shift),
             "k_sel_sizer": jnp.zeros(k_sel_padded, dtype=bool),
         }
         # token_sizer / tile_sizer carry the flat layout's capacities likewise.
         for key, size in (("token_sizer", "p_cap"), ("tile_sizer", "e_cap")):
             if size in self._token_sizes:
                 self._structure[key] = jnp.zeros(self._token_sizes[size], dtype=bool)
-        if self._device_nl:
-            # Shifts are rebuilt with the list, so a cell change never stales it.
-            max_shift = 0
-        elif len(structure["cell_shifts"]) > 0:
-            max_shift = int(np.max(np.abs(structure["cell_shifts"])))
-        else:
-            max_shift = 0
-        self._nl_cache.save_reference(atoms, max_cell_shift=max_shift)
+        # The device list is rebuilt with its shifts every step, so a cell
+        # change never stales it: the cache only watches the atom count,
+        # species and pbc.
+        self._nl_cache.save_reference(
+            atoms, max_cell_shift=0 if self._device_nl else max_shift
+        )
 
         # Composition shifts are constant w.r.t. positions; Python fp64 sum
         # added post-JIT. Species can only change via a rebuild, so here. The
@@ -526,14 +539,38 @@ class UPETCalculator(BaseCalculator):
         positions[:n_real] = atoms.get_positions()
         cell = np.array(atoms.get_cell()[:], dtype=np.float64)
         window = {}
+        max_shift = self._max_shift
         if self._device_nl and atoms.pbc.any():
             window["lattice_shifts"] = lattice_shifts(cell, atoms.pbc, self._cutoff)
+            # The current window bounds every pair's image shift at this cell.
+            max_shift = int(np.abs(window["lattice_shifts"]).max())
         self._structure = {
             **self._structure,
             "positions": jnp.array(positions, dtype=self._dtype),
             "cell": jnp.array(cell, dtype=self._dtype),
             **window,
             **self._conditioning(atoms, N_padded),
+            **self._seed_inputs(atoms, N_padded, max_shift),
+        }
+
+    def _seed_inputs(self, atoms, N_padded, max_cell_shift):
+        """``cutoff_seed`` and ``seed_displacement`` for ``seed_cutoffs``: the
+        last call's cutoffs and half the largest change of any pair distance
+        since (atom displacements plus the cell change through the largest
+        image shift). Always present, so the forward is traced once; ``inf``
+        when there is no seed (first call, other atoms)."""
+        if not self.express.seed_cutoffs:
+            return {}
+        cutoffs, delta = jnp.zeros(N_padded, self._dtype), np.inf
+        if self._seed is not None and self._seed[0].shape[0] == N_padded:
+            cutoffs, positions, cell = self._seed
+            if len(positions) == len(atoms):
+                moved = np.linalg.norm(atoms.get_positions() - positions, axis=1).max()
+                strained = np.linalg.norm(atoms.get_cell()[:] - cell, axis=1).sum()
+                delta = moved + 0.5 * (max_cell_shift or 0) * strained
+        return {
+            "cutoff_seed": cutoffs,
+            "seed_displacement": jnp.asarray(delta, self._dtype),
         }
 
     def _device_inputs(self, structure, atoms):
