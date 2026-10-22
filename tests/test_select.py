@@ -55,8 +55,8 @@ def structure(request):
 def test_pack_edges_round_trip(structure):
     """Every unmasked pair survives packing exactly once; nothing else does."""
     k = _max_count(structure)
-    packed, overflow = _pack(structure, k)
-    assert not bool(overflow)
+    packed, truncation = _pack(structure, k)
+    assert not bool(truncation.overflow)
     assert packed["pair_cutoffs"] is None
 
     real = np.asarray(packed["pair_mask"])
@@ -87,8 +87,65 @@ def test_pack_edges_overflow_on_undersized_width(structure):
     k = _max_count(structure)
     if k < 2:
         pytest.skip("needs at least 2 neighbors on some center")
-    _, overflow = _pack(structure, k - 1)
-    assert bool(overflow)
+    _, truncation = _pack(structure, k - 1)
+    assert bool(truncation.overflow)
+
+
+def test_pack_edges_truncation(structure):
+    """The accounting next to the packed dict: no cutoffs, every unmasked pair
+    selected, per-center counts, and overflow iff a count exceeds the width."""
+    _, t = _pack(structure, _max_count(structure))
+    assert t.atomic_cutoffs is None and t.pair_cutoffs is None
+    assert np.array_equal(t.selected, structure["pair_mask"])
+    N = structure["positions"].shape[0]
+    counts = np.bincount(structure["centers"][structure["pair_mask"]], minlength=N)
+    assert np.array_equal(t.counts, counts)
+    assert not bool(t.overflow)
+
+
+def test_truncate_edges_matches_select_edges(structure):
+    """The in-JIT selection reports the same accounting as the host-side
+    ``select_edges`` on the same structure, and overflow iff ``k_sel`` is below
+    the largest count."""
+    from petjax import select_edges, truncate_edges
+    from petjax.utils import edge_displacements
+
+    hypers = dict(num_neighbors_adaptive=4, cutoff=CUTOFF, cutoff_width_adaptive=0.5)
+    sel = select_edges(structure, **hypers, method="grid")
+    k_sel = int(sel.counts.max())
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+
+    def run(k):
+        return truncate_edges(
+            R_ij,
+            structure["centers"],
+            structure["others"],
+            structure["reverse"],
+            structure["pair_mask"],
+            structure["atomic_numbers"],
+            structure["atom_mask"],
+            k,
+            **hypers,
+            method="grid",
+        )
+
+    _, t = run(k_sel)
+    assert np.allclose(t.atomic_cutoffs, sel.atomic_cutoffs, rtol=1e-6, atol=0)
+    assert np.allclose(t.pair_cutoffs, sel.pair_cutoffs, rtol=1e-6, atol=0)
+    assert np.array_equal(t.selected, sel.selected)
+    assert np.array_equal(t.counts, sel.counts)
+    assert not bool(t.overflow)
+
+    if k_sel > 1:
+        _, t = run(k_sel - 1)
+        assert bool(t.overflow)
+        assert np.array_equal(t.counts, sel.counts)
 
 
 def test_pack_edges_forward_smoke(structure):
@@ -107,8 +164,8 @@ def test_pack_edges_forward_smoke(structure):
         num_gnn_layers=1,
         cutoff=CUTOFF,
     )
-    packed, overflow = _pack(structure, _max_count(structure))
-    assert not bool(overflow)
+    packed, truncation = _pack(structure, _max_count(structure))
+    assert not bool(truncation.overflow)
     params = model.init(jax.random.key(0), **packed)
     energy = model.apply(params, **packed)
     assert bool(jnp.all(jnp.isfinite(energy)))
