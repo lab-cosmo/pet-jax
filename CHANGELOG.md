@@ -6,6 +6,10 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Changed
+
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag: the per-atom and per-pair cutoffs, the selected mask, the selected count per center, and `overflow`, mirroring what `select_edges` reports host-side. Callers that unpacked the flag read `.overflow`; the counts let a driver size `k_sel` without leaving jit.
+
 ### Added
 
 - `center_order` and `corresponding_edges`: jit-safe twins of the two layout steps `to_structure` does on the host (sort a padded flat neighbour list by center with padding last, and build the reverse map by stable multi-key sorts on int32 keys), for raw neighbour lists built on the device.
