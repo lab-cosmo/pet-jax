@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 
+import functools
 from collections.abc import Callable
 
 import flax.linen as nn
@@ -47,12 +48,14 @@ class UPET(nn.Module):
     max_spin_multiplicity: int = 10
     direct_forces: bool = False
     direct_stress: bool = False
-    # Token layout, attention tiling and the reverse gather (``express.Express``);
-    # see ``Backbone``.
+    # Token layout, attention tiling, the reverse gather, rematerialisation and
+    # atom blocks (``express.Express``); see ``Backbone``.
     tokens: str = "padded"
     attention_tile: int | None = None
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    remat: bool = False
+    atom_block: int | None = None
 
     @nn.compact
     def __call__(
@@ -88,6 +91,8 @@ class UPET(nn.Module):
             attention_tile=self.attention_tile,
             fold_extra_block=self.fold_extra_block,
             reverse_unique=self.reverse_unique,
+            remat=self.remat,
+            atom_block=self.atom_block,
             name="backbone",
         )(
             R_ij,
@@ -107,8 +112,11 @@ class UPET(nn.Module):
         # a sorted segment sum by center on the flat one.
         segments = centers if self.tokens == "flat" else None
 
-        predictions = Energy(d_head=self.d_head, name="energy_head")(
-            node, edge, cutoffs, pair_mask, atom_mask, segments
+        def readout(module, node, edge, cutoffs, pair_mask, atom_mask):
+            return _readout(module, node, edge, cutoffs, pair_mask, atom_mask, segments)
+
+        predictions, forces, stress = staged(self, readout, atomic_numbers.shape[0])(
+            node, edge, cutoffs, pair_mask, atom_mask
         )
 
         energy_scale = self.param("energy_scale", nn.initializers.ones, (1,))
@@ -121,9 +129,6 @@ class UPET(nn.Module):
         # loaded scales (forces per-species by Z; stress scalar).
         out = {"energy": energy}
         if self.direct_forces:
-            forces = DirectForces(d_head=self.d_head, name="forces_head")(
-                node, edge, cutoffs, pair_mask, atom_mask, segments
-            )
             force_scale = self.param(
                 "force_scale", nn.initializers.ones, (self.max_atomic_number + 1,)
             )
@@ -131,12 +136,22 @@ class UPET(nn.Module):
                 forces * force_scale[atomic_numbers][:, None] * atom_mask[:, None]
             )
         if self.direct_stress:
-            stress = DirectStress(d_head=self.d_head, name="stress_head")(
-                node, edge, cutoffs, pair_mask, atom_mask, segments
-            )
             stress_scale = self.param("stress_scale", nn.initializers.ones, (1,))
             out["stress"] = stress * stress_scale * atom_mask[:, None, None]
         return out
+
+
+def _readout(upet, node, edge, cutoffs, pair_mask, atom_mask, segments):
+    """The heads of ``upet`` on (a block of) the backbone's features: per-atom
+    energy, and the raw direct forces and stress (``None`` without heads)."""
+    args = (node, edge, cutoffs, pair_mask, atom_mask, segments)
+    energy = Energy(d_head=upet.d_head, name="energy_head")(*args)
+    forces = stress = None
+    if upet.direct_forces:
+        forces = DirectForces(d_head=upet.d_head, name="forces_head")(*args)
+    if upet.direct_stress:
+        stress = DirectStress(d_head=upet.d_head, name="stress_head")(*args)
+    return energy, forces, stress
 
 
 class Backbone(nn.Module):
@@ -188,6 +203,21 @@ class Backbone(nn.Module):
     ``fold_extra_block`` computes the extra tiles' own block in the
     rectangular pass. Either way the result is the padded layout's to summation
     order, with the same parameter tree.
+
+    Peak memory. Each GNN layer runs in two stages: the tokens (geometry,
+    compress, transformer layers) give the node features and the edge
+    messages, and the message update (reverse gather, comb MLP) gives the next
+    messages; the readout in ``UPET`` is a third. ``remat=True``
+    rematerialises each stage in the backward pass. ``atom_block=B`` maps each
+    stage over contiguous blocks of ``B`` atoms (``staged``) with
+    rematerialised bodies: on the padded layout a block of atoms is a
+    contiguous slice of ``B * n`` pairs, and the only couplings across atoms,
+    the reverse gather and the species tables gathered by neighbour, read from
+    full arrays that the blocks close over. Only the streams between the
+    stages (messages ``[P, d_pet]``, node features ``[N, d_node]``) are
+    materialised. ``N`` must be a multiple of ``min(B, N)``; extra padded atoms
+    are masked like the dummy atom; padded layout only. Neither switch changes
+    the parameter tree, and the result is the stock one to summation order.
     """
 
     d_pet: int = 128
@@ -210,6 +240,8 @@ class Backbone(nn.Module):
     attention_tile: int | None = None
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    remat: bool = False
+    atom_block: int | None = None
 
     @nn.compact
     def __call__(
@@ -237,6 +269,7 @@ class Backbone(nn.Module):
         assert flat == (tile_tokens is not None), "tokens='flat' needs the tile maps"
         if self.attention_tile is not None:
             assert flat and tile_tokens.shape[1] + 1 == self.attention_tile
+        assert not (flat and self.atom_block is not None), "atom_block needs padded tokens"
 
         # Computed once, added to the node features after every GNN layer
         # (upstream adds it to the layer's output node embeddings).
@@ -273,6 +306,7 @@ class Backbone(nn.Module):
             cutoffs_tokens = jnp.concatenate([central, cutoffs.reshape(N, n)], axis=1)
             mask = jnp.concatenate([atom_mask[:, None], pair_mask.reshape(N, n)], axis=1)
 
+        paired = None
         if self.reverse_unique:
             idx = jnp.arange(P)
             paired = pair_mask & pair_mask[reverse] & (reverse[reverse] == idx)
@@ -295,76 +329,152 @@ class Backbone(nn.Module):
         node = node_features[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
-            # Geometric features
-            geom = jnp.concatenate([R_ij, r_ij[..., None]], axis=-1)
-            geom_proj = masked(
-                nn.Dense(d_pet, name=f"gnn_layers_{layer_idx}_edge_embed"),
-                geom,
-                pair_mask,
-            )
-
-            if layer_idx == 0:
-                tokens_flat = masked(
-                    MLP(
-                        (d_pet, d_pet),
-                        name=f"gnn_layers_{layer_idx}_compress",
-                    ),
-                    jnp.concatenate([geom_proj, messages], axis=-1),
-                    pair_mask,
-                )
-            else:
-                neighbor_embed = nn.Embed(
+            neighbor_table = None
+            if layer_idx > 0:
+                neighbor_table = nn.Embed(
                     self.max_atomic_number + 1,
                     d_pet,
                     name=f"gnn_layers_{layer_idx}_neighbor_embed",
-                )
-                neighbor_feats = (
-                    neighbor_embed(atomic_numbers)[neighbors] * pair_mask[..., None]
-                )
-                tokens_flat = masked(
-                    MLP(
-                        (d_pet, d_pet),
-                        name=f"gnn_layers_{layer_idx}_compress",
-                    ),
-                    jnp.concatenate([geom_proj, neighbor_feats, messages], axis=-1),
-                    pair_mask,
-                )
+                )(atomic_numbers)
 
-            edge = tokens_flat if flat else tokens_flat.reshape(N, n, d_pet)
+            def tokens_stage(module, *args, layer_idx=layer_idx, table=neighbor_table):
+                return _layer_tokens(module, layer_idx, table, tiles, *args)
 
-            # Transformer layers
-            for attn_idx in range(self.num_attention_layers):
-                node, edge = TransformerLayer(
-                    d_pet=d_pet,
-                    d_node=d_node,
-                    d_ff=self.d_feedforward,
-                    num_heads=self.num_heads,
-                    temperature=self.attention_temperature,
-                    fold_extra_block=self.fold_extra_block,
-                    name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
-                )(node, edge, cutoffs_tokens, mask, tiles)
+            node, edge_flat = staged(self, tokens_stage, N)(
+                R_ij,
+                r_ij,
+                messages,
+                neighbors,
+                pair_mask,
+                node,
+                cutoffs_tokens,
+                mask,
+                conditioning,
+            )
 
-            if conditioning is not None:
-                node = node + conditioning[:, None, :]
+            def messages_stage(module, *args, layer_idx=layer_idx, edge_full=edge_flat):
+                return _layer_messages(module, layer_idx, edge_full, *args)
 
-            # Message passing (feedforward mixing)
-            edge_flat = edge.reshape(P, d_pet) * pair_mask[..., None]
-            messages = messages + edge_flat
-            if layer_idx < self.num_gnn_layers - 1 or self.final_message_passing:
-                if self.reverse_unique:
-                    reversed_flat = edge_flat.at[reverse].get(unique_indices=True)
-                    reversed_flat = reversed_flat * paired[..., None]
-                else:
-                    reversed_flat = edge_flat[reverse]
-                combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
-                combined = nn.LayerNorm(epsilon=1e-5, name=f"comb_norms_{layer_idx}")(
-                    combined
-                )
-                combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
-                messages = messages + combined * pair_mask[..., None]
+            messages = staged(self, messages_stage, N)(
+                edge_flat, reverse, paired, messages, pair_mask
+            )
 
         node = node[:, 0, :] * atom_mask[:, None]
         return node, messages, cutoffs
+
+
+def _layer_tokens(
+    backbone,
+    layer_idx,
+    neighbor_table,
+    tiles,
+    R_ij,
+    r_ij,
+    messages,
+    neighbors,
+    pair_mask,
+    node,
+    cutoffs_tokens,
+    mask,
+    conditioning,
+):
+    """First stage of GNN layer ``layer_idx`` of ``backbone`` on (a block of)
+    the atoms: geometry and compress MLP per pair, then the transformer layers
+    per atom. Returns the node features ``[N, 1, d_node]`` and the masked edge
+    messages ``[P, d_pet]``."""
+    d_pet = backbone.d_pet
+    geom = jnp.concatenate([R_ij, r_ij[..., None]], axis=-1)
+    geom_proj = masked(
+        nn.Dense(d_pet, name=f"gnn_layers_{layer_idx}_edge_embed"), geom, pair_mask
+    )
+    if neighbor_table is None:
+        features = [geom_proj, messages]
+    else:
+        neighbor_feats = neighbor_table[neighbors] * pair_mask[..., None]
+        features = [geom_proj, neighbor_feats, messages]
+    tokens_flat = masked(
+        MLP((d_pet, d_pet), name=f"gnn_layers_{layer_idx}_compress"),
+        jnp.concatenate(features, axis=-1),
+        pair_mask,
+    )
+
+    N = node.shape[0]
+    edge = tokens_flat if tiles is not None else tokens_flat.reshape(N, -1, d_pet)
+    for attn_idx in range(backbone.num_attention_layers):
+        node, edge = TransformerLayer(
+            d_pet=d_pet,
+            d_node=backbone.d_node,
+            d_ff=backbone.d_feedforward,
+            num_heads=backbone.num_heads,
+            temperature=backbone.attention_temperature,
+            fold_extra_block=backbone.fold_extra_block,
+            name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
+        )(node, edge, cutoffs_tokens, mask, tiles)
+
+    if conditioning is not None:
+        node = node + conditioning[:, None, :]
+    return node, edge.reshape(-1, d_pet) * pair_mask[..., None]
+
+
+def _layer_messages(
+    backbone, layer_idx, edge_full, edge_flat, reverse, paired, messages, pair_mask
+):
+    """Second stage of GNN layer ``layer_idx``: add the edge messages
+    ``edge_flat`` of (a block of) the pairs and, with message passing after
+    this layer, their mix with the reverse messages, gathered from all pairs'
+    ``edge_full``."""
+    d_pet = backbone.d_pet
+    messages = messages + edge_flat
+    if layer_idx < backbone.num_gnn_layers - 1 or backbone.final_message_passing:
+        if backbone.reverse_unique:
+            reversed_flat = edge_full.at[reverse].get(unique_indices=True)
+            reversed_flat = reversed_flat * paired[..., None]
+        else:
+            reversed_flat = edge_full[reverse]
+        combined = jnp.concatenate([edge_flat, reversed_flat], axis=-1)
+        combined = nn.LayerNorm(epsilon=1e-5, name=f"comb_norms_{layer_idx}")(combined)
+        combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
+        messages = messages + combined * pair_mask[..., None]
+    return messages
+
+
+def staged(module, fn, num_atoms):
+    """``fn(module, *args)`` as a stage of the forward, run as ``module``'s
+    ``remat`` / ``atom_block`` say: as is (stock), rematerialised, or mapped
+    over blocks of atoms. Every leaf of ``args`` and of the result is per
+    atom or per pair, its leading axis ``num_atoms`` or ``num_atoms * n`` in
+    center-major order; a block is the same contiguous fraction of each.
+
+    The Flax lifted transforms take ``fn`` with the module as first argument,
+    so the submodules ``fn`` creates keep their names in ``module``'s scope
+    and the parameter tree is the stock one; ``variable_broadcast="params"``
+    hands every block the same parameters. Arrays ``fn`` closes over are seen
+    whole by each block."""
+    if module.atom_block is None:
+        return functools.partial(nn.remat(fn) if module.remat else fn, module)
+    block = min(module.atom_block, num_atoms)
+    if num_atoms % block:
+        raise ValueError(
+            f"atom_block={module.atom_block} does not divide N_padded={num_atoms}"
+        )
+    num_blocks = num_atoms // block
+
+    def body(mod, carry, args):
+        return carry, fn(mod, *args)
+
+    scan = nn.scan(
+        nn.remat(body, prevent_cse=False),
+        variable_broadcast="params",
+        split_rngs={"params": False},
+        length=num_blocks,
+    )
+
+    def run(*args):
+        blocks = jax.tree.map(lambda x: x.reshape((num_blocks, -1) + x.shape[1:]), args)
+        _, out = scan(module, None, blocks)
+        return jax.tree.map(lambda y: y.reshape((-1,) + y.shape[2:]), out)
+
+    return run
 
 
 class Energy(nn.Module):

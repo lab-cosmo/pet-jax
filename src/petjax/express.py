@@ -62,6 +62,16 @@ class Express:
         rectangular pass instead of the compacted extra path.
       reverse_unique: gather the reverse messages through an involution with
         unique indices.
+
+    Peak memory (``model.py``):
+      remat: rematerialise each GNN layer's two stages (geometry, compress and
+        transformer; message update) and the readout in the backward pass
+        instead of keeping their activations.
+      atom_block: run those stages over contiguous blocks of that many atoms
+        (``lax.scan``), block bodies rematerialised, so only the per-layer
+        streams ``[P, d_pet]`` and ``[N, d_node]`` and one block's activations
+        are live. The calculator pads ``N_padded`` to a multiple of it (a block
+        larger than ``N_padded`` is one block). Needs ``tokens="padded"``.
     """
 
     solver: str = "segment_sum"
@@ -78,6 +88,8 @@ class Express:
     tile_floor: int = 8
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    remat: bool = False
+    atom_block: int | None = None
 
     def __post_init__(self):
         _check_choice("solver", self.solver, SOLVERS)
@@ -89,6 +101,10 @@ class Express:
             raise ValueError("fold_extra_block needs attention_tile")
         if self.attention_tile is not None and self.attention_tile < 2:
             raise ValueError("attention_tile must hold the centre and one neighbour")
+        if self.atom_block is not None and self.tokens != "padded":
+            raise ValueError("atom_block needs tokens='padded'")
+        if self.atom_block is not None and self.atom_block < 1:
+            raise ValueError("atom_block must be at least 1")
 
     @classmethod
     def from_any(cls, value):
@@ -113,6 +129,8 @@ class Express:
             "attention_tile": self.attention_tile,
             "fold_extra_block": self.fold_extra_block,
             "reverse_unique": self.reverse_unique,
+            "remat": self.remat,
+            "atom_block": self.atom_block,
         }
         stock = Express()
         return {k: v for k, v in updates.items() if v != getattr(stock, k)}
