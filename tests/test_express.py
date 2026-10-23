@@ -311,3 +311,27 @@ def test_device_list_trajectory(checkpoint, frames):
         candidate.append((energy, forces, atoms.get_stress(), dict(calc.call_stats)))
     assert_equivalent(stock, candidate)
     assert len(builds) == 2  # one sizing per structure
+
+
+def test_peak_memory(assets_dir, frames, capsys):
+    """Compiled for 324 atoms in fp64, the forward's temporary memory goes
+    down with remat and further with atom blocks. Only the ordering is
+    meaningful on the CPU: remat saves little under XLA:CPU's scheduling, and
+    the factors on a GPU differ."""
+    atoms = frames[-1].repeat((3, 1, 1))
+    checkpoint = assets_dir / "checkpoints" / "pet-mad-xs-v1.6"
+    temp = {}
+    for name, express in (
+        ("stock", Express()),
+        ("remat", Express(remat=True)),
+        ("atom_block16", Express(atom_block=16)),
+    ):
+        calc = UPETCalculator.from_checkpoint(
+            str(checkpoint), default_dtype="float64", express=express
+        )
+        calc._build_structure(atoms)
+        compiled = calc._predict_fn.lower(calc._params, calc._structure).compile()
+        temp[name] = compiled.memory_analysis().temp_size_in_bytes / len(atoms) / 1e3
+    with capsys.disabled():
+        print("\ntemp kB/atom:", {k: round(v, 1) for k, v in temp.items()})
+    assert temp["atom_block16"] < temp["remat"] < temp["stock"]
