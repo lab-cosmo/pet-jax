@@ -21,6 +21,7 @@ def to_structure(
     bucket_strategy="multiples",
     n_atoms_bucket_strategy=None,
     n_pair_bucket_strategy=None,
+    atom_block=None,
     int_dtype=np.int64,
     float_dtype=np.float64,
 ):
@@ -33,7 +34,10 @@ def to_structure(
     to ``None`` — no bucketing — because ``n_atoms`` is constant across an
     MD trajectory, so any padding above ``n_atoms + 1`` is dead per-atom
     work in the model body. Set explicitly only if a single Calculator is
-    reused across structures of different sizes.
+    reused across structures of different sizes. ``atom_block`` (the
+    blocked forward's, ``express.Express``) then rounds ``N_padded`` up to a
+    multiple of it, unless it fits in one block; the atoms added are padding
+    like the rest, and the dummy atom stays at ``N_padded - 1``.
 
     Pairs come back grouped by center (``sorted=True``): ``_pack_selected_to_flat``
     and the segment sums require ``i`` non-decreasing.
@@ -64,6 +68,8 @@ def to_structure(
         S = np.zeros((len(i), 3), dtype=float_dtype)
 
     N_padded = _bucket_or(n_atoms + 1, n_atoms_bucket_strategy)
+    if atom_block is not None and N_padded > atom_block:
+        N_padded = -(-N_padded // atom_block) * atom_block
     dummy_atom = N_padded - 1
 
     n_pair_raw = len(i)

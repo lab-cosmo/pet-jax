@@ -315,6 +315,7 @@ class UPETCalculator(BaseCalculator):
             bucket_strategy=self._bucket_strategy,
             n_atoms_bucket_strategy=self._n_atoms_bucket_strategy,
             n_pair_bucket_strategy=self._n_pair_bucket_strategy,
+            atom_block=self.express.atom_block,
         )
 
         N_padded = structure["positions"].shape[0]
