@@ -70,8 +70,10 @@ class Express:
       atom_block: run those stages over contiguous blocks of that many atoms
         (``lax.scan``), block bodies rematerialised, so only the per-layer
         streams ``[P, d_pet]`` and ``[N, d_node]`` and one block's activations
-        are live. The calculator pads ``N_padded`` to a multiple of it (a block
-        larger than ``N_padded`` is one block). Needs ``tokens="padded"``.
+        are live. It is an upper bound: the atoms are cut into the fewest
+        equal blocks of at most that size, and the calculator pads ``N_padded``
+        to a multiple of their number (below ``N_padded / atom_block + 1``
+        atoms of padding). Needs ``tokens="padded"``.
     """
 
     solver: str = "segment_sum"

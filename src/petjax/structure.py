@@ -14,6 +14,22 @@ import jax.numpy as jnp
 from marathon.utils import next_size
 
 
+def atom_blocks(num_atoms, atom_block):
+    """``(num_blocks, block)`` for the blocked forward: the fewest equal
+    blocks of at most ``atom_block`` atoms that hold ``num_atoms``, so the
+    padding is below ``num_blocks`` atoms instead of below ``atom_block``
+    (a block of 8192 on 10006 atoms gives two blocks of 5003, not 16384 atoms).
+    ``num_atoms`` must be a multiple of ``num_blocks``, which ``to_structure``
+    arranges."""
+    num_blocks = -(-num_atoms // atom_block)
+    if num_atoms % num_blocks:
+        raise ValueError(
+            f"atom_block={atom_block} on {num_atoms} atoms needs {num_blocks} equal "
+            f"blocks; pad to a multiple of {num_blocks}"
+        )
+    return num_blocks, num_atoms // num_blocks
+
+
 def to_structure(
     atoms,
     cutoff,
@@ -36,8 +52,10 @@ def to_structure(
     work in the model body. Set explicitly only if a single Calculator is
     reused across structures of different sizes. ``atom_block`` (the
     blocked forward's, ``express.Express``) then rounds ``N_padded`` up to a
-    multiple of it, unless it fits in one block; the atoms added are padding
-    like the rest, and the dummy atom stays at ``N_padded - 1``.
+    multiple of the number of blocks it implies, ``ceil(N_padded /
+    atom_block)``, so the blocks are equal and at most that many atoms are
+    added (``atom_blocks``); the atoms added are padding like the rest, and
+    the dummy atom stays at ``N_padded - 1``.
 
     Pairs come back grouped by center (``sorted=True``): ``_pack_selected_to_flat``
     and the segment sums require ``i`` non-decreasing.
@@ -68,8 +86,9 @@ def to_structure(
         S = np.zeros((len(i), 3), dtype=float_dtype)
 
     N_padded = _bucket_or(n_atoms + 1, n_atoms_bucket_strategy)
-    if atom_block is not None and N_padded > atom_block:
-        N_padded = -(-N_padded // atom_block) * atom_block
+    if atom_block is not None:
+        num_blocks = -(-N_padded // atom_block)
+        N_padded = -(-N_padded // num_blocks) * num_blocks
     dummy_atom = N_padded - 1
 
     n_pair_raw = len(i)

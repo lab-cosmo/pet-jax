@@ -11,6 +11,7 @@ from flax.linen import attention as flax_attention
 
 from typing import NamedTuple
 
+from .structure import atom_blocks
 from .utils import cutoff_bump, safe_norm
 
 
@@ -215,7 +216,8 @@ class Backbone(nn.Module):
     the reverse gather and the species tables gathered by neighbour, read from
     full arrays that the blocks close over. Only the streams between the
     stages (messages ``[P, d_pet]``, node features ``[N, d_node]``) are
-    materialised. ``N`` must be a multiple of ``min(B, N)``; extra padded atoms
+    materialised. ``N`` is cut into ``ceil(N / B)`` equal blocks
+    (``structure.atom_blocks``) and must be a multiple of that; extra padded atoms
     are masked like the dummy atom; padded layout only. Neither switch changes
     the parameter tree, and the result is the stock one to summation order.
     """
@@ -452,12 +454,7 @@ def staged(module, fn, num_atoms):
     whole by each block."""
     if module.atom_block is None:
         return functools.partial(nn.remat(fn) if module.remat else fn, module)
-    block = min(module.atom_block, num_atoms)
-    if num_atoms % block:
-        raise ValueError(
-            f"atom_block={module.atom_block} does not divide N_padded={num_atoms}"
-        )
-    num_blocks = num_atoms // block
+    num_blocks, _ = atom_blocks(num_atoms, module.atom_block)
 
     def body(mod, carry, args):
         return carry, fn(mod, *args)

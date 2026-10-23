@@ -54,6 +54,8 @@ CASES = {
     "atom_block8": Express(atom_block=8),
     # every frame in a single block, no extra padding
     "atom_block256": Express(atom_block=256),
+    # two blocks of 55 on the 109-atom frame (one atom of padding), one on the rest
+    "atom_block64": Express(atom_block=64),
     "atom_block-sorted_window": Express(atom_block=8, solver="sorted_window"),
     "atom_block-device_list": Express(
         atom_block=8, neighbor_list="device", cutoff_guard=True, reverse_unique=True
