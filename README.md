@@ -165,7 +165,7 @@ state = result.fix_or_raise(state)  # grows k_sel (and kUPS's list capacities) i
 out = evaluate(state).value.data   # per-system energies, dE/dr, dE/dcell
 ```
 
-Inside kUPS's propagators the same assertion-and-fix loop runs automatically, so `k_sel` is sized the way kUPS sizes its own neighbour-list capacities: start it small, it grows on the first overflow. There is no host-side sizing pass and no Verlet skin; the raw list comes from kUPS at the checkpoint's cutoff. Several systems in one state are evaluated together, each getting its own energy and gradients, and must share their periodicity (a kUPS `Cell` has one periodicity mask).
+Inside kUPS's propagators the same assertion-and-fix loop runs automatically, so `k_sel` is sized the way kUPS sizes its own neighbour-list capacities: start it small, it grows on the first overflow. It is sized only from a complete edge list, so when kUPS's own list capacities are still being repaired (they start from a density estimate that misjudges clusters in vacuum) `k_sel` waits one cycle rather than growing from a truncated list. There is no host-side sizing pass and no Verlet skin; the raw list comes from kUPS at the checkpoint's cutoff. Several systems in one state are evaluated together, each getting its own energy and gradients, and must share their periodicity (a kUPS `Cell` has one periodicity mask).
 
 What to know:
 

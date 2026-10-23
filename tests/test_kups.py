@@ -333,3 +333,33 @@ def test_overflow_grows_k_sel(frames, mliap, potential):
     np.testing.assert_allclose(
         second.value.data.total_energies.data, out.total_energies.data, rtol=1e-6
     )
+
+
+def test_truncated_list_does_not_size_k_sel(frames, mliap, potential):
+    """kUPS neighbour-list capacities that are too small give a truncated edge
+    list in the same cycle whose assertion repairs them; the adaptive cutoffs
+    on that list are too wide and the counts too high. k_sel must be sized
+    only once the list is complete: starting from tiny list capacities ends at
+    the same k_sel as starting from kUPS's estimate."""
+    atoms = frames[PERIODIC[0]]
+    settled = _state([atoms], mliap.model.cutoff, k_sel=1)
+    tiny = State(
+        settled.particles,
+        settled.systems,
+        UniversalNeighborlistParameters(
+            avg_edges=1,
+            avg_candidates=1,
+            avg_image_candidates=1,
+            cells=settled.neighborlist_params.cells,
+        ),
+        settled.upet_params,
+    )
+    first = as_result_function(potential)(tiny)
+    assert any("capacity" in str(a) for a in first.failed_assertions)
+
+    out_tiny, tiny = _evaluate(potential, tiny)
+    out_settled, settled = _evaluate(potential, settled)
+    assert tiny.upet_params.k_sel == settled.upet_params.k_sel
+    np.testing.assert_allclose(
+        out_tiny.total_energies.data, out_settled.total_energies.data, rtol=1e-6
+    )

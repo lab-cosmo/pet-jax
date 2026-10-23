@@ -208,6 +208,21 @@ def upet_energy(inp: UPETGraphInput) -> WithPatch[Table[SystemId, Energy], IdPat
     centers, others = indices[order, 0], indices[order, 1]
     cell_shifts, pair_mask, R_ij = edges.shifts[order, 0], pair_mask[order], R_ij[order]
     reverse = corresponding_edges(centers, others, cell_shifts, pair_mask)
+    # A kUPS edge buffer that overflowed comes back truncated with no flag
+    # (kUPS's own assertion fails and the cycle reruns, but every failed fix is
+    # applied at once). Missing neighbours push the adaptive cutoffs to the
+    # maximum and the counts up, and k_sel never shrinks, so size it only from
+    # a complete graph. A complete radius graph is symmetric: every real pair
+    # finds its reverse.
+    complete = jnp.all(
+        ~pair_mask
+        | (
+            pair_mask[reverse]
+            & (centers[reverse] == others)
+            & (others[reverse] == centers)
+            & (cell_shifts[reverse] == -cell_shifts).all(axis=-1)
+        )
+    )
 
     truncated, truncation = truncate_edges(
         R_ij.astype(dtype),
@@ -226,7 +241,7 @@ def upet_energy(inp: UPETGraphInput) -> WithPatch[Table[SystemId, Energy], IdPat
     )
     # pet-jax's overflow signal as a kUPS assertion: the fix grows k_sel on
     # the state and the step is rerun at the new static width.
-    k_sel.generate_assertion(truncation.counts.max())
+    k_sel.generate_assertion(jnp.where(complete, truncation.counts.max(), 0))
 
     conditioning = {}
     if mliap.conditioning is not None:
