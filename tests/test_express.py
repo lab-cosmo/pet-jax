@@ -47,6 +47,25 @@ CASES = {
         solver="blocked_prefix_sum", seed_cutoffs=True, solver_iterations=3
     ),
     "sorted_window_seeded": Express(solver="sorted_window", seed_cutoffs=True),
+    "remat": Express(remat=True),
+    "remat-flat-tile12": Express(remat=True, tokens="flat", attention_tile=12),
+    # 109 -> 112 padded atoms on the large frame (14 blocks), 25 -> 32 on the
+    # 24-atom molecule; the 3-atom one fits in a single block
+    "atom_block8": Express(atom_block=8),
+    # every frame in a single block, no extra padding
+    "atom_block256": Express(atom_block=256),
+    "atom_block-sorted_window": Express(atom_block=8, solver="sorted_window"),
+    "atom_block-device_list": Express(
+        atom_block=8, neighbor_list="device", cutoff_guard=True, reverse_unique=True
+    ),
+    "atom_block-everything_padded": Express(
+        atom_block=16,
+        solver="sorted_window",
+        seed_cutoffs=True,
+        neighbor_list="device",
+        cutoff_guard=True,
+        reverse_unique=True,
+    ),
     # every stream at once
     "everything": Express(
         solver="sorted_window",
@@ -175,6 +194,59 @@ def test_express_validation():
         Express(attention_tile=32)  # needs flat tokens
     with pytest.raises(ValueError):
         Express(tokens="flat", fold_extra_block=True)  # needs a tile
+    with pytest.raises(ValueError):
+        Express(tokens="flat", atom_block=8)  # padded only
+    with pytest.raises(ValueError):
+        Express(atom_block=0)
+    assert Express(atom_block=8, remat=True).model_updates() == {
+        "atom_block": 8,
+        "remat": True,
+    }
+
+
+@pytest.mark.parametrize("express", [Express(remat=True), Express(atom_block=8)])
+def test_param_tree_unchanged(express, assets_dir, frames):
+    """The switches leave the parameter tree as it is: ``init`` gives the
+    checkpoint's names and shapes (direct heads included) and the stock
+    values."""
+    import jax
+    import jax.numpy as jnp
+
+    from petjax.convert import load_checkpoint
+    from petjax.model import UPET
+    from petjax.select import truncate
+    from petjax.structure import to_structure
+
+    params, metadata = load_checkpoint(assets_dir / "checkpoints" / "pet-mad-xs-v1.6")
+    config = metadata["config"]
+    stock = UPET(**config, direct_forces=True, direct_stress=True)
+    model = stock.clone(**express.model_updates())
+    structure = to_structure(frames[-1], config["cutoff"], atom_block=express.atom_block)
+    structure["k_sel_sizer"] = jnp.zeros(24, dtype=bool)
+    truncated, _ = truncate(
+        structure,
+        config["num_neighbors_adaptive"],
+        config["cutoff"],
+        config["cutoff_width_adaptive"],
+        method=config["adaptive_cutoff_method"],
+    )
+
+    def shapes(variables):
+        return jax.tree.map(jnp.shape, variables)
+
+    key = jax.random.PRNGKey(0)
+    reference = stock.init(key, **truncated)
+    initialised = model.init(key, **truncated)
+    assert shapes(initialised) == shapes(reference) == shapes(params)
+    jax.tree.map(np.testing.assert_array_equal, initialised, reference)
+
+
+@pytest.mark.parametrize("name", ["remat", "atom_block8"])
+def test_direct_heads(name, checkpoint, frames):
+    """The non-conservative heads run per block (or rematerialised) too."""
+    direct = dict(direct_forces=True, direct_stress=True)
+    stock = predictions(checkpoint, frames, Express(), **direct)
+    assert_equivalent(stock, predictions(checkpoint, frames, CASES[name], **direct))
 
 
 def test_express_recorded(checkpoint, frames):
