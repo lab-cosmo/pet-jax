@@ -6,8 +6,14 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Changed
+
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag: the per-atom and per-pair cutoffs, the selected mask, the selected count per center, and `overflow`, mirroring what `select_edges` reports host-side. Callers that unpacked the flag read `.overflow`; the counts let a driver size `k_sel` without leaving jit.
+
 ### Added
 
+- `petjax.kups`, an adapter that runs a converted checkpoint as a [kUPS](https://github.com/cusp-ai-oss/kups) potential (`pip install "pet-jax[kups]"`, Python ≥ 3.12): the raw neighbour list is built on the device by kUPS, several systems batch in one program, and `k_sel` grows through kUPS's capacity-fix loop. Energies, forces and cell gradients agree with `UPETCalculator`.
+- `center_order` and `corresponding_edges`: jit-safe twins of the two layout steps `to_structure` does on the host (sort a padded flat neighbour list by center with padding last, and build the reverse map by stable multi-key sorts on int32 keys), for raw neighbour lists built on the device.
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
 

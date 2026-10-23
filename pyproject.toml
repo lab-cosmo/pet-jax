@@ -45,6 +45,8 @@ Changelog = "https://github.com/lab-cosmo/pet-jax/blob/main/CHANGELOG.md"
 # The metatrain floor keeps the resolver off the broken metatrain==0.0.0
 # placeholder sdist on PyPI (predates the real releases; fails to build).
 convert = ["torch", "metatomic-torch", "metatrain>=2026.3"]
+# The kUPS adapter (petjax.kups); kUPS itself needs Python 3.12.
+kups = ["kups>=1.0.8; python_version >= '3.12'"]
 
 [project.scripts]
 petjax-convert = "petjax.cli:convert_main"

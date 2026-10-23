@@ -127,7 +127,7 @@ def _select_and_predict(
     if epsilon is not None:
         structure = apply_strain(structure, epsilon)
 
-    truncated, overflow = truncate(
+    truncated, truncation = truncate(
         structure,
         num_neighbors_adaptive,
         cutoff,
@@ -136,7 +136,7 @@ def _select_and_predict(
         no_shadow=no_shadow,
     )
     out = model.apply(params, **truncated)
-    aux = {"overflow": overflow}
+    aux = {"overflow": truncation.overflow}
     if isinstance(out, dict):
         energy = jnp.sum(out["energy"])
         if "forces" in out:

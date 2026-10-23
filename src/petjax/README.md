@@ -16,10 +16,18 @@ The top-level README explains the 2-phase split (outside JIT = build + size; ins
 
 - Adaptive per-atom cutoffs are recomputed inside the autograd graph every step. They depend on neighbour positions, so they must contribute to `dE/dpositions` — otherwise forces are wrong.
 - `truncate` splits at the displacement boundary: `edge_displacements` (single structure, one cell) feeds `truncate_edges`, the layout-agnostic selection+pack core. External consumers with precomputed per-edge displacements — training pipelines batching several structures, where no single cell exists — call `truncate_edges` directly (public API); it requires `centers` non-decreasing and a static `k_sel`.
+- Next to the truncated dict, `truncate_edges` and `pack_edges` return a `Truncation`: the same accounting as the host-side `Selection` (cutoffs, selected mask, counts per center) plus `overflow`, as traced arrays. A driver that lives entirely inside jit sizes `k_sel` from `counts` instead of calling `select_edges`.
 - `pack_edges` is the selection-free sibling of `truncate_edges`: it packs every unmasked pair to a fixed width `k` and emits `pair_cutoffs=None` (plain scalar-cutoff bump in the model). For NLs trimmed upstream to ≤ `k` per center (hard-capped training); its `overflow` flag signals insufficient trimming. It reuses `_pack_selected_to_flat`.
 - Selection uses `vmap(boolean_mask_indices)`, a JIT-compatible `array[mask]` adapted from [GLP](https://github.com/sirmarcel/glp), so shapes stay fixed across selections.
 - The reverse-pair map is built via the index chain `raw_to_sel[reverse_raw[sel_to_raw]]`, not by search-by-value. The latter is ambiguous when an atom is its own neighbour through multiple periodic images.
 - `value_and_grad(..., argnums=(positions, strain))` gives forces and the virial stress in one pass. Composition shifts (linear in atomic numbers) are added post-JIT in Python fp64 so they contribute zero to forces with no precision loss.
+
+**Under kUPS** — `kups.upet_energy`, traced inside kUPS's jitted propagator
+
+- The energy function reuses the in-JIT half only: `Edges.difference_vectors` for `R_ij` (per-system cells), `center_order` and `corresponding_edges` for the layout, `truncate_edges` for selection and pack, `model.apply` for the forward. kUPS's out-of-bounds sentinel index is the atom count, so padding the particle arrays by one row makes it pet-jax's dummy atom with no index arithmetic.
+- The outside-JIT half is replaced by kUPS's capacity machinery: `k_sel` is a static field on the state (`UPETParameters`), read through a `LensCapacity`, and `Truncation.counts.max()` feeds `generate_assertion`. On overflow kUPS's runner applies the fix (next power of `growth_base` above the count), the propagator retraces at the new static `k_sel` and the block reruns. This is why `truncate_edges` returns the counts. The requirement is gated on the edge list being complete (every real pair has its reverse): a kUPS buffer that overflowed comes back truncated with no flag, the missing neighbours push the adaptive cutoffs to the maximum and the counts up, and since every failed fix is applied in the same cycle and capacities never shrink, `k_sel` would otherwise be sized from a graph that was never real.
+- Gradients come from kUPS's `PotentialFromEnergy` (`jax.vjp` over positions and the cell's frame parameters), so the implicit-function-theorem step of the cutoff solve is inside the gradient as in `predict_fn`. The cell gradient is w.r.t. the six lower-triangular entries kUPS parametrises; see the top-level README for why that differs from the calculator's Voigt stress for a non-equivariant model.
+- `jit` placement: none in `kups.py`. kUPS jits the propagator and `PotentialFromEnergy.__call__`; the energy function is plain.
 
 **Per-step orchestration** — `UPETCalculator.calculate`
 
@@ -45,6 +53,7 @@ Shape stability is best-effort, not enforced: shapes tend to be stable or grow w
 ## Internal conventions
 
 - **Rectangular NL layout**: shape `[N_padded * k, ...]` where `k = k_raw` (raw NL) or `k = k_sel` (post-selection). A single dummy atom at index `N_padded - 1` absorbs all padded neighbours; pair masks zero out their contributions inside the model.
+- **Device-side layout helpers**: `center_order` and `corresponding_edges` in `structure.py` are jit-safe twins of the host steps in `to_structure`, for a raw list built on the device or handed over by a driver in its own order: sort by center with padding last, then the reverse map by two stable multi-key `lax.sort`s on int32 keys (no int64 encoding, no x64). Padded pairs map to themselves, as on the host, so the dummy-atom conventions carry over unchanged.
 - **Attention uses `flax.linen.attention.dot_product_attention`**, not `jax.nn.dot_product_attention`. The JAX builtin hardcodes its softmax to fp32 and fills masked slots with `-0.7 * finfo(logits_dtype).max`. That overflows to `-inf` when fp64 logits are cast to fp32, which gives NaN softmax on fully-masked padded-atom rows (only the backward path bites; forward survives because NaN×0 for masked slots is still NaN, but only in the gradient). Flax runs softmax in the input dtype and masks with `finfo(dtype).min` in that same dtype, so both fp32 and fp64 work.
 
 ## Code style
