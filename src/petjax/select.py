@@ -143,11 +143,23 @@ def truncate_edges(
     return truncated, overflow
 
 
-def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_mask, k):
+def pack_edges(
+    R_ij,
+    centers,
+    others,
+    reverse,
+    pair_mask,
+    atomic_numbers,
+    atom_mask,
+    k,
+    pair_cutoffs=None,
+):
     """Fixed-width pack on a flat NL with precomputed displacements — no
     selection: every unmasked pair goes into the rectangular ``[N * k]``
-    layout. Returns the truncated dict keyed like ``truncate_edges``'s, with
-    ``pair_cutoffs=None`` (the model applies its plain scalar-cutoff bump).
+    layout. Returns the truncated dict keyed like ``truncate_edges``'s.
+    ``pair_cutoffs`` (per flat pair, optional) are packed with the pairs and set the
+    model's per-pair cutoff bump; without them the model applies its scalar
+    cutoff.
 
     ``overflow`` is True iff a center holds more than ``k`` unmasked pairs —
     that pair is silently dropped, so trim upstream to ``<= k`` per center.
@@ -171,7 +183,7 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_m
         "reverse": slot[reverse[sel_to_pair]],
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,
-        "pair_cutoffs": None,
+        "pair_cutoffs": None if pair_cutoffs is None else pair_cutoffs[sel_to_pair],
     }
     return truncated, overflow
 

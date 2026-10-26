@@ -114,6 +114,59 @@ def test_pack_edges_forward_smoke(structure):
     assert bool(jnp.all(jnp.isfinite(energy)))
 
 
+def test_pack_edges_pair_cutoffs(structure):
+    """Per-pair cutoffs travel with their pairs, and a constant one equal to
+    the model cutoff reproduces the scalar-cutoff forward."""
+    from petjax import UPET
+    from petjax.utils import edge_displacements
+
+    k = _max_count(structure)
+    R_ij = edge_displacements(
+        structure["positions"],
+        structure["centers"],
+        structure["others"],
+        structure["cell_shifts"],
+        structure["cell"],
+    )
+    args = (
+        R_ij,
+        structure["centers"],
+        structure["others"],
+        structure["reverse"],
+        structure["pair_mask"],
+        structure["atomic_numbers"],
+        structure["atom_mask"],
+        k,
+    )
+    tag = np.arange(len(structure["centers"]), dtype=np.float32)
+    packed, _ = pack_edges(*args, pair_cutoffs=tag)
+    real = np.asarray(packed["pair_mask"])
+    by_tag = np.asarray(packed["pair_cutoffs"])[real].astype(int)
+    np.testing.assert_array_equal(
+        np.asarray(packed["centers"])[real], structure["centers"][by_tag]
+    )
+    np.testing.assert_array_equal(
+        np.asarray(packed["neighbors"])[real], structure["others"][by_tag]
+    )
+
+    model = UPET(
+        d_pet=8,
+        d_node=8,
+        d_head=8,
+        d_feedforward=8,
+        num_heads=2,
+        num_attention_layers=1,
+        num_gnn_layers=1,
+        cutoff=CUTOFF,
+    )
+    scalar, _ = pack_edges(*args)
+    constant, _ = pack_edges(*args, pair_cutoffs=np.full_like(tag, CUTOFF))
+    params = model.init(jax.random.key(0), **scalar)
+    np.testing.assert_allclose(
+        model.apply(params, **constant), model.apply(params, **scalar), rtol=1e-6, atol=1e-7
+    )
+
+
 # -- select_edges: the adaptive selection's mask, host-side --
 
 
