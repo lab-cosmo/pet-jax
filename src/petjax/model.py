@@ -56,6 +56,7 @@ class UPET(nn.Module):
     fold_extra_block: bool = False
     reverse_unique: bool = False
     attention: str = "xla"
+    fold_compress: bool = False
     remat: bool = False
     atom_block: int | None = None
 
@@ -94,6 +95,7 @@ class UPET(nn.Module):
             fold_extra_block=self.fold_extra_block,
             reverse_unique=self.reverse_unique,
             attention=self.attention,
+            fold_compress=self.fold_compress,
             remat=self.remat,
             atom_block=self.atom_block,
             name="backbone",
@@ -200,6 +202,17 @@ class Backbone(nn.Module):
     instead of ``flax``'s ``dot_product_attention``; single tiles only, same
     result to round-off.
 
+    ``fold_compress=True`` folds the inputs of each layer's compress MLP into
+    its first ``Dense``: the geometry projection, the neighbour species table
+    and the biases are linear, so ``concat([geom_proj, table[Z_j], messages])
+    @ W1`` becomes ``messages @ W1_m + (table @ W1_t)[Z_j] + geom @ (W_e W1_g)
+    + b'`` with the three small weight products formed at trace time; at layer
+    0 the messages are the species embedding itself and the GEMM becomes a
+    table lookup. One GEMM of width ``d_pet`` replaces the width-4 GEMM, the
+    concat and the width-``3 d_pet`` GEMM; the parameter tree is unchanged and
+    the result is the stock one to round-off. Applies only in ``apply``: the
+    stock layers run during ``init`` so the parameters exist.
+
     Token layout. ``tokens="padded"`` (stock) takes the pairs in the
     rectangular ``[N * n]`` layout. ``tokens="flat"`` takes one compacted,
     center-sorted token list ``[P]`` of any static length plus the attention
@@ -251,6 +264,7 @@ class Backbone(nn.Module):
     fold_extra_block: bool = False
     reverse_unique: bool = False
     attention: str = "xla"
+    fold_compress: bool = False
     remat: bool = False
     atom_block: int | None = None
 
@@ -340,6 +354,8 @@ class Backbone(nn.Module):
         node = node_features[:, None, :] * atom_mask[:, None, None]
 
         for layer_idx in range(self.num_gnn_layers):
+            # the species tables the compress MLP reads: the neighbour embedding, and at
+            # layer 0 the edge embedding behind the messages (for the fold)
             neighbor_table = None
             if layer_idx > 0:
                 neighbor_table = nn.Embed(
@@ -347,9 +363,16 @@ class Backbone(nn.Module):
                     d_pet,
                     name=f"gnn_layers_{layer_idx}_neighbor_embed",
                 )(atomic_numbers)
+            message_table = edge_embed(atomic_numbers) if layer_idx == 0 else None
 
-            def tokens_stage(module, *args, layer_idx=layer_idx, table=neighbor_table):
-                return _layer_tokens(module, layer_idx, table, tiles, *args)
+            def tokens_stage(
+                module,
+                *args,
+                layer_idx=layer_idx,
+                table=neighbor_table,
+                message_table=message_table,
+            ):
+                return _layer_tokens(module, layer_idx, table, message_table, tiles, *args)
 
             node, edge_flat = staged(self, tokens_stage, N)(
                 R_ij,
@@ -378,6 +401,7 @@ def _layer_tokens(
     backbone,
     layer_idx,
     neighbor_table,
+    message_table,
     tiles,
     R_ij,
     r_ij,
@@ -392,22 +416,36 @@ def _layer_tokens(
     """First stage of GNN layer ``layer_idx`` of ``backbone`` on (a block of)
     the atoms: geometry and compress MLP per pair, then the transformer layers
     per atom. Returns the node features ``[N, 1, d_node]`` and the masked edge
-    messages ``[P, d_pet]``."""
+    messages ``[P, d_pet]``. ``neighbor_table`` / ``message_table`` are the
+    species tables ``[N, d_pet]`` behind the neighbour features and (at layer
+    0) the messages."""
     d_pet = backbone.d_pet
     geom = jnp.concatenate([R_ij, r_ij[..., None]], axis=-1)
-    geom_proj = masked(
-        nn.Dense(d_pet, name=f"gnn_layers_{layer_idx}_edge_embed"), geom, pair_mask
-    )
-    if neighbor_table is None:
-        features = [geom_proj, messages]
+    if backbone.fold_compress and not backbone.is_initializing():
+        tokens_flat = _compress_folded(
+            backbone,
+            layer_idx,
+            neighbor_table,
+            message_table,
+            geom,
+            messages,
+            neighbors,
+            pair_mask,
+        )
     else:
-        neighbor_feats = neighbor_table[neighbors] * pair_mask[..., None]
-        features = [geom_proj, neighbor_feats, messages]
-    tokens_flat = masked(
-        MLP((d_pet, d_pet), name=f"gnn_layers_{layer_idx}_compress"),
-        jnp.concatenate(features, axis=-1),
-        pair_mask,
-    )
+        geom_proj = masked(
+            nn.Dense(d_pet, name=f"gnn_layers_{layer_idx}_edge_embed"), geom, pair_mask
+        )
+        if neighbor_table is None:
+            features = [geom_proj, messages]
+        else:
+            neighbor_feats = neighbor_table[neighbors] * pair_mask[..., None]
+            features = [geom_proj, neighbor_feats, messages]
+        tokens_flat = masked(
+            MLP((d_pet, d_pet), name=f"gnn_layers_{layer_idx}_compress"),
+            jnp.concatenate(features, axis=-1),
+            pair_mask,
+        )
 
     N = node.shape[0]
     edge = tokens_flat if tiles is not None else tokens_flat.reshape(N, -1, d_pet)
@@ -426,6 +464,29 @@ def _layer_tokens(
     if conditioning is not None:
         node = node + conditioning[:, None, :]
     return node, edge.reshape(-1, d_pet) * pair_mask[..., None]
+
+
+def _compress_folded(
+    backbone, layer_idx, neighbor_table, message_table, geom, messages, neighbors, pair_mask
+):
+    """The compress stage of ``_layer_tokens`` with its inputs folded into the
+    first ``Dense`` (see ``Backbone``): the layer's parameters are read directly,
+    so this runs in ``apply`` only."""
+    d = backbone.d_pet
+    params = backbone.variables["params"]
+    edge_embed = params[f"gnn_layers_{layer_idx}_edge_embed"]
+    compress = params[f"gnn_layers_{layer_idx}_compress"]
+    W1, b1 = compress["Dense_0"]["kernel"], compress["Dense_0"]["bias"]
+    W2, b2 = compress["Dense_1"]["kernel"], compress["Dense_1"]["bias"]
+    W1_geom = W1[:d]
+    h = geom @ (edge_embed["kernel"] @ W1_geom) + (edge_embed["bias"] @ W1_geom + b1)
+    if neighbor_table is None:
+        # layer 0: the messages are the edge embedding of the neighbour's species
+        h = h + (message_table @ W1[d:])[neighbors]
+    else:
+        h = h + (neighbor_table @ W1[d : 2 * d])[neighbors] + messages @ W1[2 * d :]
+    out = jax.nn.silu(h) @ W2 + b2
+    return jnp.where(pair_mask[..., None], out, jnp.zeros((), out.dtype))
 
 
 def _layer_messages(

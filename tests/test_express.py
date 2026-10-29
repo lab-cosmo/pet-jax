@@ -47,6 +47,9 @@ CASES = {
         solver="blocked_prefix_sum", seed_cutoffs=True, solver_iterations=3
     ),
     "sorted_window_seeded": Express(solver="sorted_window", seed_cutoffs=True),
+    "fold_compress": Express(fold_compress=True),
+    "fold_compress-flat": Express(fold_compress=True, tokens="flat"),
+    "fold_compress-atom_block8": Express(fold_compress=True, atom_block=8),
     "remat": Express(remat=True),
     "remat-flat-tile12": Express(remat=True, tokens="flat", attention_tile=12),
     # 109 -> 112 padded atoms on the large frame (14 blocks), 25 -> 32 on the

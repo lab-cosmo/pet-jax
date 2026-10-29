@@ -18,6 +18,7 @@ SOLVERS = ("segment_sum", "sorted_segment_sum", "blocked_prefix_sum", "sorted_wi
 NEIGHBOR_LISTS = ("host", "device")
 TOKEN_LAYOUTS = ("padded", "flat")
 ATTENTION_KERNELS = ("xla", "cute")
+SOLVER_KERNELS = ("xla", "cute")
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,14 @@ class Express:
         step wider than the bump) the solve takes the stock bracket and at
         least 10 steps. A no-op for ``sorted_window``, which brackets from the
         sorted distances.
+      solver_kernel: ``xla`` or ``cute``: run the ``sorted_window`` solve and
+        its implicit-function derivative as one CuTe DSL kernel per direction
+        with a warp per atom (``kernels.solver``; fp32 only, exact to
+        round-off, needs ``pet-jax[cute]`` and a GPU). The atom's raw pairs
+        are sorted inside the warp, so the global sorts go; on the padded
+        layout the rows then pack in list order, not by distance.
+      solver_capacity: raw pairs per atom the kernel holds (a power of two up to
+        256, above ``window_capacity``); more raises ``overflow``.
 
     Raw neighbour list (``structure.py`` / ``calculator.py``):
       neighbor_list: ``host`` (vesin at ``cutoff + skin``, Verlet-cached) or
@@ -68,6 +77,12 @@ class Express:
         fp32 only, exact to round-off; needs ``pet-jax[cute]`` and a GPU).
         Single-tile attention only, so not with ``attention_tile``.
 
+    The compress MLP (``model.py``):
+      fold_compress: fold the geometry projection, the neighbour species table
+        and the biases into the compress MLP's first ``Dense`` (exact; one
+        GEMM of width ``d_pet`` instead of two GEMMs and a concat, a table
+        lookup at layer 0). The parameter tree is unchanged.
+
     Peak memory (``model.py``):
       remat: rematerialise each GNN layer's two stages (geometry, compress and
         transformer; message update) and the readout in the backward pass
@@ -86,6 +101,8 @@ class Express:
     window_capacity: int = 64
     candidate_extra: int = 8
     seed_cutoffs: bool = False
+    solver_kernel: str = "xla"
+    solver_capacity: int = 256
     neighbor_list: str = "host"
     cutoff_guard: bool = False
     tokens: str = "padded"
@@ -96,6 +113,7 @@ class Express:
     fold_extra_block: bool = False
     reverse_unique: bool = False
     attention: str = "xla"
+    fold_compress: bool = False
     remat: bool = False
     atom_block: int | None = None
 
@@ -104,6 +122,9 @@ class Express:
         _check_choice("neighbor_list", self.neighbor_list, NEIGHBOR_LISTS)
         _check_choice("tokens", self.tokens, TOKEN_LAYOUTS)
         _check_choice("attention", self.attention, ATTENTION_KERNELS)
+        _check_choice("solver_kernel", self.solver_kernel, SOLVER_KERNELS)
+        if self.solver_kernel == "cute" and self.solver != "sorted_window":
+            raise ValueError("solver_kernel='cute' runs the sorted_window solver only")
         if self.attention == "cute" and self.attention_tile is not None:
             raise ValueError(
                 "attention='cute' runs single tiles only, not with attention_tile"
@@ -143,6 +164,7 @@ class Express:
             "fold_extra_block": self.fold_extra_block,
             "reverse_unique": self.reverse_unique,
             "attention": self.attention,
+            "fold_compress": self.fold_compress,
             "remat": self.remat,
             "atom_block": self.atom_block,
         }
