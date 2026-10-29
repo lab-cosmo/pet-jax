@@ -17,9 +17,11 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
 - `UPETCalculator(express={...})`: opt-in performance switches (`petjax.express.Express`), each exact against the stock path up to summation order. They cover solver variants, a device-built neighbour list, flat tokens with fixed-width attention tiles, and `remat` / `atom_block` for peak memory.
 - `center_order` and `corresponding_edges`: jit-safe versions of `to_structure`'s center sort and reverse map, for neighbour lists built on the device.
+- Hand-written CuTe DSL kernels behind `express` switches (`petjax.kernels`, the `cute` extra; Linux, CUDA 13): the attention core, the adaptive-cutoff solver, and the GNN layer's GEMMs with fused epilogues, in fp32 (`dense="cute"`) or 3xTF32 on Blackwell (`dense="tf32x3"`, fp32-class accuracy). `fold_compress` folds the compress MLP's inputs into its first `Dense`.
 
 ### Fixed
 
+- Geometry products (edge displacements, the grid solver's probes) run at full precision whatever `matmul_precision` is, so TF32 no longer rounds the cell, and the tensor-core emulation presets (`"TF32_TF32_F32_X3"`) work.
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.
 - The RMSNorm and LayerNorm epsilons now match `torch`'s defaults (`finfo(dtype).eps` and `1e-5`) instead of `flax`'s (`1e-6`). Predictions move by ~1e-7 relative; in fp64, agreement with `metatrain` improves by an order of magnitude.
 - `petjax-convert` keeps the energy, force and stress scales in fp64 instead of rounding them to fp32. Checkpoints converted before this carry the rounded scales; reconvert with the new `--force` flag (the converter otherwise leaves existing output alone) to get fp64 predictions that match `metatrain` to ~1e-14 eV/atom instead of ~1e-7. fp32 inference is unchanged.

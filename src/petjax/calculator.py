@@ -6,6 +6,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+import functools
 import math
 import sys
 import warnings
@@ -14,6 +15,7 @@ from ase.calculators.calculator import BaseCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from .express import Express
+from .model import FUSED_DENSE, prepare_params
 from .predict import get_predict_fn
 from .select import select_edges
 from .structure import (
@@ -154,6 +156,13 @@ class UPETCalculator(BaseCalculator):
         # run mixed-precision (fp32 weights × fp64 activations) with a PET-MAD
         # checkpoint that ships as fp32.
         self._params = cast_floats(params, self._dtype)
+        if self.express.dense in FUSED_DENSE:
+            # the fused layer's transposed and gain-folded weights (and the TF32 low
+            # parts for 3xTF32), once per parameter set
+            low_parts = self.express.dense == "tf32x3"
+            self._params = jax.jit(functools.partial(prepare_params, low_parts=low_parts))(
+                self._params
+            )
 
         # The device list is rebuilt every step: the cache only notices atom
         # count, species and pbc changes.

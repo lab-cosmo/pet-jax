@@ -17,6 +17,9 @@ from dataclasses import asdict, dataclass, fields
 SOLVERS = ("segment_sum", "sorted_segment_sum", "blocked_prefix_sum", "sorted_window")
 NEIGHBOR_LISTS = ("host", "device")
 TOKEN_LAYOUTS = ("padded", "flat")
+ATTENTION_KERNELS = ("xla", "cute")
+DENSE_KERNELS = ("xla", "cute", "tf32x3")
+SOLVER_KERNELS = ("xla", "cute")
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,14 @@ class Express:
         step wider than the bump) the solve takes the stock bracket and at
         least 10 steps. A no-op for ``sorted_window``, which brackets from the
         sorted distances.
+      solver_kernel: ``xla`` or ``cute``: run the ``sorted_window`` solve and
+        its implicit-function derivative as one CuTe DSL kernel per direction
+        with a warp per atom (``kernels.solver``; fp32 only, exact to
+        round-off, needs ``pet-jax[cute]`` and a GPU). The atom's raw pairs
+        are sorted inside the warp, so the global sorts go; on the padded
+        layout the rows then pack in list order, not by distance.
+      solver_capacity: raw pairs per atom the kernel holds (a power of two up to
+        256, above ``window_capacity``); more raises ``overflow``.
 
     Raw neighbour list (``structure.py`` / ``calculator.py``):
       neighbor_list: ``host`` (vesin at ``cutoff + skin``, Verlet-cached) or
@@ -62,6 +73,23 @@ class Express:
         rectangular pass instead of the compacted extra path.
       reverse_unique: gather the reverse messages through an involution with
         unique indices.
+      attention: ``xla`` (``flax``'s ``dot_product_attention``) or ``cute``
+        (``kernels.attention``: one CuTe DSL kernel per tile and direction,
+        fp32 only, exact to round-off; needs ``pet-jax[cute]`` and a GPU).
+        Single-tile attention only, so not with ``attention_tile``.
+
+    The compress MLP (``model.py``):
+      fold_compress: fold the geometry projection, the neighbour species table
+        and the biases into the compress MLP's first ``Dense`` (exact; one
+        GEMM of width ``d_pet`` instead of two GEMMs and a concat, a table
+        lookup at layer 0). The parameter tree is unchanged.
+      dense: ``xla``, ``cute`` or ``tf32x3``: every ``Dense`` of the GNN layers
+        with its norm, bias, activation, residual and mask as one CuTe DSL GEMM
+        (``kernels.dense``; needs ``pet-jax[cute]`` and a GPU): ``cute`` is the
+        fp32 SIMT kernel, exact to round-off; ``tf32x3`` the tensor-core 3xTF32
+        kernel, fp32-class (about 1e-5 relative) and several times faster where
+        the GEMMs dominate. Both imply the folded compress and need
+        ``tokens="flat"`` and ``attention="cute"``.
 
     Peak memory (``model.py``):
       remat: rematerialise each GNN layer's two stages (geometry, compress and
@@ -81,6 +109,8 @@ class Express:
     window_capacity: int = 64
     candidate_extra: int = 8
     seed_cutoffs: bool = False
+    solver_kernel: str = "xla"
+    solver_capacity: int = 256
     neighbor_list: str = "host"
     cutoff_guard: bool = False
     tokens: str = "padded"
@@ -90,6 +120,9 @@ class Express:
     tile_floor: int = 8
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    attention: str = "xla"
+    fold_compress: bool = False
+    dense: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -97,6 +130,19 @@ class Express:
         _check_choice("solver", self.solver, SOLVERS)
         _check_choice("neighbor_list", self.neighbor_list, NEIGHBOR_LISTS)
         _check_choice("tokens", self.tokens, TOKEN_LAYOUTS)
+        _check_choice("attention", self.attention, ATTENTION_KERNELS)
+        _check_choice("solver_kernel", self.solver_kernel, SOLVER_KERNELS)
+        _check_choice("dense", self.dense, DENSE_KERNELS)
+        if self.dense != "xla" and (self.tokens != "flat" or self.attention != "cute"):
+            raise ValueError(
+                f"dense={self.dense!r} needs tokens='flat' and attention='cute'"
+            )
+        if self.solver_kernel == "cute" and self.solver != "sorted_window":
+            raise ValueError("solver_kernel='cute' runs the sorted_window solver only")
+        if self.attention == "cute" and self.attention_tile is not None:
+            raise ValueError(
+                "attention='cute' runs single tiles only, not with attention_tile"
+            )
         if self.attention_tile is not None and self.tokens != "flat":
             raise ValueError("attention_tile needs tokens='flat'")
         if self.fold_extra_block and self.attention_tile is None:
@@ -131,6 +177,9 @@ class Express:
             "attention_tile": self.attention_tile,
             "fold_extra_block": self.fold_extra_block,
             "reverse_unique": self.reverse_unique,
+            "attention": self.attention,
+            "fold_compress": self.fold_compress,
+            "dense": self.dense,
             "remat": self.remat,
             "atom_block": self.atom_block,
         }

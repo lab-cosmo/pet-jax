@@ -19,8 +19,13 @@ def cutoff_cosine(r, cutoff, width=0.5):
 
 
 def edge_displacements(positions, centers, others, cell_shifts, cell):
-    """Per-edge displacement vectors ``R_j - R_i + S @ h`` in Cartesian coords."""
-    return positions[others] - positions[centers] + cell_shifts @ cell
+    """Per-edge displacement vectors ``R_j - R_i + S @ h`` in Cartesian coords.
+    The shift product is geometry, so it runs at full precision whatever the
+    default matmul precision is (TF32 would round the cell to 10 bits; the
+    tensor-core emulations do not exist on the CPU, where the edge selection
+    runs)."""
+    shifts = jnp.dot(cell_shifts, cell, precision=jax.lax.Precision.HIGHEST)
+    return positions[others] - positions[centers] + shifts
 
 
 def safe_norm(x, axis=-1, eps=1e-15):

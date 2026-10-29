@@ -28,6 +28,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from dataclasses import replace
 from functools import partial
 
 from typing import NamedTuple
@@ -318,7 +319,10 @@ def select_edges(
     produced, as host arrays. The calculator sizes ``k_sel`` from it once per
     NL rebuild; ``selected`` is the model's actual adjacency for anything
     downstream (e.g. a Hessian sparsity pattern). ``express`` picks the solver
-    variant, as in the forward, so that sizing and forward agree."""
+    variant, as in the forward, so that sizing and forward agree; the GPU
+    kernel of the window solver runs here as its XLA twin (same result to
+    round-off)."""
+    express = replace(Express.from_any(express), solver_kernel="xla")
     # Only what the kernel reads: extra dict keys would change the jit cache key.
     keys = ("positions", "cell", "centers", "others", "cell_shifts", "pair_mask")
     # Resolved per call, not at import: importing petjax must not init a JAX backend.
@@ -330,7 +334,7 @@ def select_edges(
         cutoff,
         cutoff_width_adaptive,
         method=method,
-        express=Express.from_any(express),
+        express=express,
     )
     return Selection(*(np.asarray(x) for x in out))
 
@@ -419,7 +423,8 @@ def get_adaptive_cutoffs(
     w = jnp.exp(logw - logw.max(axis=-1, keepdims=True))
     w = w / w.sum(axis=-1, keepdims=True)
 
-    return w @ probes
+    # geometry, at full precision whatever the default matmul precision is
+    return jnp.dot(w, probes, precision=jax.lax.Precision.HIGHEST)
 
 
 def get_adaptive_cutoffs_solver(
@@ -873,18 +878,35 @@ def _select_edges(
         adaptive_fn = get_adaptive_cutoffs
     elif method == "solver" and express.solver == "sorted_window":
         iterations = express.solver_iterations
-        atomic_cutoffs, sorted_pairs, overflow = get_adaptive_cutoffs_window(
-            centers,
-            r_ij,
-            pair_mask,
-            num_neighbors_adaptive,
-            num_atoms,
-            cutoff,
-            cutoff_width_adaptive,
-            iterations=4 if iterations is None else iterations,
-            window_capacity=express.window_capacity,
-        )
-        adaptive_fn = None
+        if express.solver_kernel == "cute":
+            from .kernels.solver import window_cutoffs
+
+            atomic_cutoffs, overflow = window_cutoffs(
+                r_ij,
+                centers,
+                pair_mask,
+                num_atoms,
+                num_neighbors_adaptive,
+                cutoff,
+                cutoff_width_adaptive,
+                iterations=4 if iterations is None else iterations,
+                window_capacity=express.window_capacity,
+                capacity=express.solver_capacity,
+            )
+            adaptive_fn = None
+        else:
+            atomic_cutoffs, sorted_pairs, overflow = get_adaptive_cutoffs_window(
+                centers,
+                r_ij,
+                pair_mask,
+                num_neighbors_adaptive,
+                num_atoms,
+                cutoff,
+                cutoff_width_adaptive,
+                iterations=4 if iterations is None else iterations,
+                window_capacity=express.window_capacity,
+            )
+            adaptive_fn = None
     elif method == "solver":
         iterations = express.solver_iterations
         iterations = 10 if iterations is None else iterations
