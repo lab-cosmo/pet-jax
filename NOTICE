@@ -4,6 +4,8 @@ Files derived from examples in NVIDIA CUTLASS (https://github.com/NVIDIA/cutlass
 
 - src/petjax/kernels/_gemm_cute.py, from examples/python/CuTeDSL/cute/ampere/kernel/dense_gemm/sgemm.py
   Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+- src/petjax/kernels/_gemm_tf32_cute.py, from examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm/fp16_gemm_0.py
+  Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 BSD-3-Clause License
 

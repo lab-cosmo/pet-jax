@@ -18,7 +18,7 @@ SOLVERS = ("segment_sum", "sorted_segment_sum", "blocked_prefix_sum", "sorted_wi
 NEIGHBOR_LISTS = ("host", "device")
 TOKEN_LAYOUTS = ("padded", "flat")
 ATTENTION_KERNELS = ("xla", "cute")
-DENSE_KERNELS = ("xla", "cute")
+DENSE_KERNELS = ("xla", "cute", "tf32x3")
 SOLVER_KERNELS = ("xla", "cute")
 
 
@@ -83,11 +83,13 @@ class Express:
         and the biases into the compress MLP's first ``Dense`` (exact; one
         GEMM of width ``d_pet`` instead of two GEMMs and a concat, a table
         lookup at layer 0). The parameter tree is unchanged.
-      dense: ``xla`` or ``cute``: every ``Dense`` of the GNN layers with its
-        norm, bias, activation, residual and mask as one CuTe DSL GEMM
-        (``kernels.dense``; fp32, exact to round-off, needs ``pet-jax[cute]``
-        and a GPU). Implies the folded compress; needs ``tokens="flat"`` and
-        ``attention="cute"``.
+      dense: ``xla``, ``cute`` or ``tf32x3``: every ``Dense`` of the GNN layers
+        with its norm, bias, activation, residual and mask as one CuTe DSL GEMM
+        (``kernels.dense``; needs ``pet-jax[cute]`` and a GPU): ``cute`` is the
+        fp32 SIMT kernel, exact to round-off; ``tf32x3`` the tensor-core 3xTF32
+        kernel, fp32-class (about 1e-5 relative) and several times faster where
+        the GEMMs dominate. Both imply the folded compress and need
+        ``tokens="flat"`` and ``attention="cute"``.
 
     Peak memory (``model.py``):
       remat: rematerialise each GNN layer's two stages (geometry, compress and
@@ -131,8 +133,10 @@ class Express:
         _check_choice("attention", self.attention, ATTENTION_KERNELS)
         _check_choice("solver_kernel", self.solver_kernel, SOLVER_KERNELS)
         _check_choice("dense", self.dense, DENSE_KERNELS)
-        if self.dense == "cute" and (self.tokens != "flat" or self.attention != "cute"):
-            raise ValueError("dense='cute' needs tokens='flat' and attention='cute'")
+        if self.dense != "xla" and (self.tokens != "flat" or self.attention != "cute"):
+            raise ValueError(
+                f"dense={self.dense!r} needs tokens='flat' and attention='cute'"
+            )
         if self.solver_kernel == "cute" and self.solver != "sorted_window":
             raise ValueError("solver_kernel='cute' runs the sorted_window solver only")
         if self.attention == "cute" and self.attention_tile is not None:

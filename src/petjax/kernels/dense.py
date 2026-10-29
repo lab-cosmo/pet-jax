@@ -29,8 +29,24 @@ import jax.numpy as jnp
 import functools
 
 ACTIVATIONS = (None, "silu", "glu")
+ALGORITHMS = ("simt", "tf32x3", "tf32")
 HIGHEST = jax.lax.Precision.HIGHEST
 RSTD_EPS = float(jnp.finfo(jnp.float32).eps)
+# the tensor-core kernel: split x into its TF32 high and low parts in the kernel
+# (False: the low part as an XLA fusion and a second operand, to compare); split K
+# for M <= 128 (False: one split); the row count from which its row statistics come
+# from the kernel, below from XLA
+# (both in-kernel splits, warp 0 alone and warps 2-3 with their own mbarrier, measured
+# slower than XLA's split at every size tried)
+TF32_SPLIT_A = False
+TF32_SPLIT_K = True
+# split K above M = 128 too, from this K on (0: only M <= 128); glu's tile width
+# (0: the general rule); the shared memory one CTA's pipeline may take
+TF32_SPLIT_MIN_K = 1024
+TF32_GLU_BN = 64
+# (110 KB, two CTAs per SM at bN 64, measured slower almost everywhere)
+TF32_SMEM_LIMIT = 200 * 1024
+TF32_STATS_MIN_ROWS = 131072
 # 16-byte loads and stores in the kernel's epilogue (False: scalar ones, to compare)
 VECTOR_EPILOGUE = True
 # CTAs per SM ptxas should leave room for (it caps the registers; 0: no hint)
@@ -75,6 +91,9 @@ def fused_dense(
     tile=None,
     stages=3,
     splits=None,
+    algorithm="simt",
+    w_lo=None,
+    w_t_lo=None,
 ):
     """``epilogue(x @ W)`` for ``x [M, K]`` and the weight ``W [K, N]``, passed as
     ``w = W`` or, with ``transpose_w``, as ``w = W.T [N, K]`` (no copy either way).
@@ -110,6 +129,16 @@ def fused_dense(
     ``"glu"``, whose output is then ``[M, 2 N]`` (the value and gate halves'
     cotangents); no other epilogue input, forward only (not differentiable).
 
+    ``algorithm`` picks the GEMM: ``"simt"`` the fp32 FFMA kernel (``_gemm_cute``),
+    ``"tf32x3"`` the SM100 tensor-core kernel (``_gemm_tf32_cute``) in 3xTF32,
+    fp32-class, or ``"tf32"`` the same in one TF32 pass. For 3xTF32 ``w_lo`` is the
+    weight's low part ``w - tf32(w)`` in ``w``'s storage (``tf32_low_part``,
+    computed per call when absent) and ``x``'s is computed per call; the tensor-core
+    kernel reads ``w`` either way round at the same speed, so its backward needs
+    neither ``w_t`` nor ``w_t_lo`` (accepted, unused). ``tile`` is then ``(128, bN,
+    bK)`` (``None``: ``pick_tile_tf32``); ``stages`` and ``splits`` are its own
+    (``pick_splits_tf32``: split-K for ``M <= 128``).
+
     All fp32; ``K`` and ``N`` multiples of 32, ``M`` arbitrary. ``tile`` is the CTA
     tile ``(bM, bN, bK)``, optionally with the per-thread register tile ``(bM, bN,
     bK, tm, tn)`` (``tm, tn`` in 4, 8; else ``default_micro``) and the CTAs per SM
@@ -123,6 +152,8 @@ def fused_dense(
     ``h`` is then recomputed elementwise in the backward)."""
     if activation not in ACTIVATIONS:
         raise ValueError(f"activation must be one of {ACTIVATIONS}, got {activation!r}")
+    if algorithm not in ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {ALGORITHMS}, got {algorithm!r}")
     if x.ndim != 2 or w.ndim != 2:
         raise ValueError(f"need 2-d x and w, got {x.shape} and {w.shape}")
     M, K = x.shape
@@ -161,13 +192,15 @@ def fused_dense(
         residual2=(M, N_out),
         row_mask=(M,),
     )
-    for name, a in dict(x=x, w=w, **opts).items():
+    w_shape = w.shape
+    for name, a in dict(x=x, w=w, w_lo=w_lo, w_t_lo=w_t_lo, **opts).items():
         if a is None:
             continue
         if a.dtype != jnp.float32:
             raise TypeError(f"fused_dense runs in float32, got {name} of {a.dtype}")
-        if name in shapes and a.shape != shapes[name]:
-            raise ValueError(f"{name} must have shape {shapes[name]}, got {a.shape}")
+        want = dict(shapes, w_lo=w_shape, w_t_lo=(N, K)).get(name)
+        if want is not None and a.shape != want:
+            raise ValueError(f"{name} must have shape {want}, got {a.shape}")
     if row_sumsq and row_stats:
         raise ValueError("row_stats already includes row_sumsq")
     stats = "both" if row_stats else ("sumsq" if row_sumsq else "none")
@@ -175,27 +208,16 @@ def fused_dense(
         tile = tuple(tile)
     # the forward's tile; tile itself (None: picked per GEMM) goes to the backward
     fwd_tile = tile
-    if fwd_tile is None and stats != "none":
-        fwd_tile = _stats_tile(N_out, M)
-    glu = activation == "glu"
-    bM, bN, bK, tm, tn, _ = _full_tile(fwd_tile or pick_tile(M, N_out, K, transpose_w, glu))
-    if stats != "none" and splits is None:
-        splits = pick_splits(M, K, N_out, (bM, bN, bK), stages)
-    # under split-K the statistics come from the XLA epilogue, else from the kernel
-    if stats != "none" and splits == 1:
-        Tn = bN // tn
-        if bN != N_out or Tn > 32 or Tn & (Tn - 1):
-            raise ValueError(
-                f"row statistics need bN = {N_out} and bN / tn a power of two up to "
-                f"32, got the tile {(bM, bN, bK, tm, tn)}"
-            )
-    if K % bK:
-        raise ValueError(f"K={K} is not a multiple of the tile's bK={bK}")
-    if splits is not None and (K % (splits * bK) or K // (splits * bK) < stages - 1):
-        raise ValueError(
-            f"K={K} must split into {splits} ranges of at least {stages - 1} k-tiles of {bK}"
+    if algorithm != "simt":
+        splits = None  # pick_splits_tf32's, in _call_tf32
+        in_kernel = stats != "none" and M >= TF32_STATS_MIN_ROWS
+        bN = (fwd_tile or pick_tile_tf32(M, N_out, in_kernel, activation == "glu"))[1]
+        if in_kernel and bN != N_out:
+            raise ValueError(f"row statistics need the tile's bN = {N_out}, got {bN}")
+    else:
+        fwd_tile, splits = _simt_tile(
+            M, K, N_out, activation, transpose_w, stats, fwd_tile, stages, splits
         )
-    _check_smem((bM, bN, bK), stages, activation == "glu", transpose_w)
 
     if dact is not None:
         h, act = dact
@@ -227,9 +249,14 @@ def fused_dense(
             splits=splits,
             dact=dact,
             rstd_eps=rstd,
+            algorithm=algorithm,
+            w_lo=w_lo,
         )
         return out
 
+    for name, a in (("w_lo", w_lo), ("w_t_lo", w_t_lo)):
+        if a is not None:
+            opts[name] = a
     if w_t is not None:
         if transpose_w:
             raise ValueError(
@@ -239,7 +266,9 @@ def fused_dense(
         if w_t.dtype != jnp.float32 or w_t.shape != (N, K):
             raise ValueError(f"w_t must be float32 [N, K] = {(N, K)}, got {w_t.shape}")
         opts["w_t"] = w_t
-    names = tuple(n for n in (*OPTIONAL, "w_t") if opts.get(n) is not None)
+    names = tuple(
+        n for n in (*OPTIONAL, "w_t", "w_lo", "w_t_lo") if opts.get(n) is not None
+    )
     fn = _fused(
         names,
         activation,
@@ -251,8 +280,94 @@ def fused_dense(
         stages,
         splits,
         rstd,
+        algorithm,
     )
     return fn(x, w, tuple(opts[n] for n in names))
+
+
+def _simt_tile(M, K, N_out, activation, transpose_w, stats, tile, stages, splits):
+    """The SIMT kernel's forward tile (``None``: picked per GEMM) and split-K factor
+    for ``fused_dense``'s arguments, checked against the kernel's constraints."""
+    if tile is None and stats != "none":
+        tile = _stats_tile(N_out, M)
+    glu = activation == "glu"
+    bM, bN, bK, tm, tn, _ = _full_tile(tile or pick_tile(M, N_out, K, transpose_w, glu))
+    if stats != "none" and splits is None:
+        splits = pick_splits(M, K, N_out, (bM, bN, bK), stages)
+    # under split-K the statistics come from the XLA epilogue, else from the kernel
+    if stats != "none" and splits == 1:
+        Tn = bN // tn
+        if bN != N_out or Tn > 32 or Tn & (Tn - 1):
+            raise ValueError(
+                f"row statistics need bN = {N_out} and bN / tn a power of two up to "
+                f"32, got the tile {(bM, bN, bK, tm, tn)}"
+            )
+    if K % bK:
+        raise ValueError(f"K={K} is not a multiple of the tile's bK={bK}")
+    if splits is not None and (K % (splits * bK) or K // (splits * bK) < stages - 1):
+        raise ValueError(
+            f"K={K} must split into {splits} ranges of at least {stages - 1} k-tiles of {bK}"
+        )
+    _check_smem((bM, bN, bK), stages, glu, transpose_w)
+    return tile, splits
+
+
+def tf32_low_part(a):
+    """``a - tf32(a)`` by round-to-nearest: the small part of a 3xTF32 operand."""
+    return a - jax.lax.reduce_precision(a, exponent_bits=8, mantissa_bits=10)
+
+
+def pick_tile_tf32(M, N, stats=False, glu=False):
+    """The tensor-core kernel's ``(128, bN, 32)`` tile for an ``[M, N]`` output
+    (``N`` the GEMM's width, ``F`` for glu): ``bN = N`` for row statistics (whole
+    rows per CTA), ``TF32_GLU_BN`` for glu at ``M <= 4096`` (its two B tiles per
+    stage leave 2 stages at bN 128 in 3xTF32, 3 at 64; the deeper pipeline pays at
+    moderate M and stops paying at large M), else 64 for ``N <= 256`` at
+    ``M <= 4096``, 128 beyond (bN 256 was slower everywhere), the largest of those
+    that divides ``N``. Tuned on a B200 for PET-MAD-sized layers."""
+    if stats:
+        if N not in (32, 64, 128, 256):
+            raise ValueError(f"row statistics need an output width of 32 to 256, got {N}")
+        return (128, N, 32)
+    bN = 64 if N <= 256 and M <= 4096 else 128
+    if glu and TF32_GLU_BN and M <= 4096:
+        bN = TF32_GLU_BN
+    while N % bN:
+        bN //= 2
+    return (128, bN, 32)
+
+
+def pick_splits_tf32(M, K, N, bN, bK, stages, min_ctas=128, wide_min_ctas=64):
+    """The tensor-core kernel's split-K factor: for ``M <= 128`` (the per-atom GEMMs:
+    one row tile, ``N / bN`` CTAs) when the grid has fewer than ``min_ctas`` CTAs,
+    and above that, from ``K >= TF32_SPLIT_MIN_K``, when it has fewer than
+    ``wide_min_ctas`` (the wide-K centre GEMMs on a few hundred rows gain from it;
+    a grid that already fills about the SMs does not, and the token GEMMs' ``K`` of
+    256 and 512 stay unsplit). Then enough splits for ``min_ctas`` CTAs, at most 8,
+    each split keeping at least ``stages`` k-tiles, dividing ``K`` into whole k-tiles
+    (unsplit, the per-atom GEMMs leave most SMs idle)."""
+    ctas = -(-M // 128) * (N // bN)
+    if M <= 128:
+        if ctas >= min_ctas:
+            return 1
+    elif ctas >= wide_min_ctas or not (TF32_SPLIT_MIN_K and K >= TF32_SPLIT_MIN_K):
+        return 1
+    s = max(1, min(8, -(-min_ctas // ctas), K // (bK * stages)))
+    while s > 1 and K % (s * bK):
+        s -= 1
+    return s
+
+
+def _stages_tf32(bN, bK, three_pass, glu, limit=200 * 1024):
+    """The deepest operand pipeline (at most 4) that fits ``TF32_SMEM_LIMIT`` of
+    shared memory (about 110 KB leaves room for two CTAs per SM), else ``limit``."""
+    from ._gemm_tf32_cute import smem_bytes
+
+    for cap in (TF32_SMEM_LIMIT, limit):
+        for s in (4, 3, 2):
+            if smem_bytes(bN, bK, s, three_pass, glu) <= cap:
+                return s
+    raise ValueError(f"the tile (128, {bN}, {bK}) does not fit two stages in shared memory")
 
 
 def _stats_tile(N, M=None, rows=None):
@@ -352,12 +467,23 @@ def pick_splits(M, K, N, tile=(64, 64, 8), stages=3, min_ctas=128):
 
 @functools.cache
 def _fused(
-    names, activation, transpose_w, save_pre, row_stats, tile, dx_tile, stages, splits, rstd
+    names,
+    activation,
+    transpose_w,
+    save_pre,
+    row_stats,
+    tile,
+    dx_tile,
+    stages,
+    splits,
+    rstd,
+    algorithm="simt",
 ):
     """The custom_vjp function for one set of present inputs and flags; the
     optional inputs come in as a tuple in the order of ``names``. ``tile`` is the
     forward's, ``dx_tile`` the backward dx GEMM's (``None``: ``pick_tile``);
-    ``rstd`` is the RMSNorm epsilon when ``row_scale`` holds sums of squares."""
+    ``rstd`` is the RMSNorm epsilon when ``row_scale`` holds sums of squares;
+    ``algorithm`` is ``fused_dense``'s, for both GEMMs."""
     has_scale = "row_scale" in names
     # what the backward reads: the accumulator if there is a row scale (for its
     # cotangent, h is recomputed from it), else h if the activation needs it, and
@@ -372,6 +498,7 @@ def _fused(
         splits=splits,
         row_stats=row_stats,
         rstd_eps=rstd,
+        algorithm=algorithm,
     )
 
     def outputs(out, pre, rsum, rsq):
@@ -380,14 +507,17 @@ def _fused(
 
     @jax.custom_vjp
     def f(x, w, arrays):
+        opts = dict(zip(names, arrays))
         out, pre, _, rsum, rsq = call(
-            x, w, dict(zip(names, arrays)), activation, save_pre, False
+            x, w, opts, activation, save_pre, False, w_lo=opts.get("w_lo")
         )
         return outputs(out, pre, rsum, rsq)
 
     def fwd(x, w, arrays):
         opts = dict(zip(names, arrays))
-        out, pre, acc, rsum, rsq = call(x, w, opts, activation, keep_pre, save_acc)
+        out, pre, acc, rsum, rsq = call(
+            x, w, opts, activation, keep_pre, save_acc, w_lo=opts.get("w_lo")
+        )
         for n in ("residual", "residual2"):
             opts.pop(n, None)
         kept = out if row_stats != "none" else None
@@ -416,11 +546,11 @@ def _fused(
             dh = dh + d_pre
 
         # dx = (dh s) @ W.T: the same kernel with the weight read the other way, or
-        # the prepared W.T read the fast way
-        if "w_t" in opts:
+        # the prepared W.T read the fast way; the tensor-core kernel reads either
+        # way at the same speed, so it takes w (and w_lo) as they are
+        w_dx, dx_transposed, dx_lo = w, not transpose_w, opts.get("w_lo")
+        if "w_t" in opts and algorithm == "simt":
             w_dx, dx_transposed = opts["w_t"], False
-        else:
-            w_dx, dx_transposed = w, not transpose_w
         dx, *_ = _call(
             dh,
             w_dx,
@@ -429,9 +559,11 @@ def _fused(
             False,
             False,
             transpose_w=dx_transposed,
-            tile=dx_tile,
+            tile=dx_tile if algorithm == "simt" else None,
             stages=stages,
             splits=None,
+            algorithm=algorithm,
+            w_lo=dx_lo,
         )
         dh_s = dh if s is None else dh * s[:, None]
         if transpose_w:
@@ -452,6 +584,8 @@ def _fused(
             residual2=lambda: g,
             row_mask=lambda: jnp.zeros_like(mask),
             w_t=lambda: jnp.zeros_like(opts["w_t"]),
+            w_lo=lambda: jnp.zeros_like(opts["w_lo"]),
+            w_t_lo=lambda: jnp.zeros_like(opts["w_t_lo"]),
         )
         return dx, dw, tuple(grads[n]() for n in names)
 
@@ -532,12 +666,34 @@ def _call(
     dact=None,
     row_stats="none",
     rstd_eps=None,
+    algorithm="simt",
+    w_lo=None,
 ):
     """The kernel launch: ``(out, h, acc, row sum, row sum of squares)``, ``None``
     for each not asked for (``row_stats`` is ``"none"``, ``"sumsq"`` or
     ``"both"``); absent inputs and outputs are ``[1]`` placeholders.
     ``splits=None`` is ``pick_splits``'s; ``rstd_eps`` makes ``row_scale`` sums of
-    squares for an RMSNorm (see ``fused_dense``'s ``row_rstd``)."""
+    squares for an RMSNorm (see ``fused_dense``'s ``row_rstd``); ``algorithm`` other
+    than ``"simt"`` goes to the tensor-core kernel (``_call_tf32``), with ``w_lo``
+    the weight's low part for 3xTF32."""
+    if algorithm != "simt":
+        if tile is not None and len(tile) != 3:
+            tile = None  # a SIMT tile (row statistics' default): pick our own
+        return _call_tf32(
+            x,
+            w,
+            opts,
+            activation,
+            save_pre,
+            save_acc,
+            transpose_w=transpose_w,
+            tile=tile,
+            dact=dact,
+            row_stats=row_stats,
+            rstd_eps=rstd_eps,
+            three_pass=algorithm == "tf32x3",
+            w_lo=w_lo,
+        )
     import cutlass.jax as cjax
 
     from . import _gemm_cute as kernel
@@ -619,6 +775,117 @@ def _call(
     )
 
 
+def _call_tf32(
+    x,
+    w,
+    opts,
+    activation,
+    save_pre,
+    save_acc,
+    *,
+    transpose_w,
+    tile,
+    dact,
+    row_stats,
+    rstd_eps,
+    three_pass,
+    w_lo,
+):
+    """``_call`` on the tensor-core kernel: the same outputs. With 3xTF32, ``x``'s
+    low part is split in the kernel (``TF32_SPLIT_A``, else here by XLA) and
+    ``w``'s is ``w_lo`` (computed here when None). For ``M <= 128`` the K loop is
+    split (``pick_splits_tf32``): the kernel stores raw partials and XLA reduces
+    them and applies the epilogue, as ``_call`` does for the SIMT kernel; the row
+    statistics come from the kernel only from ``TF32_STATS_MIN_ROWS`` rows on (the
+    whole-row tiles they need leave too few CTAs below), else from XLA."""
+    import cutlass.jax as cjax
+
+    from . import _gemm_tf32_cute as kernel
+
+    M, K = x.shape
+    N = w.shape[0] if transpose_w else w.shape[1]
+    glu = activation == "glu"
+    N_gemm = N // 2 if glu else N
+    in_kernel_stats = row_stats != "none" and M >= TF32_STATS_MIN_ROWS
+    _, bN, bK = (
+        tile if tile is not None else pick_tile_tf32(M, N_gemm, in_kernel_stats, glu)
+    )
+    stages = _stages_tf32(bN, bK, three_pass, glu)
+    splits = 1
+    if TF32_SPLIT_K and not in_kernel_stats:
+        splits = pick_splits_tf32(M, K, N_gemm, bN, bK, stages)
+    split = splits > 1
+    split_a = three_pass and TF32_SPLIT_A
+    N_out = 2 * N if dact is not None and dact[1] == "glu" else N_gemm
+    placeholder = jnp.zeros((1,), jnp.float32)
+    x_lo = tf32_low_part(x) if three_pass and not split_a else placeholder
+    if three_pass:
+        w_lo = tf32_low_part(w) if w_lo is None else w_lo
+    else:
+        w_lo = placeholder
+    inputs = [opts.get(n, placeholder) for n in OPTIONAL]
+    inputs.append(placeholder if dact is None or split else dact[0])
+
+    def maybe(on, shape):
+        return jax.ShapeDtypeStruct(shape if on else (1,), jnp.float32)
+
+    # under split-K the kernel only stores the partial accumulators
+    kernel_opts = {} if split else opts
+    stats = row_stats if in_kernel_stats else "none"
+    # the weight as the (N, K) tensor: the [K, N] array through a transposed view
+    # (MN-major B), or the [N, K] array as it is (K-major)
+    w_spec = None if transpose_w else cjax.TensorSpec(mode=(1, 0))
+    out, pre, acc, rsum, rsq = cjax.cutlass_call(
+        kernel.launch_dense_tf32,
+        output_shape_dtype=(
+            maybe(not split, (M, N_out)),
+            maybe(save_pre and not split, (M, N)),
+            maybe(save_acc or split, (splits, M, N)),
+            maybe(stats == "both", (M,)),
+            maybe(stats != "none", (M,)),
+        ),
+        input_spec=(None, w_spec, None, w_spec if three_pass else None)
+        + tuple(None for _ in inputs),
+        use_static_tensors=True,
+        bN=bN,
+        bK=bK,
+        stages=stages,
+        b_k_major=transpose_w,
+        three_pass=three_pass,
+        subtiles=max(1, bN // 64),
+        has_bias="bias" in kernel_opts,
+        has_row_scale="row_scale" in kernel_opts,
+        row_scale_mode="scale" if rstd_eps is None else "rstd",
+        rstd_eps=0.0 if rstd_eps is None else rstd_eps,
+        has_pre_add="pre_add" in kernel_opts,
+        has_rank1="rank1_row" in kernel_opts,
+        save_pre=save_pre and not split,
+        save_acc=save_acc or split,
+        activation="glu" if glu else ("none" if split else activation or "none"),
+        dact="none" if dact is None or split else dact[1],
+        has_residual="residual" in kernel_opts,
+        has_residual2="residual2" in kernel_opts,
+        has_row_mask="row_mask" in kernel_opts,
+        row_stats=stats,
+        splits=splits,
+        split_a=split_a,
+    )(x, w, x_lo, w_lo, *inputs)
+    acc = acc.sum(0) if split else acc[0]
+    if split:
+        if rstd_eps is not None and "row_scale" in opts:
+            opts = dict(opts, row_scale=_effective_scale(opts, rstd_eps, K))
+        out, pre = _epilogue(acc, opts, activation, dact)
+    if row_stats != "none" and not in_kernel_stats:
+        rsum, rsq = out.sum(1), jnp.sum(out * out, axis=1)
+    return (
+        out,
+        pre if save_pre else None,
+        acc if save_acc else None,
+        rsum if row_stats == "both" else None,
+        rsq if row_stats != "none" else None,
+    )
+
+
 def reference_dense(
     x,
     w,
@@ -640,11 +907,15 @@ def reference_dense(
     w_t=None,
     dact=None,
     precision=HIGHEST,
+    algorithm=None,
+    w_lo=None,
+    w_t_lo=None,
 ):
     """The same math in plain JAX, for tests and benchmarks; ``precision`` of the
     GEMM is full fp32 by default (``None`` is what a ``flax`` ``Dense`` uses).
-    ``w_t`` is accepted and ignored, as ``fused_dense``'s forward does."""
-    del w_t
+    ``w_t``, ``algorithm``, ``w_lo`` and ``w_t_lo`` are accepted and ignored, so a
+    test can pass ``fused_dense``'s arguments as they are."""
+    del w_t, algorithm, w_lo, w_t_lo
     if row_rstd is not None:
         row_scale = jax.lax.rsqrt(row_rstd / x.shape[1] + rstd_eps)
     h = jnp.dot(x, w.T if transpose_w else w, precision=precision)
@@ -698,6 +969,10 @@ MLP_ARRAYS = (
     "row_mask",
     "w1_t",
     "w2_t",
+    "w1_lo",
+    "w2_lo",
+    "w1_t_lo",
+    "w2_t_lo",
 )
 
 
@@ -721,6 +996,11 @@ def fused_mlp(
     w2_t=None,
     row_sumsq=False,
     row_stats=False,
+    algorithm="simt",
+    w1_lo=None,
+    w2_lo=None,
+    w1_t_lo=None,
+    w2_t_lo=None,
 ):
     """``out = (act(h) @ W2 + b2 + residual + residual2) * row_mask[:, None]`` with
     ``h = (x @ W1) * row_scale[:, None] + b1 + pre_add + rank1[0][:, None] *
@@ -735,14 +1015,21 @@ def fused_mlp(
     the prepared transposes for the backward, as in ``fused_dense``;
     ``row_sumsq`` adds ``sum(out**2, axis=1)``, ``row_stats`` both ``sum(out,
     axis=1)`` and that. Returns ``out``, ``(out, sumsq)`` or ``(out, sum,
-    sumsq)``. Differentiable once, like ``fused_dense``."""
+    sumsq)``. Differentiable once, like ``fused_dense``. ``algorithm``, ``w1_lo``
+    and ``w2_lo`` are ``fused_dense``'s ``algorithm`` and ``w_lo`` for the two
+    GEMMs (``w1_t_lo`` / ``w2_t_lo`` accepted, unused: the tensor-core backward
+    reads the forward weights)."""
     if activation not in ("silu", "glu"):
         raise ValueError(f"activation must be 'silu' or 'glu', got {activation!r}")
+    if algorithm not in ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {ALGORITHMS}, got {algorithm!r}")
     if (x is None) != (w1 is None):
         raise ValueError("x and w1 are both given or both None")
     if w1 is None and pre_add is None:
         raise ValueError("without a first GEMM the pre-activation comes from pre_add")
-    if w1 is None and any(a is not None for a in (w1_t, row_scale, row_rstd, rank1)):
+    if w1 is None and any(
+        a is not None for a in (w1_t, w1_lo, w1_t_lo, row_scale, row_rstd, rank1)
+    ):
         raise ValueError("without a first GEMM only pre_add and b1 form h")
     if row_rstd is not None:
         if row_scale is not None:
@@ -765,6 +1052,10 @@ def fused_mlp(
         row_mask=row_mask,
         w1_t=w1_t,
         w2_t=w2_t,
+        w1_lo=w1_lo,
+        w2_lo=w2_lo,
+        w1_t_lo=w1_t_lo,
+        w2_t_lo=w2_t_lo,
     )
     arrays = {n: a for n, a in arrays.items() if a is not None}
     F, N2 = w2.shape
@@ -786,6 +1077,10 @@ def fused_mlp(
         row_mask=(M,),
         w1_t=(N1, K),
         w2_t=(N2, F),
+        w1_lo=(K, N1),
+        w2_lo=(F, N2),
+        w1_t_lo=(N1, K),
+        w2_t_lo=(N2, F),
     )
     for name, a in arrays.items():
         if a.dtype != jnp.float32:
@@ -796,10 +1091,10 @@ def fused_mlp(
         raise ValueError("row_stats already includes row_sumsq")
     stats = "both" if row_stats else ("sumsq" if row_sumsq else "none")
     names = tuple(n for n in MLP_ARRAYS if n in arrays)
-    return _fused_mlp(names, activation, stats, rstd)(arrays)
+    return _fused_mlp(names, activation, stats, rstd, algorithm)(arrays)
 
 
-def _mlp_forward(a, activation, stats, rstd, keep):
+def _mlp_forward(a, activation, stats, rstd, keep, algorithm="simt"):
     """The two GEMMs: ``(out, h, act(h), acc1, sum, sumsq)``; ``acc1`` (the
     first layer's raw accumulator, for the row scale's cotangent) only with
     ``keep`` and a row scale, the row statistics as ``stats`` says (``"none"``,
@@ -821,6 +1116,8 @@ def _mlp_forward(a, activation, stats, rstd, keep):
             stages=3,
             splits=None,
             rstd_eps=rstd,
+            algorithm=algorithm,
+            w_lo=a.get("w1_lo"),
         )
     else:
         h = a["pre_add"] + a["b1"] if "b1" in a else a["pre_add"]
@@ -838,18 +1135,21 @@ def _mlp_forward(a, activation, stats, rstd, keep):
         False,
         False,
         transpose_w=False,
-        tile=_stats_tile(N2, M) if stats != "none" else None,
+        tile=_stats_tile(N2, M) if stats != "none" and algorithm == "simt" else None,
         stages=3,
         splits=None,
         row_stats=stats,
+        algorithm=algorithm,
+        w_lo=a.get("w2_lo"),
     )
     return out, h, h_act, acc1, rsum, sumsq
 
 
 @functools.cache
-def _fused_mlp(names, activation, stats, rstd):
+def _fused_mlp(names, activation, stats, rstd, algorithm="simt"):
     """The custom_vjp function of ``fused_mlp`` for one set of present arrays
     (a dict keyed by ``names``)."""
+    simt = algorithm == "simt"
 
     def outputs(out, rsum, sumsq):
         extra = [a for a in (rsum, sumsq) if a is not None]
@@ -857,11 +1157,15 @@ def _fused_mlp(names, activation, stats, rstd):
 
     @jax.custom_vjp
     def f(a):
-        out, _, _, _, rsum, sumsq = _mlp_forward(a, activation, stats, rstd, False)
+        out, _, _, _, rsum, sumsq = _mlp_forward(
+            a, activation, stats, rstd, False, algorithm
+        )
         return outputs(out, rsum, sumsq)
 
     def fwd(a):
-        out, h, h_act, acc1, rsum, sumsq = _mlp_forward(a, activation, stats, rstd, True)
+        out, h, h_act, acc1, rsum, sumsq = _mlp_forward(
+            a, activation, stats, rstd, True, algorithm
+        )
         saved = {n: a[n] for n in names if n not in ("residual", "residual2")}
         return outputs(out, rsum, sumsq), (saved, h, h_act, acc1, out)
 
@@ -877,7 +1181,8 @@ def _fused_mlp(names, activation, stats, rstd):
         g = d_out if mask is None else d_out * mask[:, None]
         # d act(h) = (d_out mask) @ W2.T, then the activation's derivative, in one
         # kernel: W2 read N-major through the prepared transpose, else K-major
-        if "w2_t" in a:
+        # (the tensor-core kernel reads W2 K-major at full speed, with its low part)
+        if "w2_t" in a and simt:
             w2_dx, transposed = a["w2_t"], False
         else:
             w2_dx, transposed = a["w2"], True
@@ -893,6 +1198,8 @@ def _fused_mlp(names, activation, stats, rstd):
             stages=3,
             splits=None,
             dact=(h, activation),
+            algorithm=algorithm,
+            w_lo=a.get("w2_lo"),
         )
         grads = dict(
             w2=lambda: jnp.dot(h_act.T, g, precision=HIGHEST),
@@ -902,6 +1209,10 @@ def _fused_mlp(names, activation, stats, rstd):
             row_mask=lambda: jnp.zeros_like(mask),
             w1_t=lambda: jnp.zeros_like(a["w1_t"]),
             w2_t=lambda: jnp.zeros_like(a["w2_t"]),
+            w1_lo=lambda: jnp.zeros_like(a["w1_lo"]),
+            w2_lo=lambda: jnp.zeros_like(a["w2_lo"]),
+            w1_t_lo=lambda: jnp.zeros_like(a["w1_t_lo"]),
+            w2_t_lo=lambda: jnp.zeros_like(a["w2_t_lo"]),
             b1=lambda: dh.sum(0),
             pre_add=lambda: dh,
             rank1_row=lambda: jnp.sum(dh * a["rank1_col"], axis=1),
@@ -910,7 +1221,7 @@ def _fused_mlp(names, activation, stats, rstd):
         if "x" in a:
             K = a["x"].shape[1]
             s = _effective_scale(a, rstd, K)
-            if "w1_t" in a:
+            if "w1_t" in a and simt:
                 w1_dx, transposed = a["w1_t"], False
             else:
                 w1_dx, transposed = a["w1"], True
@@ -925,6 +1236,8 @@ def _fused_mlp(names, activation, stats, rstd):
                 tile=None,
                 stages=3,
                 splits=None,
+                algorithm=algorithm,
+                w_lo=a.get("w1_lo"),
             )
             dh_s = dh if s is None else dh * s[:, None]
             grads["x"] = lambda: dx
@@ -961,9 +1274,15 @@ def reference_mlp(
     row_sumsq=False,
     row_stats=False,
     precision=HIGHEST,
+    algorithm=None,
+    w1_lo=None,
+    w2_lo=None,
+    w1_t_lo=None,
+    w2_t_lo=None,
 ):
-    """``fused_mlp`` in plain JAX."""
-    del w1_t, w2_t
+    """``fused_mlp`` in plain JAX (the prepared weights and ``algorithm`` are
+    accepted and ignored)."""
+    del w1_t, w2_t, algorithm, w1_lo, w2_lo, w1_t_lo, w2_t_lo
     if row_rstd is not None:
         row_scale = jax.lax.rsqrt(row_rstd / x.shape[1] + rstd_eps)
     if x is None:

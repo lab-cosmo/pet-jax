@@ -225,7 +225,11 @@ class Backbone(nn.Module):
     the next one turns them into the row factor), so no pass over the tokens is
     left between the kernels but the gathers and concatenations. Flat tokens and
     ``attention="cute"`` only; the parameter tree is unchanged (``prepare_params``
-    adds derived leaves), the result the stock one to round-off.
+    adds derived leaves), the result the stock one to round-off. ``dense="tf32x3"``
+    is the same layer with every GEMM as a 3xTF32 tensor-core product (the
+    operands split into a TF32 high and low part, three MMAs; fp32-class, about
+    1e-5 relative, not round-off exact; the weights' low parts come from
+    ``prepare_params(low_parts=True)``).
 
     Token layout. ``tokens="padded"`` (stock) takes the pairs in the
     rectangular ``[N * n]`` layout. ``tokens="flat"`` takes one compacted,
@@ -443,7 +447,7 @@ def _layer_tokens(
     0) the messages."""
     d_pet = backbone.d_pet
     geom = jnp.concatenate([R_ij, r_ij[..., None]], axis=-1)
-    folded = backbone.fold_compress or backbone.dense == "cute"
+    folded = backbone.fold_compress or backbone.dense in FUSED_DENSE
     if folded and not backbone.is_initializing():
         tokens_flat = _compress_folded(
             backbone,
@@ -500,7 +504,7 @@ def _layer_tokens(
 
     if conditioning is not None:
         node = node + conditioning[:, None, :]
-    if backbone.dense == "cute" and not backbone.is_initializing():
+    if backbone.dense in FUSED_DENSE and not backbone.is_initializing():
         # the fused layer's last epilogue applied the mask
         return node, edge, edge_stats
     return node, edge.reshape(-1, d_pet) * pair_mask[..., None], None
@@ -543,18 +547,21 @@ def _compress_folded(
         h = h + compress["neighbor_table"][atomic_numbers][neighbors]
     else:
         h = h + (neighbor_table @ W1[d : 2 * d])[neighbors]
-    if backbone.dense == "cute":
+    if backbone.dense in FUSED_DENSE:
         from .kernels.dense import fused_mlp
 
         # the SiLU, the second Dense, the mask and the output rows' sums of squares
         # (for the next RMSNorm) in one call with one backward; at layer 0 the
         # pre-activation is complete without a GEMM
+        extra = {}
         if neighbor_table is None:
             x, w_m, w_m_t = None, None, None
         else:
             x = messages
             w_m = compress["kernel_m"] if prepared else W1[2 * d :]
             w_m_t = compress["kernel_m_t"] if prepared else None
+            extra = _low_parts(compress, "kernel_m", backbone.dense, "w1")
+        extra |= _low_parts(compress["Dense_1"], "kernel", backbone.dense, "w2")
         return fused_mlp(
             x,
             w_m,
@@ -567,6 +574,7 @@ def _compress_folded(
             w1_t=w_m_t,
             w2_t=compress["Dense_1"].get("kernel_t"),
             row_sumsq=True,
+            **extra,
         )
     if neighbor_table is not None:
         h = h + messages @ W1[2 * d :]
@@ -594,7 +602,7 @@ def _layer_messages(
     ``None``."""
     d_pet = backbone.d_pet
     passing = layer_idx < backbone.num_gnn_layers - 1 or backbone.final_message_passing
-    if passing and backbone.dense == "cute" and not backbone.is_initializing():
+    if passing and backbone.dense in FUSED_DENSE and not backbone.is_initializing():
         return _messages_fused(
             backbone,
             layer_idx,
@@ -689,6 +697,10 @@ def _messages_fused(
         row_mask=pair_mask.astype(combined.dtype),
         w1_t=first.get("kernel_normed_t"),
         w2_t=mlp["Dense_1"].get("kernel_t"),
+        **(
+            _low_parts(first, "kernel_normed", backbone.dense, "w1")
+            | _low_parts(mlp["Dense_1"], "kernel", backbone.dense, "w2")
+        ),
     )
 
 
@@ -854,16 +866,53 @@ _FUSED_DENSES = {
 }
 
 
-def prepare_params(params):
+# the dense modes that run the fused layer (kernels.dense); "tf32x3" is the
+# tensor-core 3xTF32 GEMM, "cute" the fp32 SIMT one
+FUSED_DENSE = ("cute", "tf32x3")
+
+
+def _low_parts(layer, key, algorithm, prefix="w"):
+    """The ``fused_dense`` / ``fused_mlp`` arguments of a weight's prepared TF32 low
+    parts (``<key>_lo`` and ``<key>_t_lo`` of ``layer``), plus the algorithm, for
+    ``algorithm == "tf32x3"``; empty for the SIMT kernel (its default)."""
+    if algorithm != "tf32x3":
+        return {}
+    out = {"algorithm": algorithm}
+    for arg, leaf in ((f"{prefix}_lo", key + "_lo"), (f"{prefix}_t_lo", key + "_t_lo")):
+        if leaf in layer:
+            out[arg] = layer[leaf]
+    return out
+
+
+LOW_PART_LEAVES = (
+    "kernel",
+    "kernel_t",
+    "kernel_normed",
+    "kernel_normed_t",
+    "kernel_m",
+    "kernel_m_t",
+    "geom_kernel",
+)
+
+
+def tf32_low_part(w):
+    """``w - tf32(w)``: what the tensor cores drop of ``w`` when they read it as
+    TF32 (round to nearest, 10 mantissa bits). ``w = tf32(w) + low`` exactly, and
+    ``x @ w = x @ tf32(w) + x @ low`` is the second term of a 3xTF32 product."""
+    return w - jax.lax.reduce_precision(w, exponent_bits=8, mantissa_bits=10)
+
+
+def prepare_params(params, low_parts=False):
     """The parameter tree with the extra leaves the fused layer (``dense="cute"``)
     reads next to each ``Dense`` kernel: ``kernel_t`` (the transposed weight, for
     the backward's ``dx`` on the fast operand path), ``kernel_normed`` (the weight
     with the preceding RMSNorm's gain folded in) and its transpose, the comb
     LayerNorm's folded bias and gain-weight product, and the species tables of
-    the compress fold multiplied into its first Dense. Computed once per
-    parameter set; the layers fall back to computing them per call when the
-    leaves are absent. The stock leaves are untouched, so ``init``'s tree is a
-    subset."""
+    the compress fold multiplied into its first Dense. With ``low_parts`` also
+    every such weight's TF32 low part (``tf32_low_part``) as ``<name>_lo``, for
+    the 3xTF32 kernels. Computed once per parameter set; the layers fall back to
+    computing them per call when the leaves are absent. The stock leaves are
+    untouched, so ``init``'s tree is a subset."""
 
     def leaf(tree, path):
         for key in path.split("/"):
@@ -909,7 +958,25 @@ def prepare_params(params):
             layer["Dense_0"]["bias_folded"] = norm["bias"] @ W1 + layer["Dense_0"]["bias"]
             layer["Dense_0"]["gain_weight"] = norm["scale"] @ W1
             layer["Dense_1"]["kernel_t"] = layer["Dense_1"]["kernel"].T
+    if low_parts:
+        for name, layer in backbone.items():
+            fused = (
+                "_trans_layers_" in name
+                or name.endswith("_compress")
+                or name.startswith("comb_mlps_")
+            )
+            if fused:
+                _add_low_parts(layer)
     return params
+
+
+def _add_low_parts(tree):
+    """``<name>_lo`` next to every ``LOW_PART_LEAVES`` weight of ``tree``, recursively."""
+    for key, value in list(tree.items()):
+        if isinstance(value, dict):
+            _add_low_parts(value)
+        elif key in LOW_PART_LEAVES:
+            tree[key + "_lo"] = tf32_low_part(value)
 
 
 # -- transformer block --
@@ -942,7 +1009,7 @@ class TransformerLayer(nn.Module):
         d_pet, d_node = self.d_pet, self.d_node
         d_ff = self.d_ff
         expanded = d_node != d_pet
-        if self.dense_kernel == "cute" and not self.is_initializing():
+        if self.dense_kernel in FUSED_DENSE and not self.is_initializing():
             return self._fused(node, edge, cutoffs, mask, tiles, edge_mask, edge_stats)
 
         if expanded:
@@ -1021,10 +1088,13 @@ class TransformerLayer(nn.Module):
             layer = param(name)
             return layer[key] if key in layer else fallback()
 
+        algorithm = self.dense_kernel
+
         def dense(x, name, **kw):
             w = param(name + "/kernel")
             w_t = prepared(name, "kernel_t", lambda: None)
-            return fused_dense(x, w, param(name + "/bias"), w_t=w_t, **kw)
+            low = _low_parts(param(name), "kernel", algorithm)
+            return fused_dense(x, w, param(name + "/bias"), w_t=w_t, **low, **kw)
 
         def normed(norm, name):
             # (x rstd gamma) W = rstd (x (gamma W)), the gain folded into the weight
@@ -1037,12 +1107,22 @@ class TransformerLayer(nn.Module):
 
         def normed_dense(x, x_sumsq, norm, name, **kw):
             w, w_t = normed(norm, name)
+            low = _low_parts(param(name), "kernel_normed", algorithm)
             return fused_dense(
-                x, w, param(name + "/bias"), row_rstd=x_sumsq, rstd_eps=eps, w_t=w_t, **kw
+                x,
+                w,
+                param(name + "/bias"),
+                row_rstd=x_sumsq,
+                rstd_eps=eps,
+                w_t=w_t,
+                **low,
+                **kw,
             )
 
         def normed_mlp(x, x_sumsq, norm, name_in, name_out, **kw):
             w1, w1_t = normed(norm, name_in)
+            low = _low_parts(param(name_in), "kernel_normed", algorithm, "w1")
+            low |= _low_parts(param(name_out), "kernel", algorithm, "w2")
             return fused_mlp(
                 x,
                 w1,
@@ -1054,6 +1134,7 @@ class TransformerLayer(nn.Module):
                 rstd_eps=eps,
                 w1_t=w1_t,
                 w2_t=prepared(name_out, "kernel_t", lambda: None),
+                **low,
                 **kw,
             )
 

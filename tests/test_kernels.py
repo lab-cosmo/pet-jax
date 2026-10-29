@@ -288,13 +288,33 @@ def dense_inputs(M, K, N, epilogue, seed=0):
     return x, w, kw
 
 
+# the GEMM behind fused_dense / fused_mlp, and the tolerances (rtol, atol / max|ref|)
+# against the fp32 reference of the forward and of the gradients: 3xTF32 is
+# fp32-class (2e-6 to 5e-6 of the matmul's scale), not bit-for-bit fp32
+DENSE_ALGORITHMS = ["simt", "tf32x3"]
+DENSE_TOL = {"simt": (1e-5, 1e-5), "tf32x3": (1e-4, 2e-5)}
+DENSE_GRAD_TOL = {"simt": (1e-4, 1e-5), "tf32x3": (1e-4, 2e-5)}
+
+
+def _algorithm_kw(tile, extra):
+    """``(tile, extra)`` for the algorithm in ``extra``: the tensor-core kernel picks
+    its own tile and has no split or stage count to set."""
+    algorithm = extra.get("algorithm", "simt")
+    if algorithm == "simt":
+        return tile, extra
+    extra = {k: v for k, v in extra.items() if k not in ("splits", "stages")}
+    return None, extra
+
+
 def _check_dense(M, K, N, epilogue, tile, **extra):
-    """``fused_dense`` (with ``extra`` arguments, e.g. ``stages`` or ``splits``)
-    against the reference; returns its output."""
+    """``fused_dense`` (with ``extra`` arguments, e.g. ``stages``, ``splits`` or
+    ``algorithm``) against the reference; returns its output."""
     from petjax.kernels.dense import fused_dense, reference_dense
 
     if isinstance(epilogue, str):
         epilogue = DENSE_EPILOGUES[epilogue]
+    rtol, atol = DENSE_TOL[extra.get("algorithm", "simt")]
+    tile, extra = _algorithm_kw(tile, extra)
     x, w, kw = dense_inputs(M, K, N, epilogue)
     out = jax.jit(lambda x, w: fused_dense(x, w, tile=tile, **kw, **extra))(x, w)
     ref = reference_dense(x, w, **kw)
@@ -304,22 +324,44 @@ def _check_dense(M, K, N, epilogue, tile, **extra):
         o, r = np.asarray(o), np.asarray(r)
         assert o.shape == r.shape
         assert np.all(np.isfinite(o))
-        np.testing.assert_allclose(o, r, rtol=1e-5, atol=1e-5 * np.abs(r).max())
+        np.testing.assert_allclose(o, r, rtol=rtol, atol=atol * np.abs(r).max())
     if "row_mask" in kw:
         assert np.all(np.asarray(outs[0])[np.asarray(kw["row_mask"]) == 0.0] == 0.0)
     if kw.get("transpose_w"):
         # the same weight stored the other way round: the same FFMAs in the same order
+        # (the tensor core's two B layouts: equal to round-off)
         plain = dict(kw, transpose_w=False)
         again = jax.jit(lambda x, w: fused_dense(x, w, tile=tile, **plain, **extra))(x, w.T)
         for o, a in zip(jax.tree.leaves(out), jax.tree.leaves(again)):
-            np.testing.assert_array_equal(np.asarray(o), np.asarray(a))
+            o, a = np.asarray(o), np.asarray(a)
+            if extra.get("algorithm", "simt") == "simt":
+                np.testing.assert_array_equal(o, a)
+            else:
+                np.testing.assert_allclose(o, a, rtol=1e-6, atol=1e-6 * np.abs(a).max())
     return out
 
 
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
 @pytest.mark.parametrize("epilogue", list(DENSE_EPILOGUES))
 @pytest.mark.parametrize("M,K,N", DENSE_SHAPES)
-def test_dense(M, K, N, epilogue):
-    _check_dense(M, K, N, epilogue, (64, 64, 8), splits=1)
+def test_dense(M, K, N, epilogue, algorithm):
+    _check_dense(M, K, N, epilogue, (64, 64, 8), splits=1, algorithm=algorithm)
+
+
+@pytest.mark.parametrize("transpose_w", [False, True], ids=["MN-major", "K-major"])
+@pytest.mark.parametrize("M,K,N", [(2304, 256, 256), (2392, 256, 768), (300, 512, 64)])
+def test_dense_tf32_one_pass(M, K, N, transpose_w):
+    """One TF32 pass on the tensor-core kernel is cuBLAS's TF32 GEMM (what
+    ``jnp.dot`` runs at the default precision on this GPU), bit for bit."""
+    from petjax.kernels.dense import fused_dense
+
+    x, w, _ = dense_inputs(M, K, N, {})
+    stored = jnp.array(w.T) if transpose_w else w
+    out = jax.jit(
+        lambda x, s: fused_dense(x, s, algorithm="tf32", transpose_w=transpose_w)
+    )(x, stored)
+    ref = jax.jit(lambda x, w: jnp.dot(x, w, precision=jax.lax.Precision.DEFAULT))(x, w)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
 
 
 @pytest.mark.parametrize("tile", [(64, 32, 8), (128, 64, 8)])
@@ -418,13 +460,42 @@ DIFFERENTIABLE = (
 )
 
 
+# the tensor-core kernel's non-default paths: x split into its TF32 parts in the
+# kernel, the row statistics from the kernel's whole-row tiles at small M, one split
+TF32_VARIANTS = {
+    "kernel_split": ("TF32_SPLIT_A", True),
+    "stats_in_kernel": ("TF32_STATS_MIN_ROWS", 0),
+    "one_split": ("TF32_SPLIT_K", False),
+    "split_only_small_m": ("TF32_SPLIT_MIN_K", 0),
+    "glu_general_tile": ("TF32_GLU_BN", 0),
+    "two_ctas_per_sm": ("TF32_SMEM_LIMIT", 110 * 1024),
+}
+
+
+@pytest.mark.parametrize("variant", list(TF32_VARIANTS))
+@pytest.mark.parametrize(
+    "epilogue",
+    ["scale_bias_res_mask", "t_bias_glu_rank1_save", "sumsq_res_mask", "stats_glu_scale"],
+)
+@pytest.mark.parametrize(
+    "M,K,N", [(2304, 256, 256), (300, 512, 128), (37, 512, 128), (884, 2048, 256)]
+)
+def test_dense_tf32_variants(M, K, N, epilogue, variant, monkeypatch):
+    from petjax.kernels import dense
+
+    monkeypatch.setattr(dense, *TF32_VARIANTS[variant])
+    ep = DENSE_EPILOGUES.get(epilogue) or DENSE_STATS_EPILOGUES[epilogue]
+    _check_dense(M, K, N, ep, None, algorithm="tf32x3")
+
+
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
 @pytest.mark.parametrize("epilogue", list(DENSE_GRAD_EPILOGUES))
 # automatic tiles and splits: M <= 128 runs split-K
 @pytest.mark.parametrize(
     "M,K,N", [(100, 256, 128), (37, 256, 64), (3915, 256, 768), (88, 2048, 1024)]
 )
-def test_dense_grad(M, K, N, epilogue):
-    _check_dense_grad(M, K, N, DENSE_GRAD_EPILOGUES[epilogue])
+def test_dense_grad(M, K, N, epilogue, algorithm):
+    _check_dense_grad(M, K, N, DENSE_GRAD_EPILOGUES[epilogue], algorithm=algorithm)
 
 
 def _check_dense_grad(M, K, N, epilogue, **fused_kw):
@@ -445,13 +516,14 @@ def _check_dense_grad(M, K, N, epilogue, **fused_kw):
 
         return jax.jit(jax.grad(f))
 
+    rtol, atol = DENSE_GRAD_TOL[fused_kw.get("algorithm", "simt")]
     grads = loss(functools.partial(fused_dense, **fused_kw))(params)
     refs = loss(reference_dense)(params)
     for (path, g), r in zip(jax.tree.leaves_with_path(grads), jax.tree.leaves(refs)):
         g, r = np.asarray(g), np.asarray(r)
         assert g.shape == r.shape, path
         np.testing.assert_allclose(
-            g, r, rtol=1e-4, atol=1e-5 * np.abs(r).max(), err_msg=jax.tree_util.keystr(path)
+            g, r, rtol=rtol, atol=atol * np.abs(r).max(), err_msg=jax.tree_util.keystr(path)
         )
     if "row_mask" in kw and not kw.get("save_pre"):  # h is not masked
         assert np.all(np.asarray(grads["x"])[np.asarray(kw["row_mask"]) == 0.0] == 0.0)
@@ -462,16 +534,20 @@ def _check_dense_grad(M, K, N, epilogue, **fused_kw):
     "epilogue", ["plain", "scale_bias_silu_res_mask", "everything_glu"]
 )
 @pytest.mark.parametrize("M,K,N", [(100, 256, 128), (3915, 256, 768)])
-def test_dense_w_t(M, K, N, epilogue):
-    """A prepared ``W.T`` for the backward gives the same gradients (its own is
-    zero), and the mirror case is refused."""
-    from petjax.kernels.dense import fused_dense
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
+def test_dense_w_t(M, K, N, epilogue, algorithm):
+    """A prepared ``W.T`` (and for 3xTF32 the weight's low part) for the backward
+    gives the same gradients (their own are zero), and the mirror case is refused."""
+    from petjax.kernels.dense import fused_dense, tf32_low_part
 
     ep = DENSE_GRAD_EPILOGUES[epilogue]
     _, w, _ = dense_inputs(M, K, N, ep)
     w_t = jnp.array(w.T)
-    plain = _check_dense_grad(M, K, N, ep)
-    prepared = _check_dense_grad(M, K, N, ep, w_t=w_t)
+    prep = dict(w_t=w_t)
+    if algorithm != "simt":
+        prep |= dict(w_lo=tf32_low_part(w), w_t_lo=tf32_low_part(w_t))
+    plain = _check_dense_grad(M, K, N, ep, algorithm=algorithm)
+    prepared = _check_dense_grad(M, K, N, ep, algorithm=algorithm, **prep)
     for (path, a), b in zip(jax.tree.leaves_with_path(prepared), jax.tree.leaves(plain)):
         a, b = np.asarray(a), np.asarray(b)
         np.testing.assert_allclose(
@@ -496,12 +572,13 @@ DENSE_STATS_EPILOGUES = {
 }
 
 
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
 @pytest.mark.parametrize("epilogue", list(DENSE_STATS_EPILOGUES))
 @pytest.mark.parametrize(
     "M,K,N", [(2304, 256, 256), (2395, 256, 256), (2304, 256, 128), (37, 256, 256)]
 )
-def test_dense_row_stats(M, K, N, epilogue):
-    _check_dense(M, K, N, DENSE_STATS_EPILOGUES[epilogue], None)
+def test_dense_row_stats(M, K, N, epilogue, algorithm):
+    _check_dense(M, K, N, DENSE_STATS_EPILOGUES[epilogue], None, algorithm=algorithm)
 
 
 @pytest.mark.parametrize(
@@ -511,10 +588,11 @@ def test_dense_row_stats_tiles(tile):
     _check_dense(2395, 256, 256, DENSE_STATS_EPILOGUES["sumsq_res_mask"], tile)
 
 
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
 @pytest.mark.parametrize("epilogue", list(DENSE_STATS_EPILOGUES))
 @pytest.mark.parametrize("M,K,N", [(300, 256, 256), (37, 256, 128)])
-def test_dense_row_stats_grad(M, K, N, epilogue):
-    _check_dense_grad(M, K, N, DENSE_STATS_EPILOGUES[epilogue])
+def test_dense_row_stats_grad(M, K, N, epilogue, algorithm):
+    _check_dense_grad(M, K, N, DENSE_STATS_EPILOGUES[epilogue], algorithm=algorithm)
 
 
 # pick_tile's large-M choices: 128x64x16 and 128x128x16 with 2 CTAs per SM for
@@ -560,10 +638,12 @@ def test_dense_large_grad():
 # -- the fused layer: calculator parity --
 
 
-def test_dense_layer(mini_xyz, assets_dir):
-    """The recipe with ``dense="cute"``, ``solver_kernel="cute"`` and the compress
-    fold against the recipe with the attention kernel alone, fp32 on the GPU,
-    on the mini frames: energies and forces to round-off."""
+@pytest.mark.parametrize("dense", ["cute", "tf32x3"])
+def test_dense_layer(mini_xyz, assets_dir, dense):
+    """The recipe with ``dense="cute"`` (or ``"tf32x3"``), ``solver_kernel="cute"``
+    and the compress fold against the recipe with the attention kernel alone,
+    fp32 on the GPU, on the mini frames: energies and forces to round-off (the
+    SIMT kernel) or to fp32-class accuracy (3xTF32)."""
     from ase.io import read
 
     from petjax import UPETCalculator
@@ -582,7 +662,7 @@ def test_dense_layer(mini_xyz, assets_dir):
         attention="cute",
         solver_kernel="cute",
         fold_compress=True,
-        dense="cute",
+        dense=dense,
     )
     frames = [read(str(mini_xyz), index=i) for i in (0, 6, 11)]
     for express in (base, arm):
@@ -694,32 +774,42 @@ def _mlp_cases():
     return [(name, shape) for name, shapes in MLP_SHAPES.items() for shape in shapes]
 
 
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
 @pytest.mark.parametrize("case,shape", _mlp_cases())
-def test_mlp(case, shape):
+def test_mlp(case, shape, algorithm):
     """``fused_mlp`` against the reference, forward."""
     from petjax.kernels.dense import fused_mlp, reference_mlp
 
     params, kw = mlp_inputs(*shape, MLP_CASES[case])
-    out = jax.jit(lambda p: fused_mlp(**p, **kw))(params)
+    rtol, atol = DENSE_TOL[algorithm]
+    out = jax.jit(lambda p: fused_mlp(**p, **kw, algorithm=algorithm))(params)
     ref = reference_mlp(**params, **kw)
     for o, r in zip(jax.tree.leaves(out), jax.tree.leaves(ref)):
         o, r = np.asarray(o), np.asarray(r)
         assert o.shape == r.shape
-        np.testing.assert_allclose(o, r, rtol=1e-5, atol=1e-5 * np.abs(r).max())
+        np.testing.assert_allclose(o, r, rtol=rtol, atol=atol * np.abs(r).max())
     if "row_mask" in kw:
         first = np.asarray(jax.tree.leaves(out)[0])
         assert np.all(first[np.asarray(kw["row_mask"]) == 0.0] == 0.0)
 
 
+@pytest.mark.parametrize("algorithm", DENSE_ALGORITHMS)
 @pytest.mark.parametrize("prepared", [False, True], ids=["w", "w_t"])
 @pytest.mark.parametrize("case,shape", _mlp_cases())
-def test_mlp_grad(case, shape, prepared):
+def test_mlp_grad(case, shape, prepared, algorithm):
     """``jax.grad`` through ``fused_mlp`` against the reference, for a random
     cotangent on every output, with the weights read as stored or through the
-    prepared transposes."""
-    from petjax.kernels.dense import fused_mlp, reference_mlp
+    prepared transposes (and for 3xTF32 the prepared low parts)."""
+    from petjax.kernels.dense import fused_mlp, reference_mlp, tf32_low_part
 
     params, kw = mlp_inputs(*shape, MLP_CASES[case], prepared=prepared)
+    kw["algorithm"] = algorithm
+    if prepared and algorithm != "simt":
+        for n in ("w1", "w2"):
+            if params.get(n) is not None:
+                kw[f"{n}_lo"] = tf32_low_part(params[n])
+                kw[f"{n}_t_lo"] = tf32_low_part(kw[f"{n}_t"])
+    rtol, atol = DENSE_GRAD_TOL[algorithm]
     params = {n: a for n, a in params.items() if a is not None}
     fixed = {n: None for n in ("x", "w1", "b1") if n not in params}
     shapes = jax.tree.leaves(
@@ -741,5 +831,5 @@ def test_mlp_grad(case, shape, prepared):
         g, r = np.asarray(g), np.asarray(r)
         assert g.shape == r.shape, path
         np.testing.assert_allclose(
-            g, r, rtol=1e-4, atol=1e-5 * np.abs(r).max(), err_msg=jax.tree_util.keystr(path)
+            g, r, rtol=rtol, atol=atol * np.abs(r).max(), err_msg=jax.tree_util.keystr(path)
         )

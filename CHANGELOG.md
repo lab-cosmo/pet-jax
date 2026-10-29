@@ -17,7 +17,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
 - `UPETCalculator(express={...})`: opt-in performance switches (`petjax.express.Express`), each exact against the stock path up to summation order. They cover solver variants, a device-built neighbour list, flat tokens with fixed-width attention tiles, and `remat` / `atom_block` for peak memory.
 - `center_order` and `corresponding_edges`: jit-safe versions of `to_structure`'s center sort and reverse map, for neighbour lists built on the device.
-- Hand-written CuTe DSL kernels behind `express` switches (`petjax.kernels`, the `cute` extra; Linux, CUDA 13): the attention core, the adaptive-cutoff solver, and the GNN layer's GEMMs with fused epilogues in fp32 (`dense="cute"`). `fold_compress` folds the compress MLP's inputs into its first `Dense`.
+- Hand-written CuTe DSL kernels behind `express` switches (`petjax.kernels`, the `cute` extra; Linux, CUDA 13): the attention core, the adaptive-cutoff solver, and the GNN layer's GEMMs with fused epilogues, in fp32 (`dense="cute"`) or 3xTF32 on Blackwell (`dense="tf32x3"`, fp32-class accuracy). `fold_compress` folds the compress MLP's inputs into its first `Dense`.
 
 ### Fixed
 
