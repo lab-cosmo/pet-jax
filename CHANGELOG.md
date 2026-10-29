@@ -8,15 +8,15 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ### Changed
 
-- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag: the per-atom and per-pair cutoffs, the selected mask, the selected count per center, and `overflow`, mirroring what `select_edges` reports host-side. Callers that unpacked the flag read `.overflow`; the counts let a driver size `k_sel` without leaving jit.
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple instead of the bare `overflow` flag: cutoffs, selected mask, counts per center and `overflow`, as `select_edges` reports host-side. Read `.overflow` where you unpacked the flag.
 
 ### Added
 
-- `center_order` and `corresponding_edges`: jit-safe twins of the two layout steps `to_structure` does on the host (sort a padded flat neighbour list by center with padding last, and build the reverse map by stable multi-key sorts on int32 keys), for raw neighbour lists built on the device.
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
-- `UPETCalculator(express={...})` takes opt-in performance switches (`petjax.express.Express`), each exact against the stock path up to summation order: adaptive-cutoff solver variants (`solver="sorted_window"` and others, `seed_cutoffs`), a device-built raw neighbour list and a `cutoff_guard`, a flat token list with fixed-width attention tiles (`tokens="flat"`, `attention_tile`), `reverse_unique`, and for peak memory `remat` and `atom_block` (each GNN layer rematerialised, optionally over blocks of atoms). The calculator records the active switches in `debug_stats["express"]`.
+- `UPETCalculator(express={...})`: opt-in performance switches (`petjax.express.Express`), each exact against the stock path up to summation order. They cover solver variants, a device-built neighbour list, flat tokens with fixed-width attention tiles, and `remat` / `atom_block` for peak memory.
+- `center_order` and `corresponding_edges`: jit-safe versions of `to_structure`'s center sort and reverse map, for neighbour lists built on the device.
 
 ### Fixed
 
