@@ -55,6 +55,7 @@ class UPET(nn.Module):
     attention_tile: int | None = None
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    attention: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -92,6 +93,7 @@ class UPET(nn.Module):
             attention_tile=self.attention_tile,
             fold_extra_block=self.fold_extra_block,
             reverse_unique=self.reverse_unique,
+            attention=self.attention,
             remat=self.remat,
             atom_block=self.atom_block,
             name="backbone",
@@ -192,6 +194,12 @@ class Backbone(nn.Module):
     partner message, as the masked sentinel gives it otherwise), so the gather
     has unique indices and its transpose needs no scatter-add.
 
+    ``attention="cute"`` runs each tile's attention core (the tile gather,
+    scores, softmax, contraction with ``v``, the scatter back, and their
+    backward) as one CuTe DSL kernel per direction (``kernels.attention``)
+    instead of ``flax``'s ``dot_product_attention``; single tiles only, same
+    result to round-off.
+
     Token layout. ``tokens="padded"`` (stock) takes the pairs in the
     rectangular ``[N * n]`` layout. ``tokens="flat"`` takes one compacted,
     center-sorted token list ``[P]`` of any static length plus the attention
@@ -242,6 +250,7 @@ class Backbone(nn.Module):
     attention_tile: int | None = None
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    attention: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -410,6 +419,7 @@ def _layer_tokens(
             num_heads=backbone.num_heads,
             temperature=backbone.attention_temperature,
             fold_extra_block=backbone.fold_extra_block,
+            attention_kernel=backbone.attention,
             name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
         )(node, edge, cutoffs_tokens, mask, tiles)
 
@@ -599,6 +609,7 @@ class TransformerLayer(nn.Module):
     num_heads: int
     temperature: float = 1.0
     fold_extra_block: bool = False
+    attention_kernel: str = "xla"
 
     @nn.compact
     def __call__(self, node, edge, cutoffs, mask, tiles=None):
@@ -630,9 +641,9 @@ class TransformerLayer(nn.Module):
             return nn.Dense(d_node, name="center_mlp_out")(v * jax.nn.sigmoid(g))
 
         # PreLN transformer
-        attn = Attention(self.num_heads, self.temperature, self.fold_extra_block)(
-            rms_norm(tokens, name="norm_attn"), cutoffs, mask, tiles
-        )
+        attn = Attention(
+            self.num_heads, self.temperature, self.fold_extra_block, self.attention_kernel
+        )(rms_norm(tokens, name="norm_attn"), cutoffs, mask, tiles)
         if tiles is None:
             out_node, out_edge = attn[:, :1], attn[:, 1:]
         else:
@@ -663,6 +674,7 @@ class Attention(nn.Module):
     num_heads: int
     temperature: float = 1.0
     fold_extra_block: bool = False
+    kernel: str = "xla"
 
     @nn.compact
     def __call__(self, x, cutoffs, mask, tiles=None):
@@ -673,6 +685,11 @@ class Attention(nn.Module):
         d = F // H
 
         qkv = nn.Dense(3 * F, name="qkv")(x)
+        if self.kernel == "cute":
+            # the padded layout is the flat list [N * T] with the identity tile map
+            rows = jnp.arange(N * T, dtype=jnp.int32).reshape(N, T)
+            out = self._fused(qkv.reshape(N * T, 3 * F), rows, cutoffs, mask)
+            return nn.Dense(F, name="out")(out.reshape(N, T, F))
         q, k, v = jnp.split(qkv, 3, axis=-1)
 
         # flax scales q by 1/sqrt(d); fold in temperature for the full
@@ -697,6 +714,11 @@ class Attention(nn.Module):
         H = self.num_heads
         d = F // H
 
+        if self.kernel == "cute":
+            # the kernel gathers the tiles itself and writes the flat list back
+            assert tiles.extra_atoms.shape[0] == 0, "the cute kernel runs single tiles"
+            out = self._fused(nn.Dense(3 * F, name="qkv")(x), tiles.rows, cutoffs, mask)
+            return nn.Dense(F, name="out")(out)
         qkv = tiles.gather(nn.Dense(3 * F, name="qkv")(x))
         T, W, _ = qkv.shape
         q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -715,6 +737,12 @@ class Attention(nn.Module):
 
         # Back to the flat list before the output projection, which runs unpadded.
         return nn.Dense(F, name="out")(tiles.scatter(out.reshape(T, W, F)))
+
+    def _fused(self, qkv, rows, cutoffs, mask):
+        from .kernels.attention import fused_attention
+
+        bias = jnp.log(jnp.clip(cutoffs, 1e-15, None))
+        return fused_attention(qkv, rows, bias, mask, self.num_heads, self.temperature)
 
 
 # -- flat tokens: attention tiles --

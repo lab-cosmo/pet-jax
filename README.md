@@ -35,6 +35,12 @@ Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra
 pip install "pet-jax[convert]"
 ```
 
+The optional `cute` extra (`nvidia-cutlass-dsl[cu13]`, Linux and CUDA 13 only) adds hand-written CuTe DSL kernels that the calculator's `express` switches can turn on; without it everything runs on XLA alone:
+
+```bash
+pip install "pet-jax[cute]"
+```
+
 `pet-jax` is experimental and under active development, and releases lag behind `main`. For the latest state, install from GitHub:
 
 ```bash

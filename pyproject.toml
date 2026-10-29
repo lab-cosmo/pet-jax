@@ -45,6 +45,9 @@ Changelog = "https://github.com/lab-cosmo/pet-jax/blob/main/CHANGELOG.md"
 # The metatrain floor keeps the resolver off the broken metatrain==0.0.0
 # placeholder sdist on PyPI (predates the real releases; fails to build).
 convert = ["torch", "metatomic-torch", "metatrain>=2026.3"]
+# CuTe DSL kernels (petjax.kernels): linux and CUDA 13 only. Developed against 4.8.1;
+# the DSL's API moves between minor versions.
+cute = ["nvidia-cutlass-dsl[cu13]>=4.8.1,<4.9; sys_platform == 'linux'"]
 
 [project.scripts]
 petjax-convert = "petjax.cli:convert_main"

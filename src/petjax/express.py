@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, fields
 SOLVERS = ("segment_sum", "sorted_segment_sum", "blocked_prefix_sum", "sorted_window")
 NEIGHBOR_LISTS = ("host", "device")
 TOKEN_LAYOUTS = ("padded", "flat")
+ATTENTION_KERNELS = ("xla", "cute")
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,10 @@ class Express:
         rectangular pass instead of the compacted extra path.
       reverse_unique: gather the reverse messages through an involution with
         unique indices.
+      attention: ``xla`` (``flax``'s ``dot_product_attention``) or ``cute``
+        (``kernels.attention``: one CuTe DSL kernel per tile and direction,
+        fp32 only, exact to round-off; needs ``pet-jax[cute]`` and a GPU).
+        Single-tile attention only, so not with ``attention_tile``.
 
     Peak memory (``model.py``):
       remat: rematerialise each GNN layer's two stages (geometry, compress and
@@ -90,6 +95,7 @@ class Express:
     tile_floor: int = 8
     fold_extra_block: bool = False
     reverse_unique: bool = False
+    attention: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -97,6 +103,11 @@ class Express:
         _check_choice("solver", self.solver, SOLVERS)
         _check_choice("neighbor_list", self.neighbor_list, NEIGHBOR_LISTS)
         _check_choice("tokens", self.tokens, TOKEN_LAYOUTS)
+        _check_choice("attention", self.attention, ATTENTION_KERNELS)
+        if self.attention == "cute" and self.attention_tile is not None:
+            raise ValueError(
+                "attention='cute' runs single tiles only, not with attention_tile"
+            )
         if self.attention_tile is not None and self.tokens != "flat":
             raise ValueError("attention_tile needs tokens='flat'")
         if self.fold_extra_block and self.attention_tile is None:
@@ -131,6 +142,7 @@ class Express:
             "attention_tile": self.attention_tile,
             "fold_extra_block": self.fold_extra_block,
             "reverse_unique": self.reverse_unique,
+            "attention": self.attention,
             "remat": self.remat,
             "atom_block": self.atom_block,
         }
