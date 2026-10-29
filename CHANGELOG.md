@@ -16,6 +16,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
+- `UPETCalculator(express={...})` takes opt-in performance switches (`petjax.express.Express`), each exact against the stock path up to summation order: adaptive-cutoff solver variants (`solver="sorted_window"` and others, `seed_cutoffs`), a device-built raw neighbour list and a `cutoff_guard`, a flat token list with fixed-width attention tiles (`tokens="flat"`, `attention_tile`), `reverse_unique`, and for peak memory `remat` and `atom_block` (each GNN layer rematerialised, optionally over blocks of atoms). The calculator records the active switches in `debug_stats["express"]`.
 
 ### Fixed
 
