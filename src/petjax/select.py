@@ -2,7 +2,8 @@
 
 Given a structure dict (from ``structure.to_structure``), produce a
 ``truncated`` dict keyed to ``UPET.__call__``'s parameters so the model
-forward is ``model.apply(params, **truncated)``.
+forward is ``model.apply(params, **truncated)``, plus a ``Truncation`` with
+the selection's accounting (the host-side ``Selection`` plus ``overflow``).
 
 ``truncate`` splits at the displacement boundary: it derives ``R_ij`` via
 ``edge_displacements`` (single structure, one cell) and delegates to
@@ -31,12 +32,28 @@ from functools import partial
 
 from typing import NamedTuple
 
+from .express import Express
+from .structure import neighbor_list
 from .utils import cutoff_bump, edge_displacements, safe_norm
 
 # Per-atom model inputs a structure dict may carry besides the geometry.
 CONDITIONING_KEYS = ("charge", "spin_multiplicity")
 
-# -- truncate: structure -> (truncated dict, overflow) — the per-step entry --
+# -- truncate: structure -> (truncated dict, Truncation) — the per-step entry --
+
+
+class Truncation(NamedTuple):
+    """What ``truncate_edges`` / ``pack_edges`` selected and whether it fit:
+    ``Selection``'s fields as traced arrays, plus ``overflow``. The raw-pair
+    arrays index the input flat NL, not the packed layout. ``pack_edges`` has
+    no atomic cutoffs (``None``), passes its optional ``pair_cutoffs`` through,
+    and selects every unmasked pair."""
+
+    atomic_cutoffs: jax.Array | None  # [N] adaptive cutoff per atom
+    pair_cutoffs: jax.Array | None  # [n_pair_padded] mean of the two endpoint cutoffs
+    selected: jax.Array  # [n_pair_padded] bool, r_ij <= pair_cutoff; False on padding
+    counts: jax.Array  # [N] selected pairs per center, unclipped; k_sel must cover its max
+    overflow: jax.Array  # scalar bool, counts.max() > k_sel or a flat capacity exceeded
 
 
 def truncate(
@@ -46,12 +63,35 @@ def truncate(
     cutoff_width_adaptive,
     method="grid",
     no_shadow=False,
+    express=None,
 ):
     """Adaptive selection + pack for a single-structure dict: derive ``R_ij``
     from ``(positions, cell_shifts, cell)``, read ``k_sel`` off the
     ``k_sel_sizer`` carrier, delegate to ``truncate_edges``. Per-atom model
     inputs beyond the geometry (``charge``, ``spin_multiplicity``) pass
-    through untouched when present."""
+    through untouched when present. ``express`` selects the performance
+    switches (``Express``).
+
+    With ``neighbor_list="device"`` the raw list is built here
+    (``structure.neighbor_list``) from ``positions``, ``cell``, ``pbc`` and the
+    ``lattice_shifts`` window at radius ``neighbor_radius``, into the static
+    capacity read off the ``pair_sizer`` carrier, instead of read off the dict;
+    a real pair that does not fit sets ``overflow``. With ``seed_cutoffs``,
+    the optional ``cutoff_seed`` / ``seed_displacement`` entries are passed on
+    to ``truncate_edges``."""
+    express = Express.from_any(express)
+    raw_overflow = None
+    if express.neighbor_list == "device":
+        nl, raw_overflow = neighbor_list(
+            structure["positions"],
+            structure["cell"],
+            structure["atom_mask"],
+            structure["pbc"],
+            structure["lattice_shifts"],
+            structure["neighbor_radius"],
+            structure["pair_sizer"].shape[-1],
+        )
+        structure = {**structure, **nl}
     R_ij = edge_displacements(
         structure["positions"],
         structure["centers"],
@@ -59,7 +99,7 @@ def truncate(
         structure["cell_shifts"],
         structure["cell"],
     )
-    truncated, overflow = truncate_edges(
+    truncated, truncation = truncate_edges(
         R_ij,
         structure["centers"],
         structure["others"],
@@ -73,11 +113,22 @@ def truncate(
         cutoff_width_adaptive,
         method=method,
         no_shadow=no_shadow,
+        express=express,
+        token_capacity=_sizer(structure, "token_sizer"),
+        tile_capacity=_sizer(structure, "tile_sizer") or 0,
+        cutoff_seed=structure.get("cutoff_seed"),
+        seed_displacement=structure.get("seed_displacement"),
     )
     for key in CONDITIONING_KEYS:
         if key in structure:
             truncated[key] = structure[key]
-    return truncated, overflow
+    if raw_overflow is not None:
+        truncation = truncation._replace(overflow=truncation.overflow | raw_overflow)
+    return truncated, truncation
+
+
+def _sizer(structure, key):
+    return structure[key].shape[-1] if key in structure else None
 
 
 def truncate_edges(
@@ -94,11 +145,17 @@ def truncate_edges(
     cutoff_width_adaptive,
     method="grid",
     no_shadow=False,
+    express=None,
+    token_capacity=None,
+    tile_capacity=0,
+    cutoff_seed=None,
+    seed_displacement=None,
 ):
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
     truncated dict keyed to ``UPET.__call__``'s parameter names (so the forward
-    is ``model.apply(params, **truncated)``).
+    is ``model.apply(params, **truncated)``) and the ``Truncation``. Its
+    ``counts`` is what a driver sizes ``k_sel`` from without leaving jit.
 
     ``cutoff`` is the trained maximum cutoff and ``cutoff_width_adaptive`` the
     selection taper width only — the final ``cutoff_bump`` taper inside the
@@ -109,10 +166,30 @@ def truncate_edges(
     ones (atoms sample-contiguous, padding at the tail), since the selection
     couples pairs only through their center/other atoms. Requires ``centers``
     non-decreasing; ``k_sel`` must be a static int under jit.
+
+    ``express`` picks the solver and the token layout (``Express``). With
+    ``tokens="flat"`` the survivors go into one compacted list of static
+    length ``token_capacity`` instead (``_pack_selected_to_tokens``; the last
+    slot stays empty as the sentinel, so at most ``token_capacity - 1`` tokens
+    fit), and the dict gains the attention tile maps ``tile_tokens`` and
+    ``extra_atoms`` (``_token_tiles``): tiles of width ``k_sel + 1``, or of
+    ``express.attention_tile`` with up to ``tile_capacity`` extra tiles.
+    ``overflow`` then also covers the token capacity and the tiles. On the
+    padded layout the ``sorted_window`` solver packs from the sorted candidate
+    prefix (``_pack_sorted_candidates``) instead of ``_pack_selected_to_flat``.
+
+    With ``express.seed_cutoffs``, ``cutoff_seed`` (``[N]``, the cutoffs of an
+    earlier call) and ``seed_displacement`` (scalar ``delta``: no pair distance
+    changed by more than ``2 delta`` since) start the solve near the old root;
+    either ``None`` means no seed. See ``get_adaptive_cutoffs_solver``.
     """
+    express = Express.from_any(express)
     N = atomic_numbers.shape[0]
 
-    _atomic_cutoffs, pair_cutoffs, selected = _select_edges(
+    seed = None
+    if cutoff_seed is not None and seed_displacement is not None:
+        seed = (cutoff_seed, seed_displacement)
+    atomic_cutoffs, pair_cutoffs, selected, sorted_pairs, solver_overflow = _select_edges(
         R_ij,
         centers,
         others,
@@ -123,10 +200,39 @@ def truncate_edges(
         cutoff_width_adaptive,
         method=method,
         no_shadow=no_shadow,
+        express=express,
+        seed=seed,
     )
-    slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
-        selected, centers, N, k_sel
-    )
+    tiles = {}
+    if express.tokens == "flat":
+        if token_capacity is None:
+            raise ValueError("tokens='flat' needs a static token_capacity")
+        slot, sel_to_pair, pair_mask_sel, counts, offsets, packed, overflow = (
+            _pack_selected_to_tokens(selected, centers, N, k_sel, token_capacity)
+        )
+        if express.attention_tile is None:
+            width, tile_capacity = k_sel + 1, 0
+        else:
+            width = express.attention_tile
+        tile_tokens, extra_atoms, tile_overflow = _token_tiles(
+            offsets, packed, token_capacity, width, tile_capacity
+        )
+        overflow = overflow | tile_overflow
+        tiles = {"tile_tokens": tile_tokens, "extra_atoms": extra_atoms}
+    elif sorted_pairs is None:
+        slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
+            selected, centers, N, k_sel
+        )
+    else:
+        slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_sorted_candidates(
+            selected,
+            sorted_pairs,
+            atomic_cutoffs,
+            atom_mask,
+            k_sel,
+            k_sel + express.candidate_extra,
+        )
+    overflow = overflow | solver_overflow
 
     # Reverse map in P_sel space. Under overflow a pair can fit while its
     # reverse does not; then slot[reverse] = P_sel - 1 (the masked sentinel).
@@ -139,8 +245,9 @@ def truncate_edges(
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,
         "pair_cutoffs": pair_cutoffs[sel_to_pair],
+        **tiles,
     }
-    return truncated, overflow
+    return truncated, Truncation(atomic_cutoffs, pair_cutoffs, selected, counts, overflow)
 
 
 def pack_edges(
@@ -156,10 +263,11 @@ def pack_edges(
 ):
     """Fixed-width pack on a flat NL with precomputed displacements — no
     selection: every unmasked pair goes into the rectangular ``[N * k]``
-    layout. Returns the truncated dict keyed like ``truncate_edges``'s.
+    layout. Returns the truncated dict keyed like ``truncate_edges``'s, and a
+    ``Truncation`` without atomic cutoffs whose ``selected`` is ``pair_mask``.
     ``pair_cutoffs`` (per flat pair, optional) are packed with the pairs and set the
     model's per-pair cutoff bump; without them the model applies its scalar
-    cutoff.
+    cutoff. The ``Truncation`` carries them as given (``None`` without them).
 
     ``overflow`` is True iff a center holds more than ``k`` unmasked pairs —
     that pair is silently dropped, so trim upstream to ``<= k`` per center.
@@ -172,7 +280,7 @@ def pack_edges(
     has seen, and ``overflow`` does not flag it.
     """
     N = atomic_numbers.shape[0]
-    slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
+    slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
         pair_mask, centers, N, k
     )
     truncated = {
@@ -185,7 +293,7 @@ def pack_edges(
         "atom_mask": atom_mask,
         "pair_cutoffs": None if pair_cutoffs is None else pair_cutoffs[sel_to_pair],
     }
-    return truncated, overflow
+    return truncated, Truncation(None, pair_cutoffs, pair_mask, counts, overflow)
 
 
 # -- select_edges: the adaptive selection host-side, via a CPU-pinned jit kernel --
@@ -204,18 +312,25 @@ def select_edges(
     cutoff,
     cutoff_width_adaptive,
     method="grid",
+    express=None,
 ):
     """Run the adaptive selection on a structure dict on CPU and return what it
     produced, as host arrays. The calculator sizes ``k_sel`` from it once per
     NL rebuild; ``selected`` is the model's actual adjacency for anything
-    downstream (e.g. a Hessian sparsity pattern)."""
+    downstream (e.g. a Hessian sparsity pattern). ``express`` picks the solver
+    variant, as in the forward, so that sizing and forward agree."""
     # Only what the kernel reads: extra dict keys would change the jit cache key.
     keys = ("positions", "cell", "centers", "others", "cell_shifts", "pair_mask")
     # Resolved per call, not at import: importing petjax must not init a JAX backend.
     cpu = jax.devices("cpu")[0]
     cpu_structure = jax.device_put({k: structure[k] for k in keys}, cpu)
     out = _select_edges_kernel(
-        cpu_structure, num_neighbors_adaptive, cutoff, cutoff_width_adaptive, method=method
+        cpu_structure,
+        num_neighbors_adaptive,
+        cutoff,
+        cutoff_width_adaptive,
+        method=method,
+        express=Express.from_any(express),
     )
     return Selection(*(np.asarray(x) for x in out))
 
@@ -232,6 +347,7 @@ def select_edges(
         "cutoff",
         "cutoff_width_adaptive",
         "method",
+        "express",
     ),
 )
 def _select_edges_kernel(
@@ -240,6 +356,7 @@ def _select_edges_kernel(
     cutoff,
     cutoff_width_adaptive,
     method="grid",
+    express=None,
 ):
     centers = structure["centers"]
     N = structure["positions"].shape[0]
@@ -250,7 +367,7 @@ def _select_edges_kernel(
         structure["cell_shifts"],
         structure["cell"],
     )
-    atomic_cutoffs, pair_cutoffs, selected = _select_edges(
+    atomic_cutoffs, pair_cutoffs, selected, *_ = _select_edges(
         R_ij,
         centers,
         structure["others"],
@@ -260,6 +377,7 @@ def _select_edges_kernel(
         cutoff,
         cutoff_width_adaptive,
         method=method,
+        express=express,
     )
     counts = jax.ops.segment_sum(
         selected.astype(int), centers, num_segments=N, indices_are_sorted=True
@@ -305,7 +423,16 @@ def get_adaptive_cutoffs(
 
 
 def get_adaptive_cutoffs_solver(
-    centers, r_ij, pair_mask, num_neighbors, num_atoms, cutoff, cutoff_width
+    centers,
+    r_ij,
+    pair_mask,
+    num_neighbors,
+    num_atoms,
+    cutoff,
+    cutoff_width,
+    segment_sum=None,
+    iterations=10,
+    seed=None,
 ):
     """Per-atom adaptive cutoffs via a Newton-bisection root find on the
     smoothed neighbor count (metatrain's "solver" method, the default for
@@ -318,7 +445,25 @@ def get_adaptive_cutoffs_solver(
     implicit-function-theorem step re-attaches gradients through the residual,
     so the backward never differentiates through the solver loop. As in the
     grid method, ``cutoff_width`` is the checkpoint's ``cutoff_width_adaptive``.
+
+    ``segment_sum`` maps a per-pair array to per-center sums (``x -> [N]``);
+    ``None`` is ``jax.ops.segment_sum`` over ``centers`` (``_per_center_sum``
+    builds the variants). ``iterations`` is the number of Newton-bisection
+    steps.
+
+    ``seed = (r_old, delta)`` starts from earlier cutoffs ``r_old``, with
+    ``delta`` such that no pair distance changed by more than ``2 delta``
+    since. The bump is non-increasing in the distance and the baseline
+    increasing in ``r``, so the root then moved by less than ``2 delta``: the
+    bracket is ``[r_old - 2 delta, r_old + 2 delta]`` within ``[0, cutoff]``
+    and the iteration starts at ``r_old``. The root is unique, so this changes
+    the path, not the result. A seed with ``2 delta`` beyond the bump width
+    (or ``inf``, for none) is ignored, since ``iterations`` sized for a seeded
+    solve need not converge from that far; an unseeded solve takes at least
+    the stock 10 steps.
     """
+    if segment_sum is None:
+        segment_sum = _per_center_sum("segment_sum", centers, num_atoms)
     inv_cutoff = 1.0 / cutoff
     r_ij_d = jax.lax.stop_gradient(r_ij)
 
@@ -338,6 +483,17 @@ def get_adaptive_cutoffs_solver(
     r_hi = jax.lax.pcast(
         jnp.full(num_atoms, cutoff, dtype=r_ij.dtype), varying, to="varying"
     )
+    r_start = 0.5 * r_hi
+    if seed is not None:
+        r_old, delta = (jax.lax.stop_gradient(jnp.asarray(x, r_ij.dtype)) for x in seed)
+        seeded = 2 * delta <= cutoff_width
+        # A cutoff clamped at cutoff/16 is not a root; the root is below it.
+        r_lo = jnp.where(
+            seeded & (r_old > cutoff / 16), jnp.maximum(r_old - 2 * delta, 0), r_lo
+        )
+        r_hi = jnp.where(seeded, jnp.minimum(r_old + 2 * delta, cutoff), r_hi)
+        r_start = jnp.where(seeded, r_old, r_start)
+        iterations = jnp.where(seeded, iterations, max(iterations, 10))
 
     # 10 iterations converge to fp32 precision (upstream's choice). Newton
     # steps that would leave the bracket (flat shoulders between bumps) fall
@@ -355,6 +511,7 @@ def get_adaptive_cutoffs_solver(
             cutoff_width,
             inv_cutoff,
             num_neighbors,
+            segment_sum,
         )
         f = n - num_neighbors
         below = f <= 0
@@ -364,9 +521,17 @@ def get_adaptive_cutoffs_solver(
         inside = (r_newton >= r_lo) & (r_newton <= r_hi)
         return r_lo, r_hi, jnp.where(inside, r_newton, 0.5 * (r_lo + r_hi))
 
-    _, _, r = jax.lax.fori_loop(0, 10, newton_bisection_step, (r_lo, r_hi, 0.5 * r_hi))
+    _, _, r = jax.lax.fori_loop(0, iterations, newton_bisection_step, (r_lo, r_hi, r_start))
     _, dn_root = _n_total_and_dn_dr(
-        r, r_ij_d, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+        r,
+        r_ij_d,
+        centers,
+        pair_mask,
+        num_atoms,
+        cutoff_width,
+        inv_cutoff,
+        num_neighbors,
+        segment_sum,
     )
 
     # IFT step: r and dn_root are constants; gradients attach only through the
@@ -375,7 +540,15 @@ def get_adaptive_cutoffs_solver(
     # physical lower bound on the adapted cutoff.
     n_residual = (
         _n_total(
-            r, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+            r,
+            r_ij,
+            centers,
+            pair_mask,
+            num_atoms,
+            cutoff_width,
+            inv_cutoff,
+            num_neighbors,
+            segment_sum,
         )
         - num_neighbors
     )
@@ -383,30 +556,60 @@ def get_adaptive_cutoffs_solver(
 
 
 def _n_total(
-    r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+    r_per_atom,
+    r_ij,
+    centers,
+    pair_mask,
+    num_atoms,
+    cutoff_width,
+    inv_cutoff,
+    num_neighbors,
+    segment_sum=None,
 ):
     """Smoothed neighbor count plus cubic baseline, evaluated at per-atom
     cutoff ``r_per_atom``. Padded pairs are masked out (upstream has no
     padding; the mask is the only deviation)."""
+    if segment_sum is None:
+        segment_sum = _per_center_sum("segment_sum", centers, num_atoms)
     per_edge = cutoff_bump(r_ij, r_per_atom[centers], cutoff_width) * pair_mask
-    n = jax.ops.segment_sum(per_edge, centers, num_atoms)
+    n = segment_sum(per_edge)
     x = r_per_atom * inv_cutoff
     return n + num_neighbors * x**3
 
 
 def _n_total_and_dn_dr(
-    r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
+    r_per_atom,
+    r_ij,
+    centers,
+    pair_mask,
+    num_atoms,
+    cutoff_width,
+    inv_cutoff,
+    num_neighbors,
+    segment_sum,
 ):
-    """``n_total`` and its analytic d/dr in one pass, for the Newton steps.
+    """``n_total`` and its analytic d/dr in one pass, for the Newton steps."""
+    f, df_dr = _bump_and_slope(r_ij, r_per_atom[centers], cutoff_width, pair_mask)
+    n = segment_sum(f)
+    dn = segment_sum(df_dr)
+
+    x = r_per_atom * inv_cutoff
+    n = n + num_neighbors * x**3
+    dn = dn + 3.0 * num_neighbors * x**2 * inv_cutoff
+    return n, dn
+
+
+def _bump_and_slope(r_ij, r, cutoff_width, mask):
+    """The bump ``f`` and its d/dr per pair, zero where ``mask`` is False.
 
     Closed form of the bump in its active region ``s = (d - r + w)/w`` in (0, 1):
     ``f = 0.5 * (1 + tanh(cot(pi s)))``, ``df/dr = (pi / 2w) sech^2(cot(pi s)) /
     sin^2(pi s)``; outside, f saturates to 1 (below) / 0 (above) with df/dr = 0.
     The clamp of ``s`` matches the eps in ``cutoff_bump`` so f agrees
     numerically with the forward pass."""
-    scaled = (r_ij - (r_per_atom[centers] - cutoff_width)) / cutoff_width
-    active = (scaled > 0.0) & (scaled < 1.0) & pair_mask
-    smaller = (scaled <= 0.0) & pair_mask
+    scaled = (r_ij - (r - cutoff_width)) / cutoff_width
+    active = (scaled > 0.0) & (scaled < 1.0) & mask
+    smaller = (scaled <= 0.0) & mask
 
     safe = jnp.clip(scaled, 1e-6, 1 - 1e-6)
     s = jnp.pi * safe
@@ -419,17 +622,223 @@ def _n_total_and_dn_dr(
         (0.5 * jnp.pi / cutoff_width) * (1.0 - tanh_cot**2) / (sin_s * sin_s),
         0.0,
     )
+    return f, df_dr
 
-    n = jax.ops.segment_sum(f, centers, num_atoms)
-    dn = jax.ops.segment_sum(df_dr, centers, num_atoms)
 
-    x = r_per_atom * inv_cutoff
-    n = n + num_neighbors * x**3
-    dn = dn + 3.0 * num_neighbors * x**2 * inv_cutoff
-    return n, dn
+# -- per-center sums over the center-sorted flat list --
+
+
+def _per_center_sum(solver, centers, num_atoms):
+    """``x -> [num_atoms]`` per-center sums for the ``Express.solver`` variant.
+    ``centers`` must be non-decreasing for every variant but the stock one."""
+    if solver == "segment_sum":
+        return partial(jax.ops.segment_sum, segment_ids=centers, num_segments=num_atoms)
+    if solver == "sorted_segment_sum":
+        return partial(
+            jax.ops.segment_sum,
+            segment_ids=centers,
+            num_segments=num_atoms,
+            indices_are_sorted=True,
+        )
+    if solver == "blocked_prefix_sum":
+        queries = jnp.arange(num_atoms + 1)
+        bounds = jnp.searchsorted(
+            jnp.asarray(centers), queries, side="left", method="scan_unrolled"
+        )
+        return partial(_blocked_prefix_sum, bounds=bounds)
+    raise ValueError(f"no per-center sum for solver {solver!r}")
+
+
+def _blocked_prefix_sum(x, bounds, block=1024):
+    """Sums of ``x`` over the contiguous segments ``[bounds[c], bounds[c + 1])``
+    from a two-level prefix sum: an inclusive cumsum inside blocks of ``block``
+    entries plus an exclusive cumsum of the block totals.
+
+    A segment spanning at most two blocks (any segment of at most ``block``
+    entries) never differences the long prefix: the outer term is the same
+    float twice, exactly zero. Its rounding is then bounded by the running sum
+    over one block, not over the list. A plain prefix-sum difference is not:
+    at the end of a long fp32 list both prefixes are large, and their
+    difference loses the low bits of the segment's sum (cutoffs off by ~1e-4 A).
+    The bound is still looser than the scatter's when a block holds many short
+    segments (a molecule's list fits in one block), by about the number of
+    segments per block."""
+    P = x.shape[0]
+    pad = (-P) % block
+    if pad:
+        x = jnp.concatenate([x, jnp.zeros(pad, x.dtype)])
+    num_blocks = x.shape[0] // block
+    inner = jnp.cumsum(x.reshape(num_blocks, block), axis=1)
+    totals = inner[:, -1]
+    inner = inner.reshape(-1)
+    outer = jnp.concatenate([jnp.zeros(1, x.dtype), jnp.cumsum(totals)])
+
+    starts, ends = bounds[:-1], bounds[1:]
+    nonempty = ends > starts
+    last = jnp.where(nonempty, ends - 1, 0)
+    first_block, last_block = starts // block, last // block
+    at_boundary = starts % block == 0
+    before = jnp.where(at_boundary, 0.0, inner[jnp.where(at_boundary, 0, starts - 1)])
+    through = inner[last]
+    between = (
+        outer[jnp.minimum(last_block, num_blocks)]
+        - outer[jnp.minimum(first_block + 1, num_blocks)]
+    )
+    within = through - before
+    across = (totals[jnp.minimum(first_block, num_blocks - 1)] - before) + through + between
+    return jnp.where(nonempty, jnp.where(first_block == last_block, within, across), 0.0)
+
+
+# -- sorted-window solver: the same root from each atom's sorted distances --
+
+# Distance of padded pairs and of slots past a row: sorts last, bump exactly 0.
+_FAR = 1e30
+
+
+class SortedPairs(NamedTuple):
+    """The flat list reordered by (center, distance), for the window solver and
+    the candidate pack."""
+
+    r: jax.Array  # [P] detached distances in that order; padded pairs at _FAR
+    order: jax.Array  # [P] raw pair index of each entry
+    starts: jax.Array  # [N] first entry of each center
+    counts: jax.Array  # [N] entries per center
+
+
+def _sort_pairs(r_ij, centers, pair_mask, num_atoms):
+    """``SortedPairs`` of a center-sorted flat list: two stable argsorts (by
+    distance, then by center), which XLA:GPU runs as radix sorts; one two-key
+    ``lax.sort`` costs about twice as much on long lists."""
+    centers = jnp.asarray(centers)
+    r = jnp.where(pair_mask, jax.lax.stop_gradient(r_ij), _FAR)
+    by_distance = jnp.argsort(r, stable=True)
+    order = by_distance[jnp.argsort(centers[by_distance], stable=True)]
+    bounds = jnp.searchsorted(
+        centers, jnp.arange(num_atoms + 1), side="left", method="scan_unrolled"
+    )
+    return SortedPairs(r[order], order, bounds[:-1], bounds[1:] - bounds[:-1])
+
+
+def get_adaptive_cutoffs_window(
+    centers,
+    r_ij,
+    pair_mask,
+    num_neighbors,
+    num_atoms,
+    cutoff,
+    cutoff_width,
+    iterations=4,
+    window_capacity=64,
+):
+    """``get_adaptive_cutoffs_solver``'s root, from each atom's sorted
+    distances instead of sums over the whole list. Returns ``(cutoffs,
+    sorted_pairs, overflow)``; ``overflow`` is True iff some atom had more than
+    ``window_capacity`` pairs in its window, and the cutoffs are then not exact.
+
+    With ``d_(1) <= d_(2) <= ...`` an atom's distances (``d_(0) = 0``) and
+    ``r_p = cutoff (1 - p/k)^(1/3)`` (0 for ``p >= k``) the radius where the
+    baseline leaves room for ``p`` neighbours, the root lies in ``[a, b]`` with
+
+        a = max over p with d_(p) < r_p of min(d_(p+1), r_p),
+        b = min over p with r_p < d_(p+1) + w of max(d_(p) + w, r_p), capped at cutoff,
+
+    since bump is 1 below ``r - w`` and 0 above ``r``, so the count is bounded
+    by ``#{d <= r - w}`` and ``#{d < r}``. Only the ``k + 2`` nearest enter.
+    On ``[a, b]`` every pair with ``d <= a - w`` counts exactly 1 and every
+    pair with ``d >= b`` exactly 0, so ``n_total`` is, term by term, the stock
+    sum over the window ``(a - w, b)`` plus the count below it. The
+    Newton-bisection runs on that window from the bracket midpoint, never
+    leaving ``[a, b]``, and the IFT step uses the live window distances with
+    the stock clamps; bump' vanishes outside the window, so the gradient is
+    the stock one too.
+    """
+    k = num_neighbors
+    inv_cutoff = 1.0 / cutoff
+    w = cutoff_width
+    sorted_pairs = _sort_pairs(r_ij, centers, pair_mask, num_atoms)
+    starts, counts = sorted_pairs.starts, sorted_pairs.counts
+
+    nearest, _, _ = _row_gather(
+        sorted_pairs.r, starts, counts, jnp.zeros_like(starts), int(np.ceil(k)) + 2
+    )
+    a, b, lo = _window_bracket(nearest, k, cutoff, w)
+
+    # The (W+1)-th entry only checks that the window held every pair below b.
+    _, valid, entry = _row_gather(
+        sorted_pairs.r, starts, counts, lo.astype(starts.dtype), window_capacity + 1
+    )
+    raw = sorted_pairs.order[jnp.where(valid, entry, 0)]
+    # Padded pairs carry the dummy atom's r_ij ~ 0 in the raw list.
+    valid = valid & jnp.asarray(pair_mask)[raw]
+    past_end = r_ij.shape[0] + jnp.arange(raw.size, dtype=raw.dtype).reshape(raw.shape)
+    d_live = r_ij.at[jnp.where(valid, raw, past_end)].get(
+        mode="fill", fill_value=_FAR, unique_indices=True
+    )
+    d = jax.lax.stop_gradient(d_live)
+    overflow = jnp.any(valid[:, -1] & (d[:, -1] < b))
+    d, d_live, valid = d[:, :-1], d_live[:, :-1], valid[:, :-1]
+    lo = lo.astype(d.dtype)
+
+    def n_and_dn(r):
+        f, df_dr = _bump_and_slope(d, r[:, None], w, valid)
+        x = r * inv_cutoff
+        n = lo + jnp.sum(f, axis=1) + k * x**3
+        return n, jnp.sum(df_dr, axis=1) + 3.0 * k * x**2 * inv_cutoff
+
+    def newton_bisection_step(_, carry):
+        r_lo, r_hi, r = carry
+        n, dn = n_and_dn(r)
+        f = n - k
+        below = f <= 0
+        r_lo = jnp.where(below, r, r_lo)
+        r_hi = jnp.where(below, r_hi, r)
+        r_newton = r - f / jnp.clip(dn, 1e-6, None)
+        inside = (r_newton >= r_lo) & (r_newton <= r_hi)
+        return r_lo, r_hi, jnp.where(inside, r_newton, 0.5 * (r_lo + r_hi))
+
+    _, _, r = jax.lax.fori_loop(0, iterations, newton_bisection_step, (a, b, 0.5 * (a + b)))
+    _, dn_root = n_and_dn(r)
+
+    bump = cutoff_bump(d_live, r[:, None], w)
+    n_residual = lo + jnp.sum(bump, axis=1) + k * (r * inv_cutoff) ** 3 - k
+    cutoffs = jnp.clip(r - n_residual / jnp.clip(dn_root, 1e-6, None), cutoff / 16, cutoff)
+    return cutoffs, sorted_pairs, overflow
+
+
+def _window_bracket(nearest, k, cutoff, w):
+    """``[a, b]`` and ``lo = #{d <= a - w}`` from the ``k + 2`` nearest
+    distances per atom (``_FAR`` past a row); see
+    ``get_adaptive_cutoffs_window``."""
+    p = jnp.arange(nearest.shape[1], dtype=nearest.dtype)
+    r_p = cutoff * jnp.cbrt(jnp.clip(1.0 - p / k, 0.0, 1.0))
+    d_prev = jnp.concatenate([jnp.zeros_like(nearest[:, :1]), nearest[:, :-1]], axis=1)
+    a = jnp.max(jnp.where(d_prev < r_p, jnp.minimum(nearest, r_p), -jnp.inf), axis=1)
+    b = jnp.min(jnp.where(r_p < nearest + w, jnp.maximum(d_prev + w, r_p), jnp.inf), axis=1)
+    b = jnp.minimum(b, cutoff)
+    lo = jnp.sum(nearest <= (a - w)[:, None], axis=1)
+    return a, b, lo
+
+
+def _row_gather(sorted_r, starts, counts, first, width):
+    """``[N, width]`` entries ``first .. first + width`` of each center's run in
+    the sorted list, ``_FAR`` past its end. Returns ``(values, valid,
+    entry)`` with ``entry`` the position in the sorted list."""
+    column = first[:, None] + jnp.arange(width, dtype=starts.dtype)[None, :]
+    valid = column < counts[:, None]
+    entry = starts[:, None] + column
+    values = jnp.where(valid, sorted_r[jnp.where(valid, entry, 0)], _FAR)
+    return values, valid, entry
 
 
 # -- selection mask: adaptive cutoffs, r_ij <= pair_cutoff --
+
+
+class _Selected(NamedTuple):
+    atomic_cutoffs: jax.Array
+    pair_cutoffs: jax.Array
+    selected: jax.Array
+    sorted_pairs: SortedPairs | None = None  # the window solver's sort, for its pack
+    overflow: jax.Array | bool = False  # the window solver's window overflowed
 
 
 def _select_edges(
@@ -443,36 +852,69 @@ def _select_edges(
     cutoff_width_adaptive,
     method="grid",
     no_shadow=False,
+    express=None,
+    seed=None,
 ):
     """Shared selection core: consumed by ``_select_edges_kernel`` (host-side)
-    and ``truncate_edges`` (forward). Returns ``(atomic_cutoffs, pair_cutoffs,
-    selected)``.
+    and ``truncate_edges`` (forward). Returns a ``_Selected``: ``(atomic_cutoffs,
+    pair_cutoffs, selected)``, plus the sorted list and the window overflow of
+    the ``sorted_window`` solver.
 
     ``method`` picks the per-atom cutoff algorithm (a trace-time branch);
-    grid and solver take the same arguments."""
+    grid and solver take the same arguments. ``express.solver`` picks the
+    variant of the solver method; the grid method has none. ``seed`` (see
+    ``get_adaptive_cutoffs_solver``) is read only with ``express.seed_cutoffs``
+    and by the segment-sum variants: the window solver has its own bracket,
+    and seeding it is a no-op."""
+    express = Express.from_any(express)
     r_ij = safe_norm(R_ij, axis=-1)
+    sorted_pairs, overflow = None, False
     if method == "grid":
         adaptive_fn = get_adaptive_cutoffs
+    elif method == "solver" and express.solver == "sorted_window":
+        iterations = express.solver_iterations
+        atomic_cutoffs, sorted_pairs, overflow = get_adaptive_cutoffs_window(
+            centers,
+            r_ij,
+            pair_mask,
+            num_neighbors_adaptive,
+            num_atoms,
+            cutoff,
+            cutoff_width_adaptive,
+            iterations=4 if iterations is None else iterations,
+            window_capacity=express.window_capacity,
+        )
+        adaptive_fn = None
     elif method == "solver":
-        adaptive_fn = get_adaptive_cutoffs_solver
+        iterations = express.solver_iterations
+        iterations = 10 if iterations is None else iterations
+        if express.seed_cutoffs and seed is None:
+            iterations = max(iterations, 10)
+        adaptive_fn = partial(
+            get_adaptive_cutoffs_solver,
+            segment_sum=_per_center_sum(express.solver, centers, num_atoms),
+            iterations=iterations,
+            seed=seed if express.seed_cutoffs else None,
+        )
     else:
         raise ValueError(
             f"adaptive_cutoff_method must be 'grid' or 'solver', got {method!r}"
         )
-    atomic_cutoffs = adaptive_fn(
-        centers,
-        r_ij,
-        pair_mask,
-        num_neighbors_adaptive,
-        num_atoms,
-        cutoff,
-        cutoff_width_adaptive,
-    )
+    if adaptive_fn is not None:
+        atomic_cutoffs = adaptive_fn(
+            centers,
+            r_ij,
+            pair_mask,
+            num_neighbors_adaptive,
+            num_atoms,
+            cutoff,
+            cutoff_width_adaptive,
+        )
     if no_shadow:
         atomic_cutoffs = jax.lax.stop_gradient(atomic_cutoffs)
     pair_cutoffs = (atomic_cutoffs[centers] + atomic_cutoffs[others]) / 2
     selected = (r_ij <= pair_cutoffs) & pair_mask
-    return atomic_cutoffs, pair_cutoffs, selected
+    return _Selected(atomic_cutoffs, pair_cutoffs, selected, sorted_pairs, overflow)
 
 
 # -- pack flat selection into the [N_padded * k_sel] rectangular layout --
@@ -496,6 +938,7 @@ def _pack_selected_to_flat(selected, centers, N_padded, k_sel):
       sel_to_pair:    ``[P_sel]`` — inverse map. Unused P_sel slots point
                       at ``N_pair_padded - 1`` (the padded-pair sentinel).
       pair_mask_sel:  ``[P_sel]`` bool.
+      counts:         ``[N_padded]`` — selected pairs per center, unclipped.
       overflow:       scalar bool — True iff any selected pair didn't fit
                       because its center already had ≥ ``k_sel`` selected.
     """
@@ -525,4 +968,152 @@ def _pack_selected_to_flat(selected, centers, N_padded, k_sel):
     sel_to_pair = jnp.full(P_sel, N_pair_padded - 1, dtype=centers.dtype)
     sel_to_pair = sel_to_pair.at[slot].set(jnp.arange(N_pair_padded, dtype=centers.dtype))
 
-    return slot, sel_to_pair, pair_mask_sel, overflow
+    return slot, sel_to_pair, pair_mask_sel, count_per_center, overflow
+
+
+# -- pack flat selection into one compacted token list, plus the attention tiles --
+
+
+def _pack_selected_to_tokens(selected, centers, N_padded, k_sel, capacity):
+    """Pack a flat selection mask over sorted-by-center pairs into one
+    compacted token list of static length ``capacity``: atom-contiguous, no
+    holes, the token of atom ``i``'s ``c``-th selected pair at slot
+    ``offsets[i] + c``, where ``offsets`` is the exclusive cumsum of the
+    per-atom counts (clipped to ``k_sel``). Slots past the last token are
+    empty and point at the padded-pair sentinel; the last slot is always
+    empty, so it serves as the masked-out target like ``P_sel - 1`` in
+    ``_pack_selected_to_flat`` and at most ``capacity - 1`` tokens fit.
+
+    Returns:
+      slot:           ``[N_pair_padded]`` — token slot of each selected pair
+                      that fits, ``capacity - 1`` otherwise.
+      sel_to_pair:    ``[capacity]`` — inverse map; empty slots point at
+                      ``N_pair_padded - 1``.
+      pair_mask_sel:  ``[capacity]`` bool, the first ``sum(packed)`` slots.
+      counts:         ``[N_padded]`` — selected pairs per center, unclipped.
+      offsets:        ``[N_padded]`` — first slot of each atom's tokens.
+      packed:         ``[N_padded]`` — tokens per atom that made it into the
+                      list (``counts`` clipped to ``k_sel`` and the capacity).
+      overflow:       scalar bool — a center selected more than ``k_sel``
+                      pairs, or the tokens exceed ``capacity - 1``.
+    """
+    N_pair_padded = selected.shape[0]
+    idx = centers.dtype
+
+    sel_int = selected.astype(idx)
+    counts = jax.ops.segment_sum(
+        sel_int, centers, num_segments=N_padded, indices_are_sorted=True
+    )
+    clipped = jnp.minimum(counts, k_sel)
+    zero = jnp.zeros(1, idx)
+    prefix = jnp.concatenate([zero, jnp.cumsum(counts)[:-1]])
+    offsets = jnp.concatenate([zero, jnp.cumsum(clipped)[:-1]])
+    # Column within the center's row (valid where selected), as in the rectangular pack.
+    column = jnp.cumsum(sel_int) - 1 - prefix[centers]
+    slot = offsets[centers] + column
+
+    usable = capacity - 1
+    fits = selected & (column < k_sel) & (slot < usable)
+    overflow = jnp.any(counts > k_sel) | (jnp.sum(clipped) > usable)
+    slot = jnp.where(fits, slot, usable)
+    packed = jnp.clip(jnp.minimum(clipped, usable - offsets), 0, None)
+
+    sel_to_pair = jnp.full(capacity, N_pair_padded - 1, dtype=idx)
+    sel_to_pair = sel_to_pair.at[jnp.where(fits, slot, capacity)].set(
+        jnp.arange(N_pair_padded, dtype=idx), mode="drop"
+    )
+    pair_mask_sel = jnp.arange(capacity) < jnp.sum(packed)
+    return slot, sel_to_pair, pair_mask_sel, counts, offsets, packed, overflow
+
+
+def _token_tiles(offsets, packed, capacity, width, tile_capacity):
+    """The attention tiles over a compacted token list (``_pack_selected_to_tokens``).
+
+    Tile ``i < N`` belongs to atom ``i``: its centre token in slot 0 (implicit,
+    not in the map) and its first ``width - 1`` tokens in slots
+    ``1 .. width - 1``. An atom with more tokens gets one extra tile, a row
+    ``N + x`` with ``x < tile_capacity``, holding its tokens
+    ``width - 1 .. 2 * width - 3`` in slots ``1 .. width - 1`` (slot 0 empty).
+
+    Returns:
+      tile_tokens:  ``[N + tile_capacity, width - 1]`` — token slot behind
+                    tile slot ``1 + j``; ``capacity`` marks an empty slot.
+      extra_atoms:  ``[tile_capacity]`` — atom owning extra tile ``x``; ``N``
+                    for an unused one.
+      overflow:     scalar bool — more atoms need an extra tile than
+                    ``tile_capacity``, or an atom has more than
+                    ``2 * width - 2`` tokens.
+    """
+    N = offsets.shape[0]
+    idx = offsets.dtype
+    w = width - 1
+    cols = jnp.arange(w, dtype=idx)
+
+    needs = packed > w
+    rank = jnp.cumsum(needs.astype(idx)) - 1
+    overflow = (jnp.sum(needs) > tile_capacity) | jnp.any(packed > 2 * w)
+    extra_atoms = jnp.full(tile_capacity, N, dtype=idx)
+    extra_atoms = extra_atoms.at[jnp.where(needs, rank, tile_capacity)].set(
+        jnp.arange(N, dtype=idx), mode="drop"
+    )
+
+    first = jnp.where(cols[None, :] < packed[:, None], offsets[:, None] + cols, capacity)
+    count_x = packed.at[extra_atoms].get(mode="fill", fill_value=0)
+    offset_x = offsets.at[extra_atoms].get(mode="fill", fill_value=0)
+    column_x = w + cols
+    second = jnp.where(
+        column_x[None, :] < count_x[:, None], offset_x[:, None] + column_x, capacity
+    )
+    tile_tokens = jnp.concatenate([first, second], axis=0)
+    return tile_tokens, extra_atoms, overflow
+
+
+# -- pack from the sorted candidate prefix (the sorted_window solver) --
+
+
+def _pack_sorted_candidates(
+    selected, sorted_pairs, atomic_cutoffs, atom_mask, k_sel, k_cand
+):
+    """``_pack_selected_to_flat``'s outputs, packed from the first ``k_cand``
+    entries of each center's distance-sorted run instead of from the whole
+    list. A row then holds its selected pairs by distance, not in list order:
+    the same set, which the model sees permutation-equivariantly.
+
+    The selected pairs of center ``i`` satisfy ``d <= (r_i + r_j) / 2 <=
+    (r_i + r_max) / 2``, so they are a prefix of its sorted run. ``overflow``
+    is True iff a center selects more than ``k_sel`` pairs or its
+    ``(k_cand + 1)``-th entry is inside that bound (it could be selected
+    without being looked at); ``counts`` is then a lower bound."""
+    P = selected.shape[0]
+    starts, order = sorted_pairs.starts, sorted_pairs.order
+    N = starts.shape[0]
+    P_sel = N * k_sel
+
+    d, valid, entry = _row_gather(
+        sorted_pairs.r, starts, sorted_pairs.counts, jnp.zeros_like(starts), k_cand + 1
+    )
+    raw = order[jnp.where(valid, entry, 0)]
+    chosen = selected[raw] & valid
+    r = jax.lax.stop_gradient(atomic_cutoffs)
+    r_max = jnp.max(jnp.where(atom_mask, r, 0.0))
+    unseen = jnp.any(valid[:, -1] & (d[:, -1] <= (r + r_max) / 2))
+    chosen, raw, valid = chosen[:, :-1], raw[:, :-1], valid[:, :-1]
+
+    column = jnp.cumsum(chosen, axis=1) - 1
+    counts = jnp.sum(chosen, axis=1)
+    overflow = jnp.any(counts > k_sel) | unseen
+
+    fits = chosen & (column < k_sel)
+    row = jnp.arange(N, dtype=order.dtype)[:, None]
+    packed = jnp.where(fits, row * k_sel + column, P_sel - 1).astype(order.dtype)
+    # raw pair -> slot, P_sel - 1 unless selected and fitting (as in the stock pack)
+    slot = jnp.full(P, P_sel - 1, dtype=order.dtype)
+    slot = slot.at[jnp.where(valid, raw, P).reshape(-1)].set(
+        packed.reshape(-1), mode="drop"
+    )
+    sel_to_pair = jnp.full(P_sel, P - 1, dtype=order.dtype)
+    sel_to_pair = sel_to_pair.at[packed.reshape(-1)].set(raw.reshape(-1))
+
+    counts_clipped = jnp.minimum(counts, k_sel)
+    pair_mask_sel = (jnp.arange(k_sel)[None, :] < counts_clipped[:, None]).reshape(P_sel)
+    return slot, sel_to_pair, pair_mask_sel, counts, overflow

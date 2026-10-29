@@ -1,4 +1,5 @@
-"""Host-side structure-dict construction for UPETCalculator — pure numpy.
+"""Host-side structure-dict construction for UPETCalculator — pure numpy,
+plus jit-safe twins of its layout steps for lists built on the device.
 
 Build the sorted+padded flat NL with vesin and the vendored metatrain
 corresponding-edges map, emit the result as a plain dict (the "structure";
@@ -7,8 +8,26 @@ machine + model forward live in ``select.py`` + ``predict.py``.
 """
 
 import numpy as np
+import jax
+import jax.numpy as jnp
 
 from marathon.utils import next_size
+
+
+def atom_blocks(num_atoms, atom_block):
+    """``(num_blocks, block)`` for the blocked forward: the fewest equal
+    blocks of at most ``atom_block`` atoms that hold ``num_atoms``, so the
+    padding is below ``num_blocks`` atoms instead of below ``atom_block``
+    (a block of 8192 on 10006 atoms gives two blocks of 5003, not 16384 atoms).
+    ``num_atoms`` must be a multiple of ``num_blocks``, which ``to_structure``
+    arranges."""
+    num_blocks = -(-num_atoms // atom_block)
+    if num_atoms % num_blocks:
+        raise ValueError(
+            f"atom_block={atom_block} on {num_atoms} atoms needs {num_blocks} equal "
+            f"blocks; pad to a multiple of {num_blocks}"
+        )
+    return num_blocks, num_atoms // num_blocks
 
 
 def to_structure(
@@ -18,6 +37,7 @@ def to_structure(
     bucket_strategy="multiples",
     n_atoms_bucket_strategy=None,
     n_pair_bucket_strategy=None,
+    atom_block=None,
     int_dtype=np.int64,
     float_dtype=np.float64,
 ):
@@ -30,7 +50,12 @@ def to_structure(
     to ``None`` — no bucketing — because ``n_atoms`` is constant across an
     MD trajectory, so any padding above ``n_atoms + 1`` is dead per-atom
     work in the model body. Set explicitly only if a single Calculator is
-    reused across structures of different sizes.
+    reused across structures of different sizes. ``atom_block`` (the
+    blocked forward's, ``express.Express``) then rounds ``N_padded`` up to a
+    multiple of the number of blocks it implies, ``ceil(N_padded /
+    atom_block)``, so the blocks are equal and at most that many atoms are
+    added (``atom_blocks``); the atoms added are padding like the rest, and
+    the dummy atom stays at ``N_padded - 1``.
 
     Pairs come back grouped by center (``sorted=True``): ``_pack_selected_to_flat``
     and the segment sums require ``i`` non-decreasing.
@@ -61,6 +86,9 @@ def to_structure(
         S = np.zeros((len(i), 3), dtype=float_dtype)
 
     N_padded = _bucket_or(n_atoms + 1, n_atoms_bucket_strategy)
+    if atom_block is not None:
+        num_blocks = -(-N_padded // atom_block)
+        N_padded = -(-N_padded // num_blocks) * num_blocks
     dummy_atom = N_padded - 1
 
     n_pair_raw = len(i)
@@ -173,6 +201,140 @@ def _integer_info(atoms, key, default):
             f"atoms.info[{key!r}] must be a single integer value; got {value!r}."
         )
     return int(value)
+
+
+# -- device-side layout: jit-safe twins of the host steps above --
+
+
+def center_order(centers, pair_mask):
+    """Permutation that sorts a padded flat NL by center, padded pairs last,
+    stable within a center — the layout ``truncate_edges`` and the segment
+    sums need, for a list built on the device in whatever order its builder
+    emits."""
+    centers = jnp.asarray(centers)
+    last = jnp.iinfo(centers.dtype).max
+    return jnp.argsort(jnp.where(pair_mask, centers, last), stable=True)
+
+
+def corresponding_edges(centers, others, cell_shifts, pair_mask):
+    """``_get_corresponding_edges`` on the device: for each pair ``(i, j, S)``
+    of a padded flat NL in any order, the index of ``(j, i, -S)``. Padded pairs
+    map to themselves, as in ``to_structure``. One stable multi-key sort per
+    direction on int32 keys, so no int64 encoding and no x64. The list must be
+    full: every real pair's reverse is present, as a symmetric NL guarantees."""
+    centers = jnp.asarray(centers)
+    cell_shifts = jnp.asarray(cell_shifts)
+    if jnp.issubdtype(cell_shifts.dtype, jnp.floating):
+        cell_shifts = jnp.rint(cell_shifts)
+    # Padded pairs share one key no real pair can have, so both sorts place
+    # them in input order and each maps to itself.
+    sentinel = jnp.iinfo(jnp.int32).max
+    c = jnp.where(pair_mask, centers, sentinel).astype(jnp.int32)
+    o = jnp.where(pair_mask, others, sentinel).astype(jnp.int32)
+    s = jnp.where(pair_mask[:, None], cell_shifts, 0).astype(jnp.int32)
+    forward = _lexsort((c, o, s[:, 0], s[:, 1], s[:, 2]))
+    backward = _lexsort((o, c, -s[:, 0], -s[:, 1], -s[:, 2]))
+    corresponding = jnp.zeros(centers.shape[0], dtype=centers.dtype)
+    return corresponding.at[forward].set(backward.astype(centers.dtype))
+
+
+def _lexsort(keys):
+    """Stable lexicographic argsort over equal-length integer key arrays."""
+    position = jnp.arange(keys[0].shape[0], dtype=jnp.int32)
+    return jax.lax.sort((*keys, position), num_keys=len(keys), is_stable=True)[-1]
+
+
+# -- device-built raw list: the raw NL inside the forward, rebuilt every step --
+
+
+def lattice_shifts(cell, pbc, radius):
+    """The lattice shifts ``neighbor_list`` adds to each pair's minimum image so
+    that it sees every image within ``radius``, as int32 ``[n_shifts, 3]``.
+
+    Along a periodic axis with perpendicular height ``h``, a displacement whose
+    fractional part is the minimum image (``|f| <= 1/2``) plus ``t`` lattice
+    vectors is at least ``|f + t| h`` long, so only ``|t| <= floor(radius / h +
+    1/2)`` can come within ``radius``; that is the window. Non-periodic axes
+    get ``t = 0``, a cell larger than twice the radius only the zero shift.
+    Depends on the cell: recompute it when the cell changes (``n_shifts`` is a
+    jit shape)."""
+    cell = np.asarray(cell, dtype=np.float64)
+    pbc = np.asarray(pbc, dtype=bool)
+    window = np.zeros(3, dtype=int)
+    if pbc.any():
+        volume = abs(np.linalg.det(cell))
+        if volume == 0:
+            raise ValueError("a periodic structure needs a non-degenerate cell")
+        for a in np.flatnonzero(pbc):
+            height = volume / np.linalg.norm(np.cross(cell[(a + 1) % 3], cell[(a + 2) % 3]))
+            window[a] = int(np.floor(radius / height + 0.5))
+    grid = np.meshgrid(*(np.arange(-n, n + 1) for n in window), indexing="ij")
+    return np.stack(grid, axis=-1).reshape(-1, 3).astype(np.int32)
+
+
+def neighbor_list(positions, cell, atom_mask, pbc, shifts, radius, capacity):
+    """The raw flat NL of ``to_structure`` built on the device, by an O(N²)
+    distance evaluation over the static set of lattice ``shifts`` (from
+    ``lattice_shifts``): every ordered pair ``(i, j, S)`` of real atoms with
+    ``|R_j - R_i + S @ cell| < radius``, ``S`` the minimum image of the pair
+    plus a window shift. Meant for N up to about 10⁴.
+
+    The shifts refer to ``positions`` exactly as given (no wrapping), so the
+    model must use the same array: a separately wrapped copy can differ from
+    it by a lattice vector. ``capacity`` is the static length of the pair axis;
+    the layout is ``to_structure``'s (sorted by center, padding on the dummy
+    atom ``N - 1`` with zero shift, reverse = self, the last slot always
+    empty). Returns the five NL arrays and ``overflow``, True iff a real pair
+    did not fit (then the list is invalid)."""
+    positions = jax.lax.stop_gradient(positions)
+    cell = jax.lax.stop_gradient(cell)
+    N = positions.shape[0]
+    n_shifts = shifts.shape[0]
+    if N * N * n_shifts >= 2**31:
+        raise ValueError(f"{N}² atom pairs × {n_shifts} shifts exceed int32 indexing")
+    shifts = shifts.astype(positions.dtype)
+    # pbc gates the minimum image, so a non-periodic (possibly zero) cell
+    # never reaches the result through its inverse.
+    frac = positions @ jnp.linalg.inv(cell)
+
+    def image(i, j):
+        return jnp.where(pbc, -jnp.round(frac[j] - frac[i]), 0.0)
+
+    atoms = jnp.arange(N)
+    base = (
+        positions[None, :]
+        - positions[:, None]
+        + image(atoms[:, None], atoms[None, :]) @ cell
+    )
+    R = base[:, :, None, :] + (shifts @ cell)[None, None]  # [i, j, t, 3]
+    d2 = jnp.sum(R * R, axis=-1)
+    self_image = (atoms[:, None] == atoms[None, :])[:, :, None] & jnp.all(
+        shifts == 0, axis=-1
+    )
+    keep = atom_mask[:, None, None] & atom_mask[None, :, None] & ~self_image
+    keep = (keep & (d2 < radius * radius)).reshape(-1)
+
+    # Row-major candidates (i, j, t) compact into center order, which is
+    # center_order's result already, so no sort.
+    n_candidates = keep.shape[0]
+    (index,) = jnp.nonzero(keep, size=capacity - 1, fill_value=n_candidates)
+    index = jnp.concatenate([index, jnp.full(1, n_candidates, index.dtype)])
+    pair_mask = index < n_candidates
+    index = jnp.where(pair_mask, index, 0)
+    i, j, t = index // (N * n_shifts), (index // n_shifts) % N, index % n_shifts
+
+    dummy = N - 1
+    centers = jnp.where(pair_mask, i, dummy).astype(jnp.int32)
+    others = jnp.where(pair_mask, j, dummy).astype(jnp.int32)
+    cell_shifts = jnp.where(pair_mask[:, None], image(i, j) + shifts[t], 0.0)
+    nl = {
+        "centers": centers,
+        "others": others,
+        "cell_shifts": cell_shifts,
+        "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
+        "pair_mask": pair_mask,
+    }
+    return nl, jnp.sum(keep) > capacity - 1
 
 
 # -- helpers --

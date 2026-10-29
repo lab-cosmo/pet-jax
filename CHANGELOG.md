@@ -6,11 +6,17 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+### Changed
+
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple instead of the bare `overflow` flag: cutoffs, selected mask, counts per center and `overflow`, as `select_edges` reports host-side. Read `.overflow` where you unpacked the flag.
+
 ### Added
 
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
+- `UPETCalculator(express={...})`: opt-in performance switches (`petjax.express.Express`), each exact against the stock path up to summation order. They cover solver variants, a device-built neighbour list, flat tokens with fixed-width attention tiles, and `remat` / `atom_block` for peak memory.
+- `center_order` and `corresponding_edges`: jit-safe versions of `to_structure`'s center sort and reverse map, for neighbour lists built on the device.
 
 ### Fixed
 
