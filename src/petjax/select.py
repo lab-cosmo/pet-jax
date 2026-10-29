@@ -419,7 +419,8 @@ def get_adaptive_cutoffs(
     w = jnp.exp(logw - logw.max(axis=-1, keepdims=True))
     w = w / w.sum(axis=-1, keepdims=True)
 
-    return w @ probes
+    # geometry, at full precision whatever the default matmul precision is
+    return jnp.dot(w, probes, precision=jax.lax.Precision.HIGHEST)
 
 
 def get_adaptive_cutoffs_solver(
