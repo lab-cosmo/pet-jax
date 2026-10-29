@@ -14,6 +14,7 @@ from ase.calculators.calculator import BaseCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from .express import Express
+from .model import prepare_params
 from .predict import get_predict_fn
 from .select import select_edges
 from .structure import (
@@ -154,6 +155,9 @@ class UPETCalculator(BaseCalculator):
         # run mixed-precision (fp32 weights × fp64 activations) with a PET-MAD
         # checkpoint that ships as fp32.
         self._params = cast_floats(params, self._dtype)
+        if self.express.dense == "cute":
+            # the fused layer's transposed and gain-folded weights, once per parameter set
+            self._params = jax.jit(prepare_params)(self._params)
 
         # The device list is rebuilt every step: the cache only notices atom
         # count, species and pbc changes.

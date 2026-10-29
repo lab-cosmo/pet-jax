@@ -18,6 +18,7 @@ SOLVERS = ("segment_sum", "sorted_segment_sum", "blocked_prefix_sum", "sorted_wi
 NEIGHBOR_LISTS = ("host", "device")
 TOKEN_LAYOUTS = ("padded", "flat")
 ATTENTION_KERNELS = ("xla", "cute")
+DENSE_KERNELS = ("xla", "cute")
 SOLVER_KERNELS = ("xla", "cute")
 
 
@@ -82,6 +83,11 @@ class Express:
         and the biases into the compress MLP's first ``Dense`` (exact; one
         GEMM of width ``d_pet`` instead of two GEMMs and a concat, a table
         lookup at layer 0). The parameter tree is unchanged.
+      dense: ``xla`` or ``cute``: every ``Dense`` of the GNN layers with its
+        norm, bias, activation, residual and mask as one CuTe DSL GEMM
+        (``kernels.dense``; fp32, exact to round-off, needs ``pet-jax[cute]``
+        and a GPU). Implies the folded compress; needs ``tokens="flat"`` and
+        ``attention="cute"``.
 
     Peak memory (``model.py``):
       remat: rematerialise each GNN layer's two stages (geometry, compress and
@@ -114,6 +120,7 @@ class Express:
     reverse_unique: bool = False
     attention: str = "xla"
     fold_compress: bool = False
+    dense: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -123,6 +130,9 @@ class Express:
         _check_choice("tokens", self.tokens, TOKEN_LAYOUTS)
         _check_choice("attention", self.attention, ATTENTION_KERNELS)
         _check_choice("solver_kernel", self.solver_kernel, SOLVER_KERNELS)
+        _check_choice("dense", self.dense, DENSE_KERNELS)
+        if self.dense == "cute" and (self.tokens != "flat" or self.attention != "cute"):
+            raise ValueError("dense='cute' needs tokens='flat' and attention='cute'")
         if self.solver_kernel == "cute" and self.solver != "sorted_window":
             raise ValueError("solver_kernel='cute' runs the sorted_window solver only")
         if self.attention == "cute" and self.attention_tile is not None:
@@ -165,6 +175,7 @@ class Express:
             "reverse_unique": self.reverse_unique,
             "attention": self.attention,
             "fold_compress": self.fold_compress,
+            "dense": self.dense,
             "remat": self.remat,
             "atom_block": self.atom_block,
         }

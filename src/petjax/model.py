@@ -57,6 +57,7 @@ class UPET(nn.Module):
     reverse_unique: bool = False
     attention: str = "xla"
     fold_compress: bool = False
+    dense: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -96,6 +97,7 @@ class UPET(nn.Module):
             reverse_unique=self.reverse_unique,
             attention=self.attention,
             fold_compress=self.fold_compress,
+            dense=self.dense,
             remat=self.remat,
             atom_block=self.atom_block,
             name="backbone",
@@ -213,6 +215,18 @@ class Backbone(nn.Module):
     the result is the stock one to round-off. Applies only in ``apply``: the
     stock layers run during ``init`` so the parameters exist.
 
+    ``dense="cute"`` runs every ``Dense`` of the layers with its elementwise
+    neighbours as one ``kernels.dense.fused_dense`` call (the fp32 SIMT GEMM
+    with a fused epilogue), and each two-layer MLP as one ``fused_mlp`` with a
+    single backward: the compress stage in its folded form, the transformer
+    layer (``TransformerLayer._fused``) and the message update
+    (``_messages_fused``). The RMSNorms take their statistics from the GEMM
+    that produced the normed rows (its epilogue emits the rows' sums of squares,
+    the next one turns them into the row factor), so no pass over the tokens is
+    left between the kernels but the gathers and concatenations. Flat tokens and
+    ``attention="cute"`` only; the parameter tree is unchanged (``prepare_params``
+    adds derived leaves), the result the stock one to round-off.
+
     Token layout. ``tokens="padded"`` (stock) takes the pairs in the
     rectangular ``[N * n]`` layout. ``tokens="flat"`` takes one compacted,
     center-sorted token list ``[P]`` of any static length plus the attention
@@ -265,6 +279,7 @@ class Backbone(nn.Module):
     reverse_unique: bool = False
     attention: str = "xla"
     fold_compress: bool = False
+    dense: str = "xla"
     remat: bool = False
     atom_block: int | None = None
 
@@ -372,9 +387,11 @@ class Backbone(nn.Module):
                 table=neighbor_table,
                 message_table=message_table,
             ):
-                return _layer_tokens(module, layer_idx, table, message_table, tiles, *args)
+                return _layer_tokens(
+                    module, layer_idx, table, message_table, atomic_numbers, tiles, *args
+                )
 
-            node, edge_flat = staged(self, tokens_stage, N)(
+            node, edge_flat, edge_stats = staged(self, tokens_stage, N)(
                 R_ij,
                 r_ij,
                 messages,
@@ -386,11 +403,13 @@ class Backbone(nn.Module):
                 conditioning,
             )
 
-            def messages_stage(module, *args, layer_idx=layer_idx, edge_full=edge_flat):
-                return _layer_messages(module, layer_idx, edge_full, *args)
+            def messages_stage(
+                module, *args, layer_idx=layer_idx, edge_full=edge_flat, full=edge_stats
+            ):
+                return _layer_messages(module, layer_idx, edge_full, full, *args)
 
             messages = staged(self, messages_stage, N)(
-                edge_flat, reverse, paired, messages, pair_mask
+                edge_flat, reverse, paired, messages, pair_mask, edge_stats
             )
 
         node = node[:, 0, :] * atom_mask[:, None]
@@ -402,6 +421,7 @@ def _layer_tokens(
     layer_idx,
     neighbor_table,
     message_table,
+    atomic_numbers,
     tiles,
     R_ij,
     r_ij,
@@ -415,18 +435,22 @@ def _layer_tokens(
 ):
     """First stage of GNN layer ``layer_idx`` of ``backbone`` on (a block of)
     the atoms: geometry and compress MLP per pair, then the transformer layers
-    per atom. Returns the node features ``[N, 1, d_node]`` and the masked edge
-    messages ``[P, d_pet]``. ``neighbor_table`` / ``message_table`` are the
+    per atom. Returns the node features ``[N, 1, d_node]``, the masked edge
+    messages ``[P, d_pet]`` and, from the fused layer (``dense="cute"``), the
+    edge rows' ``(sum, sum of squares)`` for the comb LayerNorm, else ``None``.
+    ``neighbor_table`` / ``message_table`` are the
     species tables ``[N, d_pet]`` behind the neighbour features and (at layer
     0) the messages."""
     d_pet = backbone.d_pet
     geom = jnp.concatenate([R_ij, r_ij[..., None]], axis=-1)
-    if backbone.fold_compress and not backbone.is_initializing():
+    folded = backbone.fold_compress or backbone.dense == "cute"
+    if folded and not backbone.is_initializing():
         tokens_flat = _compress_folded(
             backbone,
             layer_idx,
             neighbor_table,
             message_table,
+            atomic_numbers,
             geom,
             messages,
             neighbors,
@@ -448,9 +472,13 @@ def _layer_tokens(
         )
 
     N = node.shape[0]
+    edge_stats = None
+    if isinstance(tokens_flat, tuple):
+        tokens_flat, edge_sumsq = tokens_flat
+        edge_stats = (None, edge_sumsq)
     edge = tokens_flat if tiles is not None else tokens_flat.reshape(N, -1, d_pet)
     for attn_idx in range(backbone.num_attention_layers):
-        node, edge = TransformerLayer(
+        node, edge, edge_stats = TransformerLayer(
             d_pet=d_pet,
             d_node=backbone.d_node,
             d_ff=backbone.d_feedforward,
@@ -458,20 +486,41 @@ def _layer_tokens(
             temperature=backbone.attention_temperature,
             fold_extra_block=backbone.fold_extra_block,
             attention_kernel=backbone.attention,
+            dense_kernel=backbone.dense,
             name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
-        )(node, edge, cutoffs_tokens, mask, tiles)
+        )(
+            node,
+            edge,
+            cutoffs_tokens,
+            mask,
+            tiles,
+            edge_mask=pair_mask,
+            edge_stats=edge_stats,
+        )
 
     if conditioning is not None:
         node = node + conditioning[:, None, :]
-    return node, edge.reshape(-1, d_pet) * pair_mask[..., None]
+    if backbone.dense == "cute" and not backbone.is_initializing():
+        # the fused layer's last epilogue applied the mask
+        return node, edge, edge_stats
+    return node, edge.reshape(-1, d_pet) * pair_mask[..., None], None
 
 
 def _compress_folded(
-    backbone, layer_idx, neighbor_table, message_table, geom, messages, neighbors, pair_mask
+    backbone,
+    layer_idx,
+    neighbor_table,
+    message_table,
+    atomic_numbers,
+    geom,
+    messages,
+    neighbors,
+    pair_mask,
 ):
     """The compress stage of ``_layer_tokens`` with its inputs folded into the
     first ``Dense`` (see ``Backbone``): the layer's parameters are read directly,
-    so this runs in ``apply`` only."""
+    so this runs in ``apply`` only. With ``dense="cute"`` also the rows' sums of
+    squares, ``(edge, sumsq)``."""
     d = backbone.d_pet
     params = backbone.variables["params"]
     edge_embed = params[f"gnn_layers_{layer_idx}_edge_embed"]
@@ -479,26 +528,87 @@ def _compress_folded(
     W1, b1 = compress["Dense_0"]["kernel"], compress["Dense_0"]["bias"]
     W2, b2 = compress["Dense_1"]["kernel"], compress["Dense_1"]["bias"]
     W1_geom = W1[:d]
-    h = geom @ (edge_embed["kernel"] @ W1_geom) + (edge_embed["bias"] @ W1_geom + b1)
+    prepared = "geom_kernel" in compress
+    if prepared:
+        h = geom @ compress["geom_kernel"] + compress["geom_bias"]
+    else:
+        h = geom @ (edge_embed["kernel"] @ W1_geom) + (edge_embed["bias"] @ W1_geom + b1)
     if neighbor_table is None:
         # layer 0: the messages are the edge embedding of the neighbour's species
-        h = h + (message_table @ W1[d:])[neighbors]
+        if prepared:
+            h = h + compress["message_table"][atomic_numbers][neighbors]
+        else:
+            h = h + (message_table @ W1[d:])[neighbors]
+    elif prepared:
+        h = h + compress["neighbor_table"][atomic_numbers][neighbors]
     else:
-        h = h + (neighbor_table @ W1[d : 2 * d])[neighbors] + messages @ W1[2 * d :]
+        h = h + (neighbor_table @ W1[d : 2 * d])[neighbors]
+    if backbone.dense == "cute":
+        from .kernels.dense import fused_mlp
+
+        # the SiLU, the second Dense, the mask and the output rows' sums of squares
+        # (for the next RMSNorm) in one call with one backward; at layer 0 the
+        # pre-activation is complete without a GEMM
+        if neighbor_table is None:
+            x, w_m, w_m_t = None, None, None
+        else:
+            x = messages
+            w_m = compress["kernel_m"] if prepared else W1[2 * d :]
+            w_m_t = compress["kernel_m_t"] if prepared else None
+        return fused_mlp(
+            x,
+            w_m,
+            None,
+            W2,
+            b2,
+            activation="silu",
+            pre_add=h,
+            row_mask=pair_mask.astype(h.dtype),
+            w1_t=w_m_t,
+            w2_t=compress["Dense_1"].get("kernel_t"),
+            row_sumsq=True,
+        )
+    if neighbor_table is not None:
+        h = h + messages @ W1[2 * d :]
     out = jax.nn.silu(h) @ W2 + b2
     return jnp.where(pair_mask[..., None], out, jnp.zeros((), out.dtype))
 
 
 def _layer_messages(
-    backbone, layer_idx, edge_full, edge_flat, reverse, paired, messages, pair_mask
+    backbone,
+    layer_idx,
+    edge_full,
+    full_stats,
+    edge_flat,
+    reverse,
+    paired,
+    messages,
+    pair_mask,
+    edge_stats,
 ):
     """Second stage of GNN layer ``layer_idx``: add the edge messages
     ``edge_flat`` of (a block of) the pairs and, with message passing after
     this layer, their mix with the reverse messages, gathered from all pairs'
-    ``edge_full``."""
+    ``edge_full``. ``edge_stats`` / ``full_stats`` are the rows' ``(sum, sum of
+    squares)`` of ``edge_flat`` / ``edge_full`` from the fused layer, or
+    ``None``."""
     d_pet = backbone.d_pet
+    passing = layer_idx < backbone.num_gnn_layers - 1 or backbone.final_message_passing
+    if passing and backbone.dense == "cute" and not backbone.is_initializing():
+        return _messages_fused(
+            backbone,
+            layer_idx,
+            edge_full,
+            full_stats,
+            edge_flat,
+            reverse,
+            paired,
+            messages,
+            pair_mask,
+            edge_stats,
+        )
     messages = messages + edge_flat
-    if layer_idx < backbone.num_gnn_layers - 1 or backbone.final_message_passing:
+    if passing:
         if backbone.reverse_unique:
             reversed_flat = edge_full.at[reverse].get(unique_indices=True)
             reversed_flat = reversed_flat * paired[..., None]
@@ -509,6 +619,77 @@ def _layer_messages(
         combined = MLP((2 * d_pet, d_pet), name=f"comb_mlps_{layer_idx}")(combined)
         messages = messages + combined * pair_mask[..., None]
     return messages
+
+
+def _messages_fused(
+    backbone,
+    layer_idx,
+    edge_full,
+    full_stats,
+    edge_flat,
+    reverse,
+    paired,
+    messages,
+    pair_mask,
+    edge_stats,
+):
+    """``_layer_messages`` with the comb norm and MLP as one ``fused_mlp`` call:
+    the LayerNorm enters the first Dense as a row scale (the gain folded into
+    the weight), a bias (``beta W1 + b1``) and a rank-1 term (``-mu rstd`` times
+    ``gamma W1``); the second adds the message stream and the new messages and
+    masks the row. The norm's statistics of the concatenated row come from the
+    two halves' sums and sums of squares (the fused layer emitted them; the
+    reverse half's are gathered like the rows), else from a reduce. ``apply``
+    only."""
+    from .kernels.dense import fused_mlp
+
+    p = backbone.variables["params"]
+    norm, mlp = p[f"comb_norms_{layer_idx}"], p[f"comb_mlps_{layer_idx}"]
+    gamma, beta = norm["scale"], norm["bias"]
+    W1, b1 = mlp["Dense_0"]["kernel"], mlp["Dense_0"]["bias"]
+    W2, b2 = mlp["Dense_1"]["kernel"], mlp["Dense_1"]["bias"]
+    first = mlp["Dense_0"]
+    prepared = "kernel_normed" in first
+    w1 = first["kernel_normed"] if prepared else W1 * gamma[:, None]
+    b1_folded = first["bias_folded"] if prepared else beta @ W1 + b1
+    gw = first["gain_weight"] if prepared else gamma @ W1
+    if backbone.reverse_unique:
+
+        def gather(x):
+            x = x.at[reverse].get(unique_indices=True)
+            return x * paired.astype(x.dtype).reshape(paired.shape + (1,) * (x.ndim - 1))
+
+    else:
+
+        def gather(x):
+            return x[reverse]
+
+    combined = jnp.concatenate([edge_flat, gather(edge_full)], axis=-1)
+    # flax's LayerNorm statistics: the fast variance, clipped at zero
+    if edge_stats is not None and edge_stats[0] is not None:
+        width = 2 * backbone.d_pet
+        mu = (edge_stats[0] + gather(full_stats[0])) / width
+        mean_sq = (edge_stats[1] + gather(full_stats[1])) / width
+    else:
+        mu = jnp.mean(combined, axis=-1)
+        mean_sq = jnp.mean(jax.lax.square(combined), axis=-1)
+    var = jnp.maximum(0.0, mean_sq - jax.lax.square(mu))
+    rstd = jax.lax.rsqrt(var + 1e-5)
+    return fused_mlp(
+        combined,
+        w1,
+        b1_folded,
+        W2,
+        b2,
+        activation="silu",
+        row_scale=rstd,
+        rank1=(-mu * rstd, gw),
+        residual=messages,
+        residual2=edge_flat,
+        row_mask=pair_mask.astype(combined.dtype),
+        w1_t=first.get("kernel_normed_t"),
+        w2_t=mlp["Dense_1"].get("kernel_t"),
+    )
 
 
 def staged(module, fn, num_atoms):
@@ -658,6 +839,79 @@ class SystemConditioning(nn.Module):
         )
 
 
+# -- prepared parameters for the fused layer --
+
+# the Dense layers of a transformer layer and the RMSNorm whose gain folds into each
+_FUSED_DENSES = {
+    "center_contract": None,
+    "Attention_0/qkv": "norm_attn",
+    "Attention_0/out": None,
+    "center_expand": None,
+    "center_mlp_in": "norm_center",
+    "center_mlp_out": None,
+    "mlp_in": "norm_mlp",
+    "mlp_out": None,
+}
+
+
+def prepare_params(params):
+    """The parameter tree with the extra leaves the fused layer (``dense="cute"``)
+    reads next to each ``Dense`` kernel: ``kernel_t`` (the transposed weight, for
+    the backward's ``dx`` on the fast operand path), ``kernel_normed`` (the weight
+    with the preceding RMSNorm's gain folded in) and its transpose, the comb
+    LayerNorm's folded bias and gain-weight product, and the species tables of
+    the compress fold multiplied into its first Dense. Computed once per
+    parameter set; the layers fall back to computing them per call when the
+    leaves are absent. The stock leaves are untouched, so ``init``'s tree is a
+    subset."""
+
+    def leaf(tree, path):
+        for key in path.split("/"):
+            tree = tree[key]
+        return tree
+
+    params = jax.tree.map(lambda x: x, params)  # fresh dicts, the same arrays
+    backbone = params["params"]["backbone"] if "params" in params else params["backbone"]
+    for name, layer in list(backbone.items()):
+        if "_trans_layers_" in name:
+            for dense, norm in _FUSED_DENSES.items():
+                if dense.split("/")[0] not in layer:
+                    continue
+                w = leaf(layer, dense + "/kernel")
+                target = leaf(layer, dense)
+                target["kernel_t"] = w.T
+                if norm is not None:
+                    normed = w * layer[norm]["scale"][:, None]
+                    target["kernel_normed"] = normed
+                    target["kernel_normed_t"] = normed.T
+        elif name.endswith("_compress"):
+            layer_idx = int(name.split("_")[2])
+            W1 = layer["Dense_0"]["kernel"]
+            d = W1.shape[1]
+            layer["Dense_1"]["kernel_t"] = layer["Dense_1"]["kernel"].T
+            edge_embed = backbone[f"gnn_layers_{layer_idx}_edge_embed"]
+            layer["geom_kernel"] = edge_embed["kernel"] @ W1[:d]
+            layer["geom_bias"] = edge_embed["bias"] @ W1[:d] + layer["Dense_0"]["bias"]
+            if layer_idx == 0:
+                layer["message_table"] = backbone["edge_embedder"]["embedding"] @ W1[d:]
+            else:
+                table = backbone[f"gnn_layers_{layer_idx}_neighbor_embed"]["embedding"]
+                layer["neighbor_table"] = table @ W1[d : 2 * d]
+                layer["kernel_m"] = W1[2 * d :]
+                layer["kernel_m_t"] = W1[2 * d :].T
+        elif name.startswith("comb_mlps_"):
+            layer_idx = int(name.split("_")[2])
+            norm = backbone[f"comb_norms_{layer_idx}"]
+            W1 = layer["Dense_0"]["kernel"]
+            normed = W1 * norm["scale"][:, None]
+            layer["Dense_0"]["kernel_normed"] = normed
+            layer["Dense_0"]["kernel_normed_t"] = normed.T
+            layer["Dense_0"]["bias_folded"] = norm["bias"] @ W1 + layer["Dense_0"]["bias"]
+            layer["Dense_0"]["gain_weight"] = norm["scale"] @ W1
+            layer["Dense_1"]["kernel_t"] = layer["Dense_1"]["kernel"].T
+    return params
+
+
 # -- transformer block --
 
 
@@ -671,15 +925,25 @@ class TransformerLayer(nn.Module):
     temperature: float = 1.0
     fold_extra_block: bool = False
     attention_kernel: str = "xla"
+    dense_kernel: str = "xla"
 
     @nn.compact
-    def __call__(self, node, edge, cutoffs, mask, tiles=None):
+    def __call__(
+        self, node, edge, cutoffs, mask, tiles=None, edge_mask=None, edge_stats=None
+    ):
         """``edge`` is ``[N, n, d_pet]``, or the flat ``[P, d_pet]`` with
         ``tiles`` (``TokenTiles``); then the centre and edge tokens run as one
-        ``[N + P]`` list through the same row-wise layers."""
+        ``[N + P]`` list through the same row-wise layers. Returns ``(node, edge,
+        edge_stats)``: ``edge_mask`` (the pair mask, flat) and ``edge_stats`` (the
+        edge rows' ``(sum, sum of squares)``, ``[P]`` each, the sum may be
+        ``None``) are read by the fused layer only, which masks its edge output
+        itself and hands on its output rows' statistics (for the next RMSNorm,
+        or the comb LayerNorm); the stock path returns ``None`` for them."""
         d_pet, d_node = self.d_pet, self.d_node
         d_ff = self.d_ff
         expanded = d_node != d_pet
+        if self.dense_kernel == "cute" and not self.is_initializing():
+            return self._fused(node, edge, cutoffs, mask, tiles, edge_mask, edge_stats)
 
         if expanded:
             proj = nn.Dense(d_pet, name="center_contract")(node)
@@ -720,7 +984,118 @@ class TransformerLayer(nn.Module):
         out_edge = edge + out_edge
         out_edge = out_edge + edge_mlp(rms_norm(out_edge, name="norm_mlp"))
 
-        return out_node, out_edge
+        return out_node, out_edge, None
+
+    def _fused(self, node, edge, cutoffs, mask, tiles, edge_mask, edge_stats):
+        """The layer on the flat tokens with every ``Dense`` and its elementwise
+        neighbours as one ``kernels.dense.fused_dense`` call, each MLP's two as
+        one ``fused_mlp`` with one backward: the RMSNorms enter as a row factor
+        computed in the epilogue from the rows' sums of squares that the GEMM
+        producing the normed rows emitted (the gains folded into the next
+        weights; the centre MLP's norm, over ``d_node`` columns, is reduced here),
+        the biases, the SwiGLUs and the residual adds sit in the epilogues, and
+        the attention core is ``kernels.attention``. Reads the layer's parameters
+        directly, so ``apply`` only; same result as ``__call__`` to round-off."""
+        from .kernels.attention import fused_attention
+        from .kernels.dense import fused_dense, fused_mlp
+
+        assert tiles is not None and tiles.extra_atoms.shape[0] == 0
+        p = self.variables["params"]
+        N = node.shape[0]
+        node = node[:, 0]
+        eps = float(jnp.finfo(edge.dtype).eps)
+
+        def rstd(x):
+            return jax.lax.rsqrt(jnp.mean(jax.lax.square(x), axis=-1) + eps)
+
+        def sumsq(x):
+            return jnp.sum(jax.lax.square(x), axis=-1)
+
+        def param(path):
+            leaf = p
+            for key in path.split("/"):
+                leaf = leaf[key]
+            return leaf
+
+        def prepared(name, key, fallback):
+            layer = param(name)
+            return layer[key] if key in layer else fallback()
+
+        def dense(x, name, **kw):
+            w = param(name + "/kernel")
+            w_t = prepared(name, "kernel_t", lambda: None)
+            return fused_dense(x, w, param(name + "/bias"), w_t=w_t, **kw)
+
+        def normed(norm, name):
+            # (x rstd gamma) W = rstd (x (gamma W)), the gain folded into the weight
+            w = prepared(
+                name,
+                "kernel_normed",
+                lambda: param(name + "/kernel") * param(norm + "/scale")[:, None],
+            )
+            return w, prepared(name, "kernel_normed_t", lambda: None)
+
+        def normed_dense(x, x_sumsq, norm, name, **kw):
+            w, w_t = normed(norm, name)
+            return fused_dense(
+                x, w, param(name + "/bias"), row_rstd=x_sumsq, rstd_eps=eps, w_t=w_t, **kw
+            )
+
+        def normed_mlp(x, x_sumsq, norm, name_in, name_out, **kw):
+            w1, w1_t = normed(norm, name_in)
+            return fused_mlp(
+                x,
+                w1,
+                param(name_in + "/bias"),
+                param(name_out + "/kernel"),
+                param(name_out + "/bias"),
+                activation="glu",
+                row_rstd=x_sumsq,
+                rstd_eps=eps,
+                w1_t=w1_t,
+                w2_t=prepared(name_out, "kernel_t", lambda: None),
+                **kw,
+            )
+
+        edge_sumsq = sumsq(edge) if edge_stats is None else edge_stats[1]
+        if self.d_node != self.d_pet:
+            proj, proj_sumsq = dense(node, "center_contract", row_sumsq=True)
+        else:
+            proj, proj_sumsq = node, sumsq(node)
+        tokens = jnp.concatenate([proj, edge], axis=0)
+        tokens_sumsq = jnp.concatenate([proj_sumsq, edge_sumsq], axis=0)
+        qkv = normed_dense(tokens, tokens_sumsq, "norm_attn", "Attention_0/qkv")
+        bias = jnp.log(jnp.clip(cutoffs, 1e-15, None))
+        attn = fused_attention(
+            qkv, tiles.rows, bias, mask, self.num_heads, self.temperature
+        )
+        out_edge, out_edge_sumsq = dense(
+            attn[N:], "Attention_0/out", residual=edge, row_sumsq=True
+        )
+        if self.d_node != self.d_pet:
+            out_node = dense(attn[:N], "Attention_0/out")
+            out_node = dense(out_node, "center_expand", residual=node)
+            out_node = normed_mlp(
+                out_node,
+                sumsq(out_node),
+                "norm_center",
+                "center_mlp_in",
+                "center_mlp_out",
+                residual=out_node,
+            )
+        else:
+            out_node = dense(attn[:N], "Attention_0/out", residual=node)
+        out_edge, out_edge_sum, out_edge_sumsq = normed_mlp(
+            out_edge,
+            out_edge_sumsq,
+            "norm_mlp",
+            "mlp_in",
+            "mlp_out",
+            residual=out_edge,
+            row_mask=edge_mask.astype(edge.dtype),
+            row_stats=True,
+        )
+        return out_node[:, None], out_edge, (out_edge_sum, out_edge_sumsq)
 
 
 class Attention(nn.Module):
