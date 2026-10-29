@@ -122,6 +122,11 @@ def convert_main(argv=None):
             "releases."
         ),
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="convert even if the output already exists (after a converter change)",
+    )
     args = parser.parse_args(argv)
 
     kind, value = _resolve_source(args.source, args.version)
@@ -146,8 +151,8 @@ def convert_main(argv=None):
 
     out_dir = args.out or Path(f"checkpoints/{default_out_name}")
 
-    if (out_dir / "model.msgpack").exists():
-        print(f"[convert] {out_dir}/model.msgpack already present, done")
+    if (out_dir / "model.msgpack").exists() and not args.force:
+        print(f"[convert] {out_dir}/model.msgpack already present, done (--force to redo)")
         return 0
 
     from .convert import convert_checkpoint

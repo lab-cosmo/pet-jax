@@ -46,7 +46,8 @@ class Truncation(NamedTuple):
     """What ``truncate_edges`` / ``pack_edges`` selected and whether it fit:
     ``Selection``'s fields as traced arrays, plus ``overflow``. The raw-pair
     arrays index the input flat NL, not the packed layout. ``pack_edges`` has
-    no cutoffs (``None``) and selects every unmasked pair."""
+    no atomic cutoffs (``None``), passes its optional ``pair_cutoffs`` through,
+    and selects every unmasked pair."""
 
     atomic_cutoffs: jax.Array | None  # [N] adaptive cutoff per atom
     pair_cutoffs: jax.Array | None  # [n_pair_padded] mean of the two endpoint cutoffs
@@ -249,12 +250,24 @@ def truncate_edges(
     return truncated, Truncation(atomic_cutoffs, pair_cutoffs, selected, counts, overflow)
 
 
-def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_mask, k):
+def pack_edges(
+    R_ij,
+    centers,
+    others,
+    reverse,
+    pair_mask,
+    atomic_numbers,
+    atom_mask,
+    k,
+    pair_cutoffs=None,
+):
     """Fixed-width pack on a flat NL with precomputed displacements — no
     selection: every unmasked pair goes into the rectangular ``[N * k]``
-    layout. Returns the truncated dict keyed like ``truncate_edges``'s, with
-    ``pair_cutoffs=None`` (the model applies its plain scalar-cutoff bump), and
-    a ``Truncation`` without cutoffs whose ``selected`` is ``pair_mask``.
+    layout. Returns the truncated dict keyed like ``truncate_edges``'s, and a
+    ``Truncation`` without atomic cutoffs whose ``selected`` is ``pair_mask``.
+    ``pair_cutoffs`` (per flat pair, optional) are packed with the pairs and set the
+    model's per-pair cutoff bump; without them the model applies its scalar
+    cutoff. The ``Truncation`` carries them as given (``None`` without them).
 
     ``overflow`` is True iff a center holds more than ``k`` unmasked pairs —
     that pair is silently dropped, so trim upstream to ``<= k`` per center.
@@ -278,9 +291,9 @@ def pack_edges(R_ij, centers, others, reverse, pair_mask, atomic_numbers, atom_m
         "reverse": slot[reverse[sel_to_pair]],
         "pair_mask": pair_mask_sel,
         "atom_mask": atom_mask,
-        "pair_cutoffs": None,
+        "pair_cutoffs": None if pair_cutoffs is None else pair_cutoffs[sel_to_pair],
     }
-    return truncated, Truncation(None, None, pair_mask, counts, overflow)
+    return truncated, Truncation(None, pair_cutoffs, pair_mask, counts, overflow)
 
 
 # -- select_edges: the adaptive selection host-side, via a CPU-pinned jit kernel --
