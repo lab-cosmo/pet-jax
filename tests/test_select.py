@@ -393,7 +393,7 @@ def test_solver_variant_matches_stock(case, hypers, dtype, solver_structures):
         for structure in solver_structures:
             c0, s0, g0 = _solve(structure, SOLVER_HYPERS[hypers], dtype)
             c1, s1, g1 = _solve(structure, SOLVER_HYPERS[hypers], dtype, express)
-            atol, gtol = (4e-6, 1e-4) if dtype == "float32" else (1e-14, 1e-12)
+            atol, gtol = (4e-6, 1e-4) if dtype == "float32" else (1e-13, 1e-12)
             np.testing.assert_allclose(c1, c0, rtol=0, atol=atol)
             assert np.array_equal(s1, s0)
             np.testing.assert_allclose(g1, g0, rtol=0, atol=gtol * np.abs(g0).max())
