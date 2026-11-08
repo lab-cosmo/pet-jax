@@ -33,6 +33,8 @@ dependencies = [
     "numpy>=1.26",
     "ase>=3.23",
     "vesin>=0.5",
+    # not released yet: from the branch adding it to vesin
+    "vesin-jax @ git+https://github.com/Luthaf/vesin@vesin-jax#subdirectory=python/vesin_jax",
     "marathon-train>=0.2.2",
 ]
 
@@ -56,6 +58,10 @@ build-backend = "hatchling.build"
 # The version comes from the latest `v*` git tag.
 [tool.hatch.version]
 source = "vcs"
+
+# vesin-jax comes from git until it is released
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/petjax"]
