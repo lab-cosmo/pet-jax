@@ -13,7 +13,7 @@ src/petjax/
   calculator.py   # UPETCalculator (ASE)
   convert.py      # metatrain .ckpt → Flax msgpack
   cli.py          # petjax-convert entrypoint
-  structure.py    # host-side neighborlist build
+  structure.py    # neighborlist build (host-side, or in-JIT with vesin-jax)
   select.py       # in-JIT adaptive selection
   predict.py      # in-JIT forward + autodiff
   utils.py        # shared helpers
@@ -27,7 +27,7 @@ src/petjax/
 pip install pet-jax
 ```
 
-This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `marathon-train`) — everything needed to load a checkpoint and run the calculator.
+This pulls in the inference stack (`jax`, `flax`, `numpy`, `ase`, `vesin`, `vesin-jax`, `marathon-train`) — everything needed to load a checkpoint and run the calculator.
 
 Converting upstream `metatrain` `.ckpt` files needs the optional `convert` extra (`torch`, `metatomic-torch`, `metatrain`), which is **not** required for inference:
 
@@ -105,6 +105,8 @@ Step 2 involves the two cutoff widths of the model, which are easy to confuse. T
 The subtlety here is that since the cutoffs depend on the position of atoms *outside* the cutoff, gradients have to flow through the procedure to some extent and it therefore has to be done inside the model's forward pass. So we need to make the procedure compatible with `jax`, so we can `jit` it and transform it with `grad`. The constraints: No data-dependent shapes, and few shape changes to avoid costly recompilations. This is made more complicated by the fact that smoothness dictates that the procedure is not exact: We can only *target* a certain number of neighbors, but we can't guarantee it.
 
 The solution to this is a two-phase design: Outside of `jax`, we compute the initial big neighborlist and determine the final number, `k_sel`, of neighbors. We can round `k_sel` to something larger to avoid recompiles. We also have to pad the initial big neighborlist to a fixed shape, but this is easy to achieve. Inside `jax` (i.e., the `jax.jit` boundary), we then re-run the procedure and pack into `k_sel`, which we already know ahead of time due to step one. If we exceed `k_sel`, we return an `overflow` signal to tell the calculator that `k_sel` needs to be recomputed.
+
+Drivers that run entirely inside `jax.jit` (a device-side MD loop, for example) can build the initial neighborlist there too: `get_neighbor_list_fn` returns a function computing it with `vesin-jax` on CPU or GPU, in the same layout as the host-side one, into a fixed capacity with an `overflow` flag. With a Verlet `skin`, `vesin-jax` caches the candidate pairs between calls; the list it returns stays exact.
 
 For neighbor lists already trimmed to a fixed neighbor count upstream, `pack_edges` is the selection-free sibling of `truncate_edges`: it packs to the same fixed-width layout, skipping the adaptive-cutoff selection (`pair_cutoffs=None`).
 
@@ -212,6 +214,7 @@ Core (`pyproject.toml`):
 - `jax`, `jaxlib`, `flax` — neural net + autodiff
 - `numpy`, `ase` — data structures
 - `vesin` — fast neighbourlist construction
+- `vesin-jax` — the same, inside `jax.jit` (installed from git until it is released)
 - `marathon-train` — checkpoint I/O (msgpack/yaml) and bucket-size helpers
 
 Optional (the `convert` extra — see [Installation](#installation)):
