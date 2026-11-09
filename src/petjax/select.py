@@ -278,7 +278,7 @@ def get_adaptive_cutoffs(
     also sets the probe spacing — not the final-taper ``cutoff_width``. The
     probe grid is built here from the (static) ``cutoff`` / ``cutoff_width``,
     as upstream does; 0.5 is upstream's minimum probe cutoff."""
-    probes = jnp.arange(0.5, cutoff, cutoff_width / 4)
+    probes = jnp.asarray(np.arange(0.5, cutoff, cutoff_width / 4), dtype=r_ij.dtype)
     num_probes = probes.shape[0]
 
     weights = cutoff_bump(r_ij[None, :], probes[:, None], cutoff_width) * pair_mask[None, :]
@@ -286,7 +286,7 @@ def get_adaptive_cutoffs(
     eff = eff.T  # [N, num_probes]
 
     diff = eff - num_neighbors
-    x = jnp.linspace(0, 1, num_probes)
+    x = jnp.linspace(0, 1, num_probes, dtype=r_ij.dtype)
     diff = diff + num_neighbors * x**3
 
     # Centered gradient (matches torch.gradient)
