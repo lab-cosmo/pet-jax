@@ -80,13 +80,23 @@ def test_corresponding_edges_int32_inputs(structure):
 # -- device-built raw list (vesin-jax) --
 
 
+def _x64(enabled):
+    previous = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", enabled)
+    yield
+    jax.config.update("jax_enable_x64", previous)
+
+
 @pytest.fixture
 def enable_x64():
     """vesin-jax only runs with 64-bit mode."""
-    previous = jax.config.jax_enable_x64
-    jax.config.update("jax_enable_x64", True)
-    yield
-    jax.config.update("jax_enable_x64", previous)
+    yield from _x64(True)
+
+
+@pytest.fixture
+def disable_x64():
+    """Other tests (the float64 calculators) leave 64-bit mode enabled."""
+    yield from _x64(False)
 
 
 @pytest.fixture(params=["primitive", "supercell", "slab", "molecule"])
@@ -191,10 +201,9 @@ def test_neighbor_list_overflow(enable_x64):
         _device_list(atoms, host, cutoff, max_neighbors=_max_neighbors(host) - 1)
 
 
-def test_neighbor_list_needs_x64():
+def test_neighbor_list_needs_x64(disable_x64):
     atoms, cutoff = bulk("Cu", cubic=True) * [2, 2, 2], 4.0
     host = to_structure(atoms, cutoff=cutoff, skin=0.0, float_dtype=np.float32)
-    assert not jax.config.jax_enable_x64
     with pytest.raises(RuntimeError, match="jax_enable_x64"):
         _device_list(atoms, host, cutoff)
 
