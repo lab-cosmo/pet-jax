@@ -222,18 +222,23 @@ def _lexsort(keys):
 # -- device-built raw list: vesin-jax inside the jit --
 
 
-def get_neighbor_list_fn(radius, skin=0.0):
-    """Build ``neighbor_list(positions, cell, pbc, capacity, n_atoms=None) ->
-    (nl, overflow)``, the raw flat NL of ``to_structure`` at cutoff ``radius``,
-    computed by ``vesin-jax`` inside whatever jit traces it, on CPU or GPU.
+def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
+    """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> nl``, the
+    raw flat NL of ``to_structure`` at cutoff ``radius``, computed by
+    ``vesin-jax`` inside whatever jit traces it, on CPU or GPU.
 
     ``positions`` is the padded ``[N, 3]`` array of a structure dict, real atoms
     first: by default all but the dummy atom ``N - 1``, else the first static
-    ``n_atoms``. ``capacity`` is the static length of the pair axis. The layout
-    is ``to_structure``'s: sorted by center, padding on the dummy atom with zero
-    shift, reverse = self, the last slot always empty. ``overflow`` is True iff
-    the real pairs did not fit; the list then holds no pair at all, never a
-    truncated one.
+    ``n_atoms``. ``max_neighbors`` is the static number of pairs each atom can
+    hold, so the pair axis has length ``n_atoms * max_neighbors + 1``. ``pbc``
+    is static too (three Python or numpy bools, not a traced array). The
+    layout is ``to_structure``'s: sorted by center, padding on the dummy atom
+    with zero shift, reverse = self, the last slot always empty.
+
+    An atom with more than ``max_neighbors`` neighbors is an error raised by
+    ``vesin-jax`` when the list is computed (a ``jax.errors.JaxRuntimeError``),
+    never a truncated list. ``vesin-jax`` needs ``jax_enable_x64``; the list
+    and the model keep the dtype of ``positions``.
 
     The closure holds the ``vesin-jax`` calculator and, with ``skin > 0``, its
     Verlet cache, so keep one per driver for as long as it runs. The list is
@@ -242,33 +247,34 @@ def get_neighbor_list_fn(radius, skin=0.0):
     through ``edge_displacements``, as with the host list."""
     from vesin_jax import NeighborList
 
-    calculator = NeighborList(cutoff=radius, full_list=True, sorted=True, skin=skin)
+    calculator = NeighborList(
+        cutoff=radius, full_list=True, sorted=True, padded_to=max_neighbors, skin=skin
+    )
 
-    def neighbor_list(positions, cell, pbc, capacity, n_atoms=None):
-        if capacity < 1:
-            raise ValueError(f"capacity must be at least 1, got {capacity}")
+    def neighbor_list(positions, cell, pbc, n_atoms=None):
         dummy = positions.shape[0] - 1
         if n_atoms is None:
             n_atoms = dummy
 
-        # capacity - 1 pairs, so that the last slot stays empty
-        i, j, S, n_pairs = calculator.compute(
-            positions[:n_atoms], cell, pbc, quantities="ijS", max_pairs=capacity - 1
+        periodic = tuple(bool(p) for p in pbc)
+        i, j, S = calculator.compute(
+            positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijS"
         )
-        # vesin-jax pads with index n_atoms, on every pair after an overflow
-        pair_mask = i < n_atoms
-        centers = _append(jnp.where(pair_mask, i, dummy), dummy)
-        others = _append(jnp.where(pair_mask, j, dummy), dummy)
-        cell_shifts = _append(S.astype(positions.dtype), 0)
-        pair_mask = _append(pair_mask, False)
-        nl = {
+        # vesin-jax gives each atom max_neighbors slots, the unused ones with
+        # j = -1: move them after the real pairs, onto the dummy atom
+        pair_mask = j >= 0
+        order = center_order(i, pair_mask)
+        pair_mask = _append(pair_mask[order], False)
+        centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
+        others = jnp.where(pair_mask, _append(j[order], dummy), dummy)
+        cell_shifts = _append(S[order].astype(positions.dtype), 0)
+        return {
             "centers": centers,
             "others": others,
             "cell_shifts": cell_shifts,
             "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
             "pair_mask": pair_mask,
         }
-        return nl, n_pairs > capacity - 1
 
     return neighbor_list
 

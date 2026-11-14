@@ -106,7 +106,7 @@ The subtlety here is that since the cutoffs depend on the position of atoms *out
 
 The solution to this is a two-phase design: Outside of `jax`, we compute the initial big neighborlist and determine the final number, `k_sel`, of neighbors. We can round `k_sel` to something larger to avoid recompiles. We also have to pad the initial big neighborlist to a fixed shape, but this is easy to achieve. Inside `jax` (i.e., the `jax.jit` boundary), we then re-run the procedure and pack into `k_sel`, which we already know ahead of time due to step one. If we exceed `k_sel`, we return an `overflow` signal to tell the calculator that `k_sel` needs to be recomputed.
 
-Drivers that run entirely inside `jax.jit` (a device-side MD loop, for example) can build the initial neighborlist there too: `get_neighbor_list_fn` returns a function computing it with `vesin-jax` on CPU or GPU, in the same layout as the host-side one, into a fixed capacity with an `overflow` flag. With a Verlet `skin`, `vesin-jax` caches the candidate pairs between calls; the list it returns stays exact.
+Drivers that run entirely inside `jax.jit` (a device-side MD loop, for example) can build the initial neighborlist there too: `get_neighbor_list_fn` returns a function computing it with `vesin-jax` on CPU or GPU, in the same layout as the host-side one, with room for a fixed number of pairs per atom (`max_neighbors`): `vesin-jax` raises an error if an atom has more. With a Verlet `skin`, `vesin-jax` caches the candidate pairs between calls; the list it returns stays exact. `vesin-jax` needs 64-bit mode (`jax.config.update("jax_enable_x64", True)`); a float32 model still runs in float32.
 
 For neighbor lists already trimmed to a fixed neighbor count upstream, `pack_edges` is the selection-free sibling of `truncate_edges`: it packs to the same fixed-width layout, skipping the adaptive-cutoff selection (`pair_cutoffs=None`).
 
@@ -214,7 +214,7 @@ Core (`pyproject.toml`):
 - `jax`, `jaxlib`, `flax` — neural net + autodiff
 - `numpy`, `ase` — data structures
 - `vesin` — fast neighbourlist construction
-- `vesin-jax` — the same, inside `jax.jit` (installed from git until it is released)
+- `vesin-jax` — the same, inside `jax.jit` (built from the `vesin` git repository until it is released, which needs `cmake` and a C++ compiler; it supports `jax` 0.10 and 0.11)
 - `marathon-train` — checkpoint I/O (msgpack/yaml) and bucket-size helpers
 
 Optional (the `convert` extra — see [Installation](#installation)):
