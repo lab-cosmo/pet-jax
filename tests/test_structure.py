@@ -80,8 +80,17 @@ def test_corresponding_edges_int32_inputs(structure):
 # -- device-built raw list (vesin-jax) --
 
 
+@pytest.fixture
+def enable_x64():
+    """vesin-jax only runs with 64-bit mode."""
+    previous = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    yield
+    jax.config.update("jax_enable_x64", previous)
+
+
 @pytest.fixture(params=["primitive", "supercell", "slab", "molecule"])
-def system(request):
+def system(request, enable_x64):
     """``(atoms, cutoff)``, covering several images per pair, mixed periodicity
     and no periodicity."""
     if request.param == "primitive":
@@ -98,19 +107,19 @@ def system(request):
         return molecule("CH3CH2OH"), 3.0
 
 
-def _device_list(atoms, host, radius, skin=0.0, capacity=None, n_atoms=None):
-    neighbor_list = get_neighbor_list_fn(radius, skin=skin)
-    if capacity is None:
-        capacity = host["centers"].shape[0]
-    fn = jax.jit(neighbor_list, static_argnames=("capacity", "n_atoms"))
-    nl, overflow = fn(
-        jnp.asarray(host["positions"]),
-        jnp.asarray(host["cell"]),
-        atoms.pbc,
-        capacity=capacity,
-        n_atoms=n_atoms,
-    )
-    return jax.tree.map(np.asarray, nl), bool(overflow)
+def _max_neighbors(host):
+    """The largest number of pairs of an atom of a host structure."""
+    centers = np.asarray(host["centers"])[np.asarray(host["pair_mask"])]
+    return max(int(np.bincount(centers).max()), 1) if len(centers) else 1
+
+
+def _device_list(atoms, host, radius, skin=0.0, max_neighbors=None, n_atoms=None):
+    if max_neighbors is None:
+        max_neighbors = _max_neighbors(host)
+    neighbor_list = get_neighbor_list_fn(radius, max_neighbors, skin=skin)
+    fn = jax.jit(lambda positions, cell: neighbor_list(positions, cell, atoms.pbc, n_atoms))
+    nl = fn(jnp.asarray(host["positions"]), jnp.asarray(host["cell"]))
+    return jax.tree.map(np.asarray, nl)
 
 
 def _pairs(nl):
@@ -148,15 +157,16 @@ def _check_layout(nl, dummy):
 def test_neighbor_list_matches_host(system):
     atoms, cutoff = system
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    nl, overflow = _device_list(atoms, host, cutoff)
+    nl = _device_list(atoms, host, cutoff)
 
-    assert not overflow
-    assert nl["centers"].shape == host["centers"].shape
+    assert nl["centers"].shape == (len(atoms) * _max_neighbors(host) + 1,)
+    assert nl["centers"].dtype == host["centers"].dtype
+    assert nl["cell_shifts"].dtype == host["cell_shifts"].dtype
     assert _pairs(nl) == _pairs(host)
     _check_layout(nl, dummy=host["positions"].shape[0] - 1)
 
 
-def test_neighbor_list_padded_atoms():
+def test_neighbor_list_padded_atoms(enable_x64):
     """With several padding atoms, only the first n_atoms are searched and the
     padding still lands on the last (dummy) atom."""
     atoms = bulk("Cu", cubic=True) * [2, 2, 2]
@@ -167,33 +177,39 @@ def test_neighbor_list_padded_atoms():
     N_padded = host["positions"].shape[0]
     assert N_padded > len(atoms) + 1
 
-    nl, overflow = _device_list(atoms, host, 4.0, n_atoms=len(atoms))
-    assert not overflow
+    nl = _device_list(atoms, host, 4.0, n_atoms=len(atoms))
     assert _pairs(nl) == _pairs(host)
     _check_layout(nl, dummy=N_padded - 1)
 
 
-def test_neighbor_list_overflow():
-    """A capacity too small for the real pairs gives overflow and an empty list,
-    never a truncated one."""
+def test_neighbor_list_overflow(enable_x64):
+    """An atom with more neighbors than max_neighbors is an error, never a
+    truncated list."""
     atoms, cutoff = bulk("Cu", cubic=True) * [2, 2, 2], 4.0
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    capacity = int(host["pair_mask"].sum())  # one short, the last slot is empty
-    nl, overflow = _device_list(atoms, host, cutoff, capacity=capacity)
-
-    assert overflow
-    assert not nl["pair_mask"].any()
-    _check_layout(nl, dummy=host["positions"].shape[0] - 1)
+    with pytest.raises(jax.errors.JaxRuntimeError, match="more neighbors"):
+        _device_list(atoms, host, cutoff, max_neighbors=_max_neighbors(host) - 1)
 
 
-def test_neighbor_list_skin():
+def test_neighbor_list_needs_x64():
+    atoms, cutoff = bulk("Cu", cubic=True) * [2, 2, 2], 4.0
+    host = to_structure(atoms, cutoff=cutoff, skin=0.0, float_dtype=np.float32)
+    assert not jax.config.jax_enable_x64
+    with pytest.raises(RuntimeError, match="jax_enable_x64"):
+        _device_list(atoms, host, cutoff)
+
+
+def test_neighbor_list_skin(enable_x64):
     """With a skin, the list stays exact along a trajectory, across rebuilds
     and cell changes."""
     atoms, cutoff = bulk("Cu", cubic=True) * [2, 2, 2], 4.0
     host = to_structure(atoms, cutoff=cutoff, skin=0.5)
-    capacity = host["centers"].shape[0]
-    exact = jax.jit(get_neighbor_list_fn(cutoff), static_argnames="capacity")
-    cached = jax.jit(get_neighbor_list_fn(cutoff, skin=0.5), static_argnames="capacity")
+    # room for the pairs that enter the cutoff along the trajectory
+    max_neighbors = _max_neighbors(host)
+    exact = get_neighbor_list_fn(cutoff, max_neighbors)
+    cached = get_neighbor_list_fn(cutoff, max_neighbors, skin=0.5)
+    exact = jax.jit(lambda positions, cell, nl=exact: nl(positions, cell, atoms.pbc))
+    cached = jax.jit(lambda positions, cell, nl=cached: nl(positions, cell, atoms.pbc))
 
     rng = np.random.default_rng(0)
     positions = jnp.asarray(host["positions"])
@@ -202,9 +218,8 @@ def test_neighbor_list_skin():
         positions = positions.at[:-1].add(rng.normal(scale=0.05, size=(len(atoms), 3)))
         if step == 5:
             cell = cell * 1.01
-        nl, overflow = cached(positions, cell, atoms.pbc, capacity=capacity)
-        expected, _ = exact(positions, cell, atoms.pbc, capacity=capacity)
-        assert not bool(overflow)
+        nl = cached(positions, cell)
+        expected = exact(positions, cell)
         nl, expected = jax.tree.map(np.asarray, (nl, expected))
         assert _pairs(nl) == _pairs(expected)
 
@@ -214,8 +229,7 @@ def test_neighbor_list_gradients(system):
     function has the host list's energy, forces and cell derivative."""
     atoms, cutoff = system
     host = to_structure(atoms, cutoff=cutoff, skin=0.0)
-    capacity = host["centers"].shape[0]
-    neighbor_list = get_neighbor_list_fn(cutoff)
+    neighbor_list = get_neighbor_list_fn(cutoff, _max_neighbors(host))
 
     def pair_energy(positions, cell, nl):
         R = edge_displacements(
@@ -225,7 +239,7 @@ def test_neighbor_list_gradients(system):
         return jnp.sum(jnp.where(nl["pair_mask"], (cutoff - r) ** 3, 0.0))
 
     def device_energy(positions, cell):
-        nl, _ = neighbor_list(positions, cell, atoms.pbc, capacity)
+        nl = neighbor_list(positions, cell, atoms.pbc)
         return pair_energy(positions, cell, nl)
 
     def host_energy(positions, cell):
