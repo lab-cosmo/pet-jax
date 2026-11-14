@@ -1,4 +1,5 @@
-"""Host-side structure-dict construction for UPETCalculator — pure numpy.
+"""Host-side structure-dict construction for UPETCalculator — pure numpy,
+plus jit-safe twins of its layout steps for lists built on the device.
 
 Build the sorted+padded flat NL with vesin and the vendored metatrain
 corresponding-edges map, emit the result as a plain dict (the "structure";
@@ -7,6 +8,8 @@ machine + model forward live in ``select.py`` + ``predict.py``.
 """
 
 import numpy as np
+import jax
+import jax.numpy as jnp
 
 from marathon.utils import next_size
 
@@ -173,6 +176,112 @@ def _integer_info(atoms, key, default):
             f"atoms.info[{key!r}] must be a single integer value; got {value!r}."
         )
     return int(value)
+
+
+# -- device-side layout: jit-safe twins of the host steps above --
+
+
+def center_order(centers, pair_mask):
+    """Permutation that sorts a padded flat NL by center, padded pairs last,
+    stable within a center — the layout ``truncate_edges`` and the segment
+    sums need, for a list built on the device in whatever order its builder
+    emits."""
+    centers = jnp.asarray(centers)
+    last = jnp.iinfo(centers.dtype).max
+    return jnp.argsort(jnp.where(pair_mask, centers, last), stable=True)
+
+
+def corresponding_edges(centers, others, cell_shifts, pair_mask):
+    """``_get_corresponding_edges`` on the device: for each pair ``(i, j, S)``
+    of a padded flat NL in any order, the index of ``(j, i, -S)``. Padded pairs
+    map to themselves, as in ``to_structure``. One stable multi-key sort per
+    direction on int32 keys, so no int64 encoding and no x64. The list must be
+    full: every real pair's reverse is present, as a symmetric NL guarantees."""
+    centers = jnp.asarray(centers)
+    cell_shifts = jnp.asarray(cell_shifts)
+    if jnp.issubdtype(cell_shifts.dtype, jnp.floating):
+        cell_shifts = jnp.rint(cell_shifts)
+    # Padded pairs share one key no real pair can have, so both sorts place
+    # them in input order and each maps to itself.
+    sentinel = jnp.iinfo(jnp.int32).max
+    c = jnp.where(pair_mask, centers, sentinel).astype(jnp.int32)
+    o = jnp.where(pair_mask, others, sentinel).astype(jnp.int32)
+    s = jnp.where(pair_mask[:, None], cell_shifts, 0).astype(jnp.int32)
+    forward = _lexsort((c, o, s[:, 0], s[:, 1], s[:, 2]))
+    backward = _lexsort((o, c, -s[:, 0], -s[:, 1], -s[:, 2]))
+    corresponding = jnp.zeros(centers.shape[0], dtype=centers.dtype)
+    return corresponding.at[forward].set(backward.astype(centers.dtype))
+
+
+def _lexsort(keys):
+    """Stable lexicographic argsort over equal-length integer key arrays."""
+    position = jnp.arange(keys[0].shape[0], dtype=jnp.int32)
+    return jax.lax.sort((*keys, position), num_keys=len(keys), is_stable=True)[-1]
+
+
+# -- device-built raw list: vesin-jax inside the jit --
+
+
+def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
+    """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> nl``, the
+    raw flat NL of ``to_structure`` at cutoff ``radius``, computed by
+    ``vesin-jax`` inside whatever jit traces it, on CPU or GPU.
+
+    ``positions`` is the padded ``[N, 3]`` array of a structure dict, real atoms
+    first: by default all but the dummy atom ``N - 1``, else the first static
+    ``n_atoms``. ``max_neighbors`` is the static number of pairs each atom can
+    hold, so the pair axis has length ``n_atoms * max_neighbors + 1``. ``pbc``
+    is static too (three Python or numpy bools, not a traced array). The
+    layout is ``to_structure``'s: sorted by center, padding on the dummy atom
+    with zero shift, reverse = self, the last slot always empty.
+
+    An atom with more than ``max_neighbors`` neighbors is an error raised by
+    ``vesin-jax`` when the list is computed (a ``jax.errors.JaxRuntimeError``),
+    never a truncated list. ``vesin-jax`` needs ``jax_enable_x64``; the list
+    and the model keep the dtype of ``positions``.
+
+    The closure holds the ``vesin-jax`` calculator and, with ``skin > 0``, its
+    Verlet cache, so keep one per driver for as long as it runs. The list is
+    exact either way; the skin only saves the search while atoms move less than
+    ``skin / 2``. Cell shifts are constants: gradients reach positions and cell
+    through ``edge_displacements``, as with the host list."""
+    from vesin_jax import NeighborList
+
+    calculator = NeighborList(
+        cutoff=radius, full_list=True, sorted=True, padded_to=max_neighbors, skin=skin
+    )
+
+    def neighbor_list(positions, cell, pbc, n_atoms=None):
+        dummy = positions.shape[0] - 1
+        if n_atoms is None:
+            n_atoms = dummy
+
+        periodic = tuple(bool(p) for p in pbc)
+        i, j, S = calculator.compute(
+            positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijS"
+        )
+        # vesin-jax gives each atom max_neighbors slots, the unused ones with
+        # j = -1: move them after the real pairs, onto the dummy atom
+        pair_mask = j >= 0
+        order = center_order(i, pair_mask)
+        pair_mask = _append(pair_mask[order], False)
+        centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
+        others = jnp.where(pair_mask, _append(j[order], dummy), dummy)
+        cell_shifts = _append(S[order].astype(positions.dtype), 0)
+        return {
+            "centers": centers,
+            "others": others,
+            "cell_shifts": cell_shifts,
+            "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
+            "pair_mask": pair_mask,
+        }
+
+    return neighbor_list
+
+
+def _append(x, value):
+    """``x`` with one more row filled with ``value``."""
+    return jnp.concatenate([x, jnp.full((1, *x.shape[1:]), value, x.dtype)])
 
 
 # -- helpers --

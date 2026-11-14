@@ -68,10 +68,11 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
     @jax.jit
     def predict_fn(params, structure):
         atom_mask = structure["atom_mask"][..., None]
+        strain = jnp.zeros((3, 3), dtype=structure["positions"].dtype)
         if ad_forces and ad_stress:
             (energy, aux), (grad_structure, virial) = jax.value_and_grad(
                 strained_energy_fn, argnums=(1, 2), has_aux=True, allow_int=True
-            )(params, structure, jnp.zeros((3, 3)))
+            )(params, structure, strain)
             forces = -grad_structure["positions"] * atom_mask
             stress_out = virial
         elif ad_forces:  # AD forces; direct (or no) stress
@@ -83,7 +84,7 @@ def get_predict_fn(model, stress=True, no_shadow=False, num_neighbors_adaptive=N
         elif ad_stress:  # direct forces; AD stress
             (energy, aux), virial = jax.value_and_grad(
                 strained_energy_fn, argnums=2, has_aux=True, allow_int=True
-            )(params, structure, jnp.zeros((3, 3)))
+            )(params, structure, strain)
             forces = aux["forces"]
             stress_out = virial
         else:  # both direct — no autodiff
@@ -151,7 +152,7 @@ def _select_and_predict(
 def apply_strain(structure, epsilon):
     """Homogeneous strain ``F = I + epsilon`` applied to positions and cell;
     a structure→structure transform used to take ``d/d epsilon`` for stress."""
-    F = jnp.eye(3) + epsilon
+    F = jnp.eye(3, dtype=epsilon.dtype) + epsilon
     return {
         **structure,
         "positions": structure["positions"] @ F,
