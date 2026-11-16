@@ -219,6 +219,71 @@ def _lexsort(keys):
     return jax.lax.sort((*keys, position), num_keys=len(keys), is_stable=True)[-1]
 
 
+# -- device-built raw list: vesin-jax inside the jit --
+
+
+def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
+    """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> nl``, the
+    raw flat NL of ``to_structure`` at cutoff ``radius``, computed by
+    ``vesin-jax`` inside whatever jit traces it, on CPU or GPU.
+
+    ``positions`` is the padded ``[N, 3]`` array of a structure dict, real atoms
+    first: by default all but the dummy atom ``N - 1``, else the first static
+    ``n_atoms``. ``max_neighbors`` is the static number of pairs each atom can
+    hold, so the pair axis has length ``n_atoms * max_neighbors + 1``. ``pbc``
+    is static too (three Python or numpy bools, not a traced array). The
+    layout is ``to_structure``'s: sorted by center, padding on the dummy atom
+    with zero shift, reverse = self, the last slot always empty.
+
+    An atom with more than ``max_neighbors`` neighbors is an error raised by
+    ``vesin-jax`` when the list is computed (a ``jax.errors.JaxRuntimeError``),
+    never a truncated list. ``vesin-jax`` needs ``jax_enable_x64``; the list
+    and the model keep the dtype of ``positions``.
+
+    The closure holds the ``vesin-jax`` calculator and, with ``skin > 0``, its
+    Verlet cache, so keep one per driver for as long as it runs. The list is
+    exact either way; the skin only saves the search while atoms move less than
+    ``skin / 2``. Cell shifts are constants: gradients reach positions and cell
+    through ``edge_displacements``, as with the host list."""
+    from vesin_jax import NeighborList
+
+    calculator = NeighborList(
+        cutoff=radius, full_list=True, sorted=True, padded_to=max_neighbors, skin=skin
+    )
+
+    def neighbor_list(positions, cell, pbc, n_atoms=None):
+        dummy = positions.shape[0] - 1
+        if n_atoms is None:
+            n_atoms = dummy
+
+        periodic = tuple(bool(p) for p in pbc)
+        i, j, S = calculator.compute(
+            positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijS"
+        )
+        # vesin-jax gives each atom max_neighbors slots, the unused ones with
+        # j = -1: move them after the real pairs, onto the dummy atom
+        pair_mask = j >= 0
+        order = center_order(i, pair_mask)
+        pair_mask = _append(pair_mask[order], False)
+        centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
+        others = jnp.where(pair_mask, _append(j[order], dummy), dummy)
+        cell_shifts = _append(S[order].astype(positions.dtype), 0)
+        return {
+            "centers": centers,
+            "others": others,
+            "cell_shifts": cell_shifts,
+            "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
+            "pair_mask": pair_mask,
+        }
+
+    return neighbor_list
+
+
+def _append(x, value):
+    """``x`` with one more row filled with ``value``."""
+    return jnp.concatenate([x, jnp.full((1, *x.shape[1:]), value, x.dtype)])
+
+
 # -- helpers --
 
 
