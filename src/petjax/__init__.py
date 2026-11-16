@@ -20,7 +20,7 @@ from .select import (
     truncate,
     truncate_edges,
 )
-from .structure import to_structure
+from .structure import center_order, corresponding_edges, to_structure
 from .utils import cutoff_bump, cutoff_cosine
 
 __all__ = [
@@ -39,6 +39,8 @@ __all__ = [
     "load_checkpoint",
     "convert_checkpoint",
     "to_structure",
+    "center_order",
+    "corresponding_edges",
     "truncate",
     "truncate_edges",
     "pack_edges",
