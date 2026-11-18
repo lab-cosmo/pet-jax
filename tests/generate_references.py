@@ -17,12 +17,23 @@ Two files per checkpoint, one per force/stress mode:
     test_mini_<name>.npz          conservative (energy gradients)
     test_mini_<name>_direct.npz   non-conservative (direct readout heads)
 
-Needs the upstream stack, not the inference one, and `metatrain >= 2026.4` to
-read a PET checkpoint v16 through `metatrain`'s own model classes (2026.3 tops
-out at v14). Run it from the repo root against the `.ckpt`, not the converted
-`pet-jax` checkpoint:
+Needs the upstream stack, not the inference one, and exactly `metatrain 2026.4.1`
+(the script refuses any other version). Older releases can't read a PET
+checkpoint v16 through `metatrain`'s own model classes (2026.3 tops out at v14).
+Later ones disagree with `pet-jax` in fp64 for two reasons:
 
-    uv run --with 'metatrain>=2026.4' --with metatomic-torch --with ase \\
+- From metatensor/metatrain#1240 (metatensor-learn 0.6) on, loading a checkpoint
+  saved in fp32 rounds its fp64 scaler scales and composition weights to fp32.
+  The converter keeps the stored fp64 values, so PET-MAD energies move by
+  ~3e-7 eV/atom. PET-OMol is saved in fp64 and doesn't move.
+- From metatensor/metatrain#1331 on, the adaptive cutoff is found by bisection
+  instead of Newton-bisection (`select.get_adaptive_cutoffs_solver`), which
+  moves PET-MAD v1.6 by a further ~2e-10 eV/atom.
+
+Run it from the repo root against the `.ckpt`, not the converted `pet-jax`
+checkpoint:
+
+    uv run --with 'metatrain==2026.4.1' --with metatomic-torch --with ase \\
         python tests/generate_references.py <source.ckpt> pet-mad-xs-v1.6
 """
 
@@ -34,6 +45,7 @@ from pathlib import Path
 from ase.io import read
 
 ASSETS = Path(__file__).parent / "assets"
+METATRAIN = "2026.4.1"  # see the module docstring before changing this
 
 
 def predict(calculator, frames):
@@ -73,9 +85,16 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    import metatrain
     import torch
     from metatomic.torch.ase_calculator import MetatomicCalculator
     from metatrain.utils.io import load_model
+
+    if metatrain.__version__ != METATRAIN:
+        raise SystemExit(
+            f"references need metatrain {METATRAIN}, got {metatrain.__version__}; "
+            "see the docstring of tests/generate_references.py"
+        )
 
     model = load_model(str(args.ckpt))
     # PET-MAD ships inside an LLPR wrapper whose export is fp32-only; the
