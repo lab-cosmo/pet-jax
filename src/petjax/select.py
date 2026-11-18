@@ -307,7 +307,7 @@ def get_adaptive_cutoffs(
 def get_adaptive_cutoffs_solver(
     centers, r_ij, pair_mask, num_neighbors, num_atoms, cutoff, cutoff_width
 ):
-    """Per-atom adaptive cutoffs via a Newton-bisection root find on the
+    """Per-atom adaptive cutoffs via a bisection root find on the
     smoothed neighbor count (metatrain's "solver" method, the default for
     recent checkpoints). Solves ``n_total(r) = num_neighbors`` per atom, where
     ``n_total(r) = sum_j bump(r_j, r, w) + num_neighbors * (r / cutoff)**3``;
@@ -339,14 +339,17 @@ def get_adaptive_cutoffs_solver(
         jnp.full(num_atoms, cutoff, dtype=r_ij.dtype), varying, to="varying"
     )
 
-    # 10 iterations converge to fp32 precision (upstream's choice). Newton
-    # steps that would leave the bracket (flat shoulders between bumps) fall
-    # back to the bracket midpoint. fori_loop keeps the HLO compact (vs. 10x
-    # unroll); safe here because the loop sits entirely on detached inputs,
-    # so autodiff never needs to enter it.
-    def newton_bisection_step(_, carry):
+    # Plain bisection, as upstream: n_total is monotonic, so the bracket
+    # halves every step whatever the rounding. 16 steps leave it at
+    # cutoff / 2**16; the IFT step below is a Newton step from there, which
+    # reaches fp32 resolution. (A Newton-bisection hybrid can two-cycle
+    # inside the bracket on a flat shoulder of n_total and return a non-root
+    # that depends on summation order.) fori_loop keeps the HLO compact;
+    # safe because the loop sits entirely on detached inputs, so autodiff
+    # never enters it.
+    def bisection_step(_, carry):
         r_lo, r_hi, r = carry
-        n, dn = _n_total_and_dn_dr(
+        n = _n_total(
             r,
             r_ij_d,
             centers,
@@ -356,15 +359,12 @@ def get_adaptive_cutoffs_solver(
             inv_cutoff,
             num_neighbors,
         )
-        f = n - num_neighbors
-        below = f <= 0
+        below = n - num_neighbors <= 0
         r_lo = jnp.where(below, r, r_lo)
         r_hi = jnp.where(below, r_hi, r)
-        r_newton = r - f / jnp.clip(dn, 1e-6, None)
-        inside = (r_newton >= r_lo) & (r_newton <= r_hi)
-        return r_lo, r_hi, jnp.where(inside, r_newton, 0.5 * (r_lo + r_hi))
+        return r_lo, r_hi, 0.5 * (r_lo + r_hi)
 
-    _, _, r = jax.lax.fori_loop(0, 10, newton_bisection_step, (r_lo, r_hi, 0.5 * r_hi))
+    _, _, r = jax.lax.fori_loop(0, 16, bisection_step, (r_lo, r_hi, 0.5 * r_hi))
     _, dn_root = _n_total_and_dn_dr(
         r, r_ij_d, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
     )
@@ -397,7 +397,7 @@ def _n_total(
 def _n_total_and_dn_dr(
     r_per_atom, r_ij, centers, pair_mask, num_atoms, cutoff_width, inv_cutoff, num_neighbors
 ):
-    """``n_total`` and its analytic d/dr in one pass, for the Newton steps.
+    """``n_total`` and its analytic d/dr in one pass, for the IFT step.
 
     Closed form of the bump in its active region ``s = (d - r + w)/w`` in (0, 1):
     ``f = 0.5 * (1 + tanh(cot(pi s)))``, ``df/dr = (pi / 2w) sech^2(cot(pi s)) /
