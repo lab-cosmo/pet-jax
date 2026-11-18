@@ -17,12 +17,13 @@ Two files per checkpoint, one per force/stress mode:
     test_mini_<name>.npz          conservative (energy gradients)
     test_mini_<name>_direct.npz   non-conservative (direct readout heads)
 
-Needs the upstream stack, not the inference one, and `metatrain >= 2026.4` to
-read a PET checkpoint v16 through `metatrain`'s own model classes (2026.3 tops
-out at v14). Run it from the repo root against the `.ckpt`, not the converted
-`pet-jax` checkpoint:
+Needs the upstream stack, not the inference one, with a `metatrain` that has
+the bisection "solver" (metatensor/metatrain#1331, not yet in a release; pin
+its merge commit). Run it from the repo root against the `.ckpt`, not the
+converted `pet-jax` checkpoint:
 
-    uv run --with 'metatrain>=2026.4' --with metatomic-torch --with ase \\
+    uv run --with 'metatrain @ git+https://github.com/metatensor/metatrain@1fc02b10cd4914e4c99487a45ff802c722ecd20c' \\
+        --with metatomic-torch --with ase \\
         python tests/generate_references.py <source.ckpt> pet-mad-xs-v1.6
 """
 
@@ -56,6 +57,50 @@ def predict(calculator, frames):
     }
 
 
+def restore_fp64_scales_and_shifts(model, checkpoint):
+    """Put the checkpoint's fp64 scales and composition shifts back into `model`.
+
+    `metatrain` fits both in fp64 and stores them as serialized TensorMaps, but
+    loading casts them to the dtype the model was trained in, and for an fp32
+    checkpoint `.to(torch.float64)` cannot bring the lost digits back (a global
+    factor of ~1e-8 and a per-species energy offset of ~1e-7 eV). `pet-jax`
+    keeps the fp64 values, so the references must as well.
+    """
+    import torch
+    from metatensor.torch import load_buffer
+
+    checkpoint = checkpoint.get("wrapped_model_checkpoint", checkpoint)
+    state = checkpoint["best_model_state_dict"] or checkpoint["model_state_dict"]
+
+    def restore(tensor_map, key):
+        stored = load_buffer(state[key])
+        with torch.no_grad():
+            for labels, block in tensor_map.items():
+                block.values[:] = stored.block(labels).values
+
+    # Checkpoints before the per-target / per-property split (ckpt v13) carry
+    # only the combined scale; upstream's upgrade then sets the per-target
+    # scale to it and the per-property one to 1, which needs no restoring.
+    scaler = model.scaler.model
+    for target in scaler.scales:
+        combined = f"scaler.{target}_scaler_buffer"
+        restore(scaler.scales[target], combined)
+        per_target = f"scaler.{target}_per_target_scaler_buffer"
+        restore(
+            scaler.per_target_scales[target],
+            per_target if per_target in state else combined,
+        )
+        per_property = f"scaler.{target}_per_property_scaler_buffer"
+        if per_property in state:
+            restore(scaler.per_property_scales[target], per_property)
+    for index, additive in enumerate(model.additive_models):
+        for target in additive.model.weights:
+            restore(
+                additive.model.weights[target],
+                f"additive_models.{index}.{target}_composition_buffer",
+            )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("ckpt", type=Path, help="upstream metatrain .ckpt")
@@ -80,9 +125,13 @@ def main(argv=None):
     model = load_model(str(args.ckpt))
     # PET-MAD ships inside an LLPR wrapper whose export is fp32-only; the
     # wrapped PET itself exports at any dtype.
-    if type(model).__name__ == "LLPRUncertaintyModel":
-        model = model.model
-    exported = model.to(torch.float64).export()
+    if type(model.core).__name__ == "LLPRUncertaintyModel":
+        model = model.core.model
+    model = model.to(torch.float64)
+    restore_fp64_scales_and_shifts(
+        model, torch.load(args.ckpt, weights_only=False, map_location="cpu")
+    )
+    exported = model.export()
     frames = read(str(args.dataset), index=":")
     stem = args.dataset.stem
 
