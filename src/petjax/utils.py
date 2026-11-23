@@ -5,10 +5,14 @@ import jax.numpy as jnp
 
 
 def cutoff_bump(r, cutoff, width=0.5):
-    """Smooth bump cutoff function."""
+    """Smooth bump cutoff function, ``0.5 (1 + tanh(cot(pi x)))``.
+
+    Evaluated as the equivalent ``sigmoid(2 cot(pi x))``: ``1 + tanh`` rounds to
+    zero in fp32 below about 6e-8, and PET's attention takes the logarithm.
+    """
     x = (r - (cutoff - width)) / width
     x_safe = jnp.clip(x, 1e-6, 1 - 1e-6)
-    bump = 0.5 * (1 + jnp.tanh(1 / jnp.tan(jnp.pi * x_safe)))
+    bump = jax.nn.sigmoid(2 / jnp.tan(jnp.pi * x_safe))
     return jnp.where(x <= 0, 1.0, jnp.where(x >= 1, 0.0, bump))
 
 
