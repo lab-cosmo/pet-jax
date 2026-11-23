@@ -142,7 +142,7 @@ class Backbone(nn.Module):
     layer's ``comb_norms_*`` / ``comb_mlps_*``; loading a checkpoint that has
     them leaves those entries silently unused.
 
-    Two hooks let architectures built on the PET backbone (FlashMD) reuse it.
+    Three hooks let architectures built on the PET backbone (FlashMD) reuse it.
     With ``species_embedding=False`` the backbone owns no species embedding
     table and the caller passes the initial node features ``[N, d_node]`` as
     ``node_features`` (e.g. FlashMD's species + momenta encoder); with the
@@ -151,6 +151,11 @@ class Backbone(nn.Module):
     tree is fixed by the config alone, not by what ``init`` happened to be
     called with. ``cutoff_function(r, cutoff, width)`` gives the per-pair
     cutoff factor (``cutoff_bump`` for PET-MAD, ``cutoff_cosine`` for FlashMD).
+    ``edge_features`` ``[P, F]`` are appended to the geometric input
+    ``[R_ij, r_ij]`` of every GNN layer; they only widen the
+    ``gnn_layers_*_edge_embed`` kernels (``4 + F`` input rows), so without them
+    the parameter tree is unchanged. metatrain's PET has no equivalent, so such
+    a model cannot be exported.
     """
 
     d_pet: int = 128
@@ -184,6 +189,7 @@ class Backbone(nn.Module):
         charge=None,
         spin_multiplicity=None,
         node_features=None,
+        edge_features=None,
     ):
         d_pet = self.d_pet
         d_node = self.d_node
@@ -236,9 +242,13 @@ class Backbone(nn.Module):
         )
         node = node_features[:, None, :] * atom_mask[:, None, None]
 
+        # Geometric (+ optional external) edge features, input of every GNN layer
+        geom = [R_ij, r_ij[..., None]]
+        geom = jnp.concatenate(
+            geom if edge_features is None else [*geom, edge_features], axis=-1
+        )
+
         for layer_idx in range(self.num_gnn_layers):
-            # Geometric features
-            geom = jnp.concatenate([R_ij, r_ij[..., None]], axis=-1)
             geom_proj = masked(
                 nn.Dense(d_pet, name=f"gnn_layers_{layer_idx}_edge_embed"),
                 geom,
