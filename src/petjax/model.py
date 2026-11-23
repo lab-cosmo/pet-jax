@@ -565,40 +565,68 @@ class Attention(nn.Module):
         return nn.Dense(F, name="out")(out.reshape(N, T, F))
 
 
-def smooth_cutoff_weights(scores, factors, established_power=8.0):
+def smooth_cutoff_weights(scores, factors, established_power=8.0, logit_cap=5.0):
     """Attention weights that grow in proportion to the keys' cutoff factors.
 
-    metatrain's ``smooth_cutoff_attention``. Before normalisation over the
-    keys, a key weighs
+    metatrain's ``smooth_cutoff_attention`` (metatrain #1356). Before
+    normalisation over the keys, a key weighs
 
-        f exp(score) / (1 + (1 - f) exp(score) / established)
+        f exp(score) / (1 + (1 - f) exp(score) / others)
 
-    where ``established`` is the summed weight of the other keys, each
-    counted with ``f**established_power``, i.e. once it is well inside the
-    cutoff. With a single key in the cutoff tail, that key receives exactly
-    ``f`` times the attention it would receive at ``f = 1``. Keys at
-    ``f = 1`` keep their softmax weight.
+    where ``others`` is the sum of ``f**established_power exp(score)`` over the
+    other keys, i.e. those well inside the cutoff. A single key in the cutoff
+    tail then receives exactly ``f`` times the attention it would receive at
+    ``f = 1``. Keys at ``f = 1`` keep their softmax weight. The scores are
+    soft-capped to ``logit_cap tanh(score / logit_cap)``: with several keys in
+    the tail, counting competitors with ``f**established_power`` is only an
+    approximation, and an unbounded preference would let a second key take
+    most of the attention at the edge of the cutoff.
 
     ``scores`` is ``[..., queries, keys]`` and ``factors`` broadcasts to it;
-    keys with a zero factor are excluded.
+    keys with a zero factor are excluded, and a row without keys is zero.
     """
+    scores = logit_cap * jnp.tanh(scores / logit_cap)
+    factors = jnp.broadcast_to(factors, scores.shape)
+    excluded = factors <= 0.0
+    inside = factors >= 1.0
+
+    log_f = _log_with_bounded_gradient(factors)
+    # keys inside get f = 0 here, so that log(1 - f) keeps a finite gradient
+    log_1mf = jnp.log1p(-jnp.where(inside, 0.0, factors))
+    log_others = _logsumexp_of_others(scores + established_power * log_f, excluded)
+
+    bias = log_f - jax.nn.softplus(log_1mf + scores - log_others)
+    logits = scores + jnp.where(inside | excluded, 0.0, bias)
     # a finite fill, so that rows without any key (padded atoms) stay finite
-    scores = jnp.where(factors > 0, scores, jnp.finfo(scores.dtype).min)
-    weights = jax.nn.softmax(scores, axis=-1)
+    logits = jnp.where(excluded, jnp.finfo(scores.dtype).min, logits)
+    weights = jax.nn.softmax(logits, axis=-1)
+    return jnp.where(jnp.all(excluded, axis=-1, keepdims=True), 0.0, weights)
 
-    # Summed counted weight of the keys other than each one. Subtracting each
-    # term from the total would cancel for a key that dominates it, so start
-    # from the sum without the largest term.
-    counted = weights * factors**established_power
-    index = jnp.argmax(counted, axis=-1, keepdims=True)
-    largest = jnp.take_along_axis(counted, index, axis=-1)
-    is_largest = jnp.arange(counted.shape[-1]) == index
-    rest = jnp.sum(jnp.where(is_largest, 0.0, counted), axis=-1, keepdims=True)
-    established = jnp.maximum(rest + (largest - counted), 1e-12)
 
-    weights = factors * weights * established / (established + (1.0 - factors) * weights)
-    total = jnp.sum(weights, axis=-1, keepdims=True)
-    return weights / jnp.where(total > 0, total, 1.0)
+def _log_with_bounded_gradient(x, threshold=1e-15):
+    """``log(x)``, with the gradient only for ``x > threshold`` (``1/x`` overflows)."""
+    return jnp.where(
+        x > threshold,
+        jnp.log(jnp.maximum(x, threshold)),
+        jax.lax.stop_gradient(jnp.log(jnp.maximum(x, 0.0))),
+    )
+
+
+def _logsumexp_of_others(x, excluded, log_zero=-1e30):
+    """``log(sum_{j != i} exp(x_j))`` over the non-excluded entries, for every ``i``.
+
+    Subtracting ``exp(x_i)`` from the total loses all precision for the largest
+    entry; it gets the log-sum of the rest, every other entry the largest plus
+    the rest minus itself.
+    """
+    x = jnp.where(excluded, log_zero, x)
+    index = jnp.argmax(jax.lax.stop_gradient(x), axis=-1, keepdims=True)
+    is_max = jnp.arange(x.shape[-1]) == index
+    x_max = jnp.take_along_axis(x, index, axis=-1)
+    rest = jnp.where(is_max, log_zero, x)
+    log_rest = jax.nn.logsumexp(rest, axis=-1, keepdims=True)
+    log_others = x_max + jnp.log1p(jnp.exp(log_rest - x_max) - jnp.exp(rest - x_max))
+    return jnp.where(is_max, log_rest, log_others)
 
 
 def _scores(q, k):
