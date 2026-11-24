@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import pytest
 from ase.build import bulk, molecule
 
-from petjax import get_neighbor_list_fn, to_structure
+from petjax.structure import get_neighbor_list_fn, to_structure
 from petjax.utils import edge_displacements
 
 pytest.importorskip("vesin_jax")

@@ -106,8 +106,6 @@ The subtlety here is that since the cutoffs depend on the position of atoms *out
 
 The solution to this is a two-phase design: Outside of `jax`, we compute the initial big neighborlist and determine the final number, `k_sel`, of neighbors. We can round `k_sel` to something larger to avoid recompiles. We also have to pad the initial big neighborlist to a fixed shape, but this is easy to achieve. Inside `jax` (i.e., the `jax.jit` boundary), we then re-run the procedure and pack into `k_sel`, which we already know ahead of time due to step one. If we exceed `k_sel`, we return an `overflow` signal to tell the calculator that `k_sel` needs to be recomputed.
 
-Drivers that never leave `jax.jit`, such as a device-side MD loop, can build the initial neighborlist there too: `get_neighbor_list_fn` computes it with `vesin-jax`, in the same layout and with a fixed number of slots per atom. It needs the `vesin-jax` extra (`pip install "pet-jax[vesin-jax]"`).
-
 For neighbor lists already trimmed to a fixed neighbor count upstream, `pack_edges` is the selection-free sibling of `truncate_edges`: it packs to the same fixed-width layout, skipping the adaptive-cutoff selection (`pair_cutoffs=None`).
 
 `select_edges` runs the adaptive selection on a structure dict host-side and returns what it produced: per-atom and per-pair cutoffs, the selected-pair mask, and the selected count per atom. The calculator sizes `k_sel` from it; consumers that need the model's actual adjacency rather than the raw neighbor ball (the Hessian sparsity pattern, graph-distance analyses) read the mask.
@@ -219,7 +217,7 @@ Core (`pyproject.toml`):
 Optional (extras — see [Installation](#installation)):
 
 - `convert`: `torch`, `metatomic-torch`, `metatrain` — only needed when converting `metatrain` `.ckpt` files. Inference itself runs on the JAX stack alone.
-- `vesin-jax`: `vesin-jax` — neighbourlist construction inside `jax.jit`, for `get_neighbor_list_fn`.
+- `vesin-jax`: `vesin-jax` — neighbourlist construction inside `jax.jit`, for `petjax.structure.get_neighbor_list_fn`.
 
 ## Contributing
 
