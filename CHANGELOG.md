@@ -18,6 +18,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ### Fixed
 
+- `cutoff_bump` no longer rounds to zero in fp32 near the cutoff, which made the attention bias jump there; it is now evaluated as `sigmoid(2 cot(πx))`, as in `metatrain`.
 - A float32 model no longer runs in float64 when JAX's 64-bit mode is on (as with i-PI's jax backend).
 - The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.
 - The RMSNorm and LayerNorm epsilons now match `torch`'s defaults (`finfo(dtype).eps` and `1e-5`) instead of `flax`'s (`1e-6`). Predictions move by ~1e-7 relative; in fp64, agreement with `metatrain` improves by an order of magnitude.
