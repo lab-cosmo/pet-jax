@@ -33,9 +33,9 @@ class UPET(nn.Module):
     # predating the split are filled in by load_checkpoint (adaptive :=
     # cutoff_width, upstream's own migration rule).
     cutoff_width_adaptive: float = 0.5
-    # "grid" (probe grid + Gaussian weights) or "solver" (bisection
-    # root find) — metatrain ckpt v12 splits these; pre-split checkpoints
-    # trained with grid.
+    # "grid" (probe grid + Gaussian weights) or "solver" (bisection root
+    # find) — metatrain ckpt v12 splits these; pre-split checkpoints trained
+    # with grid.
     adaptive_cutoff_method: str = "grid"
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0

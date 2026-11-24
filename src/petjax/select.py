@@ -339,13 +339,9 @@ def get_adaptive_cutoffs_solver(
         jnp.full(num_atoms, cutoff, dtype=r_ij.dtype), varying, to="varying"
     )
 
-    # Plain bisection, as upstream: n_total is monotonic, so the bracket
-    # halves every step whatever the rounding. 16 steps leave it at
+    # Plain bisection, as upstream. 16 steps leave the bracket at
     # cutoff / 2**16; the IFT step below is a Newton step from there, which
-    # reaches fp32 resolution. (A Newton-bisection hybrid can two-cycle
-    # inside the bracket on a flat shoulder of n_total and return a non-root
-    # that depends on summation order.) fori_loop keeps the HLO compact;
-    # safe because the loop sits entirely on detached inputs, so autodiff
+    # reaches fp32 resolution. The loop sits on detached inputs, so autodiff
     # never enters it.
     def bisection_step(_, carry):
         r_lo, r_hi, r = carry

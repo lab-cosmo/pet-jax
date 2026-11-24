@@ -384,6 +384,34 @@ def test_solver_finds_root_and_attaches_gradients():
     assert float(jnp.abs(grad).max()) > 0.0, "IFT step attached no gradient"
 
 
+def test_solver_converges_on_flat_shoulder():
+    """Neighbor distances of a surface atom of a Pd cluster, on which a
+    Newton-bisection hybrid cycles and returns 4.71 instead of the root
+    (metatensor/metatrain#1324)."""
+    # fmt: off
+    distances = [
+        2.6438, 2.6805, 2.6813, 2.6914, 2.7026, 2.7072, 2.7680, 2.7724, 2.8071,
+        2.8113, 2.8302, 2.8473, 3.6458, 3.7493, 3.8703, 3.9268, 3.9275, 3.9958,
+        4.5983, 4.6906, 4.6999, 4.7060, 4.7174, 4.7250, 4.7268, 4.7493, 4.7513,
+        4.7698, 4.7740, 4.7795, 4.7833, 4.8046, 4.8267, 4.8323, 4.8403, 4.8424,
+        4.8506, 4.8631, 5.4531, 5.4779, 5.4867, 5.5006, 5.5111, 5.5167, 5.5214,
+        5.5869, 5.6298, 5.6467, 6.0969, 6.1321, 6.1425, 6.1688, 6.1729, 6.1828,
+        6.1892, 6.1896, 6.2005, 6.2010, 6.2025, 6.2128, 6.2295, 6.2378, 6.2682,
+        6.2796, 6.3135, 6.6912, 6.6931, 6.7052, 6.7293, 6.7398, 6.8774, 7.1155,
+        7.1646, 7.1779, 7.1800, 7.1838, 7.1925, 7.2289, 7.2329, 7.2347, 7.2461,
+        7.2464, 7.2583, 7.2606, 7.2610, 7.2674, 7.2751, 7.3072, 7.3094, 7.3135,
+        7.3152, 7.3207, 7.3223, 7.3279, 7.3287, 7.3317, 7.3336, 7.3371, 7.3397,
+        7.3595, 7.3698, 7.3814, 7.3851, 7.4075, 7.4351,
+    ]
+    # fmt: on
+    r_ij = jnp.array(distances)
+    centers = jnp.zeros(len(distances), dtype=int)
+    mask = jnp.ones(len(distances), bool)
+
+    cut = get_adaptive_cutoffs_solver(centers, r_ij, mask, 16, 1, 7.5, 1.0)
+    np.testing.assert_allclose(float(cut[0]), 4.1590, atol=1e-4)
+
+
 def test_adaptive_cutoff_solver_end_to_end(model_data, mini_xyz):
     """A solver-method model must run through the whole calculator pipeline
     (k_sel sizing, in-JIT selection, autodiff forces) and give results close

@@ -5,7 +5,8 @@ Runs upstream `metatrain` (never `pet-jax`) on a dataset and writes an `.npz` of
 (n_structures, 3, 3), and `natoms` (n_structures,). Numbers only — the geometry
 stays in the dataset file, and `natoms` is what lets
 `test_predictions.load_reference` split the forces back up and check that the
-reference belongs to the dataset it is compared against. The model runs in
+reference belongs to the dataset it is compared against. `metatrain_version`
+records what generated the file. The model runs in
 fp64 so the references are exact to ~1e-14 and the fp64 tests can pin
 `pet-jax` to them bit for bit; fp32 tests compare to the same files. Frames
 that are not periodic in all three directions get a zero stress placeholder,
@@ -17,10 +18,10 @@ Two files per checkpoint, one per force/stress mode:
     test_mini_<name>.npz          conservative (energy gradients)
     test_mini_<name>_direct.npz   non-conservative (direct readout heads)
 
-Needs the upstream stack, not the inference one, with a `metatrain` that has
-the bisection "solver" (metatensor/metatrain#1331, not yet in a release; pin
-its merge commit). Run it from the repo root against the `.ckpt`, not the
-converted `pet-jax` checkpoint:
+Needs the upstream stack, not the inference one, with a `metatrain` at least
+as new as the commit below (the bisection "solver", not yet in a release). Run
+it from the repo root against the `.ckpt`, not the converted `pet-jax`
+checkpoint:
 
     uv run --with 'metatrain @ git+https://github.com/metatensor/metatrain@1fc02b10cd4914e4c99487a45ff802c722ecd20c' \\
         --with metatomic-torch --with ase \\
@@ -30,6 +31,8 @@ converted `pet-jax` checkpoint:
 import numpy as np
 
 import argparse
+import json
+from importlib.metadata import distribution
 from pathlib import Path
 
 from ase.io import read
@@ -55,6 +58,13 @@ def predict(calculator, frames):
         "stress": np.asarray(stress),
         "natoms": np.asarray([len(atoms) for atoms in frames]),
     }
+
+
+def metatrain_version():
+    """The installed `metatrain` version, or its commit for an install from git."""
+    dist = distribution("metatrain")
+    direct_url = json.loads(dist.read_text("direct_url.json") or "{}")
+    return direct_url.get("vcs_info", {}).get("commit_id", dist.version)
 
 
 def restore_fp64_scales_and_shifts(model, checkpoint):
@@ -143,7 +153,9 @@ def main(argv=None):
     for suffix, non_conservative in (("", False), ("_direct", direct)):
         calculator = MetatomicCalculator(exported, non_conservative=non_conservative)
         path = args.out_dir / f"{stem}_{args.name}{suffix}.npz"
-        np.savez_compressed(path, **predict(calculator, frames))
+        np.savez_compressed(
+            path, **predict(calculator, frames), metatrain_version=metatrain_version()
+        )
         print(f"wrote {len(frames)} frames to {path}")
 
 
