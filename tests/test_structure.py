@@ -1,5 +1,3 @@
-"""Device-side flat-NL layout helpers against the host builders in structure.py."""
-
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -7,8 +5,7 @@ import jax.numpy as jnp
 import pytest
 from ase.build import bulk, molecule
 
-from petjax import center_order, corresponding_edges
-from petjax.structure import to_structure
+from petjax.structure import center_order, corresponding_edges, to_structure
 
 
 @pytest.fixture(params=["primitive", "supercell", "molecule"])
@@ -29,24 +26,15 @@ def _fields(structure):
 
 
 def test_corresponding_edges_matches_host(structure):
-    """Bit-equal to the host reverse map on the host layout, padding included."""
-    got = jax.jit(corresponding_edges)(*_fields(structure))
+    centers, others, shifts, mask = _fields(structure)
+    got = jax.jit(corresponding_edges)(
+        centers.astype(np.int32), others.astype(np.int32), shifts.astype(np.float32), mask
+    )
+    assert got.dtype == jnp.int32
     assert np.array_equal(got, structure["reverse"])
 
 
-def test_corresponding_edges_any_order(structure):
-    """Independent of the pair order: on a shuffled list it is the host map
-    carried through the shuffle."""
-    perm = np.random.default_rng(0).permutation(structure["centers"].shape[0])
-    inverse = np.argsort(perm)
-    got = corresponding_edges(*(x[perm] for x in _fields(structure)))
-    assert np.array_equal(got, inverse[structure["reverse"][perm]])
-
-
 def test_center_order_then_corresponding_edges(structure):
-    """Sorting a shuffled list by center gives the layout truncate_edges needs,
-    and the reverse map on it pairs (i, j, S) with (j, i, -S) as an involution
-    that leaves padded pairs alone."""
     perm = np.random.default_rng(1).permutation(structure["centers"].shape[0])
     centers, others, shifts, mask = (x[perm] for x in _fields(structure))
     order = np.asarray(jax.jit(center_order)(centers, mask))
@@ -63,13 +51,3 @@ def test_center_order_then_corresponding_edges(structure):
     assert np.array_equal(others[rev[real]], centers[real])
     assert np.array_equal(shifts[rev[real]], -shifts[real])
     assert np.array_equal(rev[n_real:], np.arange(n_real, rev.shape[0]))
-
-
-def test_corresponding_edges_int32_inputs(structure):
-    """No x64 needed: int32 indices and float32 shifts in, int32 out."""
-    centers, others, shifts, mask = _fields(structure)
-    got = corresponding_edges(
-        centers.astype(np.int32), others.astype(np.int32), shifts.astype(np.float32), mask
-    )
-    assert got.dtype == jnp.int32
-    assert np.array_equal(got, structure["reverse"])

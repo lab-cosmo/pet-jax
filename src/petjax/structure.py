@@ -193,10 +193,10 @@ def center_order(centers, pair_mask):
 
 def corresponding_edges(centers, others, cell_shifts, pair_mask):
     """``_get_corresponding_edges`` on the device: for each pair ``(i, j, S)``
-    of a padded flat NL in any order, the index of ``(j, i, -S)``. Padded pairs
-    map to themselves, as in ``to_structure``. One stable multi-key sort per
-    direction on int32 keys, so no int64 encoding and no x64. The list must be
-    full: every real pair's reverse is present, as a symmetric NL guarantees."""
+    of a padded flat NL in any order, the index of ``(j, i, -S)``. Sorts on
+    int32 keys, so it needs neither the int64 encoding nor x64. The list must
+    be full: every real pair's reverse is present, as a symmetric NL
+    guarantees."""
     centers = jnp.asarray(centers)
     cell_shifts = jnp.asarray(cell_shifts)
     if jnp.issubdtype(cell_shifts.dtype, jnp.floating):
