@@ -2,7 +2,7 @@
 
 Given a structure dict (from ``structure.to_structure``), produce a
 ``truncated`` dict keyed to ``UPET.__call__``'s parameters so the model
-forward is ``model.apply(params, **truncated)``.
+forward is ``model.apply(params, **truncated)``, plus a ``Truncation``.
 
 ``truncate`` splits at the displacement boundary: it derives ``R_ij`` via
 ``edge_displacements`` (single structure, one cell) and delegates to
@@ -36,7 +36,18 @@ from .utils import cutoff_bump, edge_displacements, safe_norm
 # Per-atom model inputs a structure dict may carry besides the geometry.
 CONDITIONING_KEYS = ("charge", "spin_multiplicity")
 
-# -- truncate: structure -> (truncated dict, overflow) — the per-step entry --
+# -- truncate: structure -> (truncated dict, Truncation) — the per-step entry --
+
+
+class Truncation(NamedTuple):
+    """Result of the in-JIT selection: the fields of ``Selection``, plus
+    ``overflow``. Per-pair arrays are indexed like the input flat NL."""
+
+    atomic_cutoffs: jax.Array | None  # [N] adaptive cutoff per atom
+    pair_cutoffs: jax.Array | None  # [n_pair_padded] mean of the two endpoint cutoffs
+    selected: jax.Array  # [n_pair_padded] bool, r_ij <= pair_cutoff; False on padding
+    counts: jax.Array  # [N] selected pairs per center, not clipped to k_sel
+    overflow: jax.Array  # scalar bool, True iff counts.max() > k_sel
 
 
 def truncate(
@@ -59,7 +70,7 @@ def truncate(
         structure["cell_shifts"],
         structure["cell"],
     )
-    truncated, overflow = truncate_edges(
+    truncated, truncation = truncate_edges(
         R_ij,
         structure["centers"],
         structure["others"],
@@ -77,7 +88,7 @@ def truncate(
     for key in CONDITIONING_KEYS:
         if key in structure:
             truncated[key] = structure[key]
-    return truncated, overflow
+    return truncated, truncation
 
 
 def truncate_edges(
@@ -98,7 +109,7 @@ def truncate_edges(
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
     truncated dict keyed to ``UPET.__call__``'s parameter names (so the forward
-    is ``model.apply(params, **truncated)``).
+    is ``model.apply(params, **truncated)``) and the ``Truncation``.
 
     ``cutoff`` is the trained maximum cutoff and ``cutoff_width_adaptive`` the
     selection taper width only — the final ``cutoff_bump`` taper inside the
@@ -112,7 +123,7 @@ def truncate_edges(
     """
     N = atomic_numbers.shape[0]
 
-    _atomic_cutoffs, pair_cutoffs, selected = _select_edges(
+    atomic_cutoffs, pair_cutoffs, selected = _select_edges(
         R_ij,
         centers,
         others,
@@ -124,7 +135,7 @@ def truncate_edges(
         method=method,
         no_shadow=no_shadow,
     )
-    slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
+    slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
         selected, centers, N, k_sel
     )
 
@@ -140,7 +151,7 @@ def truncate_edges(
         "atom_mask": atom_mask,
         "pair_cutoffs": pair_cutoffs[sel_to_pair],
     }
-    return truncated, overflow
+    return truncated, Truncation(atomic_cutoffs, pair_cutoffs, selected, counts, overflow)
 
 
 def pack_edges(
@@ -156,7 +167,9 @@ def pack_edges(
 ):
     """Fixed-width pack on a flat NL with precomputed displacements — no
     selection: every unmasked pair goes into the rectangular ``[N * k]``
-    layout. Returns the truncated dict keyed like ``truncate_edges``'s.
+    layout. Returns the truncated dict keyed like ``truncate_edges``'s and a
+    ``Truncation`` with no atomic cutoffs, the given ``pair_cutoffs`` and
+    ``selected = pair_mask``.
     ``pair_cutoffs`` (per flat pair, optional) are packed with the pairs and set the
     model's per-pair cutoff bump; without them the model applies its scalar
     cutoff.
@@ -172,7 +185,7 @@ def pack_edges(
     has seen, and ``overflow`` does not flag it.
     """
     N = atomic_numbers.shape[0]
-    slot, sel_to_pair, pair_mask_sel, overflow = _pack_selected_to_flat(
+    slot, sel_to_pair, pair_mask_sel, counts, overflow = _pack_selected_to_flat(
         pair_mask, centers, N, k
     )
     truncated = {
@@ -185,7 +198,7 @@ def pack_edges(
         "atom_mask": atom_mask,
         "pair_cutoffs": None if pair_cutoffs is None else pair_cutoffs[sel_to_pair],
     }
-    return truncated, overflow
+    return truncated, Truncation(None, pair_cutoffs, pair_mask, counts, overflow)
 
 
 # -- select_edges: the adaptive selection host-side, via a CPU-pinned jit kernel --
@@ -492,6 +505,7 @@ def _pack_selected_to_flat(selected, centers, N_padded, k_sel):
       sel_to_pair:    ``[P_sel]`` — inverse map. Unused P_sel slots point
                       at ``N_pair_padded - 1`` (the padded-pair sentinel).
       pair_mask_sel:  ``[P_sel]`` bool.
+      counts:         ``[N_padded]`` — selected pairs per center, unclipped.
       overflow:       scalar bool — True iff any selected pair didn't fit
                       because its center already had ≥ ``k_sel`` selected.
     """
@@ -521,4 +535,4 @@ def _pack_selected_to_flat(selected, centers, N_padded, k_sel):
     sel_to_pair = jnp.full(P_sel, N_pair_padded - 1, dtype=centers.dtype)
     sel_to_pair = sel_to_pair.at[slot].set(jnp.arange(N_pair_padded, dtype=centers.dtype))
 
-    return slot, sel_to_pair, pair_mask_sel, overflow
+    return slot, sel_to_pair, pair_mask_sel, count_per_center, overflow
