@@ -41,8 +41,8 @@ def _device_list(atoms, host, radius, max_neighbors=None, n_atoms=None):
         max_neighbors = _max_neighbors(host)
     neighbor_list = get_neighbor_list_fn(radius, max_neighbors)
     fn = jax.jit(lambda positions, cell: neighbor_list(positions, cell, atoms.pbc, n_atoms))
-    nl = fn(jnp.asarray(host["positions"]), jnp.asarray(host["cell"]))
-    return jax.tree.map(np.asarray, nl)
+    nl, capacity = fn(jnp.asarray(host["positions"]), jnp.asarray(host["cell"]))
+    return jax.tree.map(np.asarray, nl), capacity
 
 
 def _pairs(nl):
@@ -80,8 +80,10 @@ def _check_layout(nl, dummy):
 def test_matches_host(system):
     atoms, cutoff = system
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    nl = _device_list(atoms, host, cutoff)
+    nl, capacity = _device_list(atoms, host, cutoff)
 
+    assert not capacity.overflow
+    assert capacity.required_max_neighbors == _max_neighbors(host)
     assert nl["centers"].shape == (len(atoms) * _max_neighbors(host) + 1,)
     assert nl["cell_shifts"].dtype == jnp.asarray(host["positions"]).dtype
     assert _pairs(nl) == _pairs(host)
@@ -99,16 +101,28 @@ def test_padded_atoms():
     N_padded = host["positions"].shape[0]
     assert N_padded > len(atoms) + 1
 
-    nl = _device_list(atoms, host, 4.0, n_atoms=len(atoms))
+    nl, capacity = _device_list(atoms, host, 4.0, n_atoms=len(atoms))
+    assert not capacity.overflow
     assert _pairs(nl) == _pairs(host)
     _check_layout(nl, dummy=N_padded - 1)
 
 
-def test_too_many_neighbors_raises():
-    atoms, cutoff = bulk("Cu", cubic=True) * [2, 2, 2], 4.0
+def test_overflow(system):
+    """Too few slots give an empty list in the usual layout, and the number of
+    slots that a rebuilt list needs."""
+    atoms, cutoff = system
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    with pytest.raises(jax.errors.JaxRuntimeError, match="more neighbors"):
-        _device_list(atoms, host, cutoff, max_neighbors=_max_neighbors(host) - 1)
+    nl, capacity = _device_list(atoms, host, cutoff, max_neighbors=1)
+    assert capacity.overflow
+    assert capacity.required_max_neighbors == _max_neighbors(host)
+    assert not nl["pair_mask"].any()
+    _check_layout(nl, dummy=host["positions"].shape[0] - 1)
+
+    nl, capacity = _device_list(
+        atoms, host, cutoff, max_neighbors=int(capacity.required_max_neighbors)
+    )
+    assert not capacity.overflow
+    assert _pairs(nl) == _pairs(host)
 
 
 def test_skin_stays_exact():
@@ -129,8 +143,9 @@ def test_skin_stays_exact():
         positions = positions.at[:-1].add(rng.normal(scale=0.05, size=(len(atoms), 3)))
         if step == 5:
             cell = cell * 1.01
-        nl = cached(positions, cell)
-        expected = exact(positions, cell)
+        nl, capacity = cached(positions, cell)
+        expected, _ = exact(positions, cell)
+        assert not capacity.overflow
         nl, expected = jax.tree.map(np.asarray, (nl, expected))
         assert _pairs(nl) == _pairs(expected)
 
@@ -150,7 +165,7 @@ def test_gradients(system):
         return jnp.sum(jnp.where(nl["pair_mask"], (cutoff - r) ** 3, 0.0))
 
     def device_energy(positions, cell):
-        nl = neighbor_list(positions, cell, atoms.pbc)
+        nl, _ = neighbor_list(positions, cell, atoms.pbc)
         return pair_energy(positions, cell, nl)
 
     def host_energy(positions, cell):

@@ -13,6 +13,8 @@ import jax.numpy as jnp
 
 from marathon.utils import next_size
 
+from typing import NamedTuple
+
 
 def to_structure(
     atoms,
@@ -222,17 +224,24 @@ def _lexsort(keys):
 # -- device-built raw list: vesin-jax inside the jit --
 
 
+class Capacity(NamedTuple):
+    """Whether a list from ``get_neighbor_list_fn`` fit its slots."""
+
+    overflow: jax.Array  # scalar bool, True iff an atom has more than max_neighbors
+    required_max_neighbors: jax.Array  # scalar int; max_neighbors unless overflow
+
+
 def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
-    """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> nl``: the
-    raw flat NL of ``to_structure`` at cutoff ``radius``, computed by
-    ``vesin-jax`` inside the jit, on CPU or GPU.
+    """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> (nl,
+    Capacity)``: the raw flat NL of ``to_structure`` at cutoff ``radius``,
+    computed by ``vesin-jax`` inside the jit, on CPU or GPU.
 
     ``positions`` is padded as in a structure dict, real atoms first: all but
     the last (dummy) atom by default, else the first ``n_atoms``. Each atom
     gets ``max_neighbors`` slots, so the pair axis has length
-    ``n_atoms * max_neighbors + 1``; an atom with more neighbors raises a
-    ``JaxRuntimeError`` rather than truncating the list. ``pbc`` and
-    ``n_atoms`` are static.
+    ``n_atoms * max_neighbors + 1``. If an atom has more neighbors, the list
+    is empty, never truncated, and the ``Capacity`` says how many slots a
+    rebuilt list needs. ``pbc`` and ``n_atoms`` are static.
 
     With ``skin > 0`` the closure keeps a Verlet cache between calls, so build
     it once per driver; the list is exact either way. Needs the ``vesin-jax``
@@ -254,9 +263,12 @@ def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
             n_atoms = dummy
 
         periodic = tuple(bool(p) for p in pbc)
-        i, j, S = calculator.compute(
-            positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijS"
+        # Asking for "n" makes vesin-jax report the capacity it needs instead
+        # of failing the computation when the slots do not suffice.
+        i, j, S, n = calculator.compute(
+            positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijSn"
         )
+        capacity = Capacity(n > n_atoms * max_neighbors, n // n_atoms)
         # vesin-jax gives each atom max_neighbors slots, the unused ones with
         # j = -1: move them after the real pairs, onto the dummy atom
         pair_mask = j >= 0
@@ -265,13 +277,14 @@ def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
         centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
         others = jnp.where(pair_mask, _append(j[order], dummy), dummy)
         cell_shifts = _append(S[order].astype(positions.dtype), 0)
-        return {
+        nl = {
             "centers": centers,
             "others": others,
             "cell_shifts": cell_shifts,
             "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
             "pair_mask": pair_mask,
         }
+        return nl, capacity
 
     return neighbor_list
 
