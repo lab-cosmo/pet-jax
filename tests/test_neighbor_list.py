@@ -107,6 +107,18 @@ def test_padded_atoms():
     _check_layout(nl, dummy=N_padded - 1)
 
 
+def test_spare_slots(system):
+    """With more slots than needed, the capacity still reports the actual
+    largest neighbor count."""
+    atoms, cutoff = system
+    host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
+    largest = _max_neighbors(host)
+    nl, capacity = _device_list(atoms, host, cutoff, max_neighbors=largest + 5)
+    assert not capacity.overflow
+    assert capacity.max_neighbors == largest
+    assert _pairs(nl) == _pairs(host)
+
+
 def test_overflow(system):
     """Too few slots give an empty list in the usual layout, and the number of
     slots that a rebuilt list needs."""

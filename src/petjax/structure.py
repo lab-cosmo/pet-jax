@@ -228,7 +228,7 @@ class Capacity(NamedTuple):
     """Whether a list from ``get_neighbor_list_fn`` fit its slots."""
 
     overflow: jax.Array  # scalar bool, True iff an atom has more neighbors than slots
-    max_neighbors: jax.Array  # scalar int, slots per atom needed; the input unless overflow
+    max_neighbors: jax.Array  # scalar int, the largest number of neighbors of an atom
 
 
 def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
@@ -240,8 +240,8 @@ def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
     the last (dummy) atom by default, else the first ``n_atoms``. Each atom
     gets ``max_neighbors`` slots, so the pair axis has length
     ``n_atoms * max_neighbors + 1``. If an atom has more neighbors, the list
-    is empty, never truncated, and the ``Capacity`` says how many slots a
-    rebuilt list needs. ``pbc`` and ``n_atoms`` are static.
+    is empty, never truncated; either way the ``Capacity`` carries the actual
+    largest neighbor count. ``pbc`` and ``n_atoms`` are static.
 
     With ``skin > 0`` the closure keeps a Verlet cache between calls, so build
     it once per driver; the list is exact either way. Needs the ``vesin-jax``
@@ -268,10 +268,13 @@ def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
         i, j, S, n = calculator.compute(
             positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijSn"
         )
-        capacity = Capacity(n > n_atoms * max_neighbors, n // n_atoms)
+        overflow = n > n_atoms * max_neighbors
         # vesin-jax gives each atom max_neighbors slots, the unused ones with
         # j = -1: move them after the real pairs, onto the dummy atom
         pair_mask = j >= 0
+        # n is the needed capacity only on overflow; else count the used slots
+        used = jax.ops.segment_sum(pair_mask.astype(n.dtype), jnp.maximum(i, 0), n_atoms)
+        capacity = Capacity(overflow, jnp.where(overflow, n // n_atoms, used.max()))
         order = center_order(i, pair_mask)
         pair_mask = _append(pair_mask[order], False)
         centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
