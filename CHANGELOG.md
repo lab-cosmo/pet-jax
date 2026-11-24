@@ -8,7 +8,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ### Changed
 
-- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag: the per-atom and per-pair cutoffs, the selected mask, the selected count per center, and `overflow`, mirroring what `select_edges` reports host-side. Callers that unpacked the flag read `.overflow`; the counts let a driver size `k_sel` without leaving jit.
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag; callers that unpacked the flag read `.overflow`. It also carries the cutoffs, the selected mask and the count per center, so a driver can size `k_sel` without leaving jit.
 
 ### Added
 

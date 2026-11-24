@@ -196,7 +196,8 @@ def test_pack_edges_pair_cutoffs(structure):
         k,
     )
     tag = np.arange(len(structure["centers"]), dtype=np.float32)
-    packed, _ = pack_edges(*args, pair_cutoffs=tag)
+    packed, truncation = pack_edges(*args, pair_cutoffs=tag)
+    assert np.array_equal(truncation.pair_cutoffs, tag)
     real = np.asarray(packed["pair_mask"])
     by_tag = np.asarray(packed["pair_cutoffs"])[real].astype(int)
     np.testing.assert_array_equal(

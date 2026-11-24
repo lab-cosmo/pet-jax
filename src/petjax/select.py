@@ -2,8 +2,7 @@
 
 Given a structure dict (from ``structure.to_structure``), produce a
 ``truncated`` dict keyed to ``UPET.__call__``'s parameters so the model
-forward is ``model.apply(params, **truncated)``, plus a ``Truncation`` with
-the selection's accounting (the host-side ``Selection`` plus ``overflow``).
+forward is ``model.apply(params, **truncated)``, plus a ``Truncation``.
 
 ``truncate`` splits at the displacement boundary: it derives ``R_ij`` via
 ``edge_displacements`` (single structure, one cell) and delegates to
@@ -113,8 +112,7 @@ def truncate_edges(
     """Adaptive cutoff selection on a flat NL with precomputed displacements:
     pack survivors into the rectangular ``[N * k_sel]`` layout, return the
     truncated dict keyed to ``UPET.__call__``'s parameter names (so the forward
-    is ``model.apply(params, **truncated)``) and the ``Truncation``. Its
-    ``counts`` is what a driver sizes ``k_sel`` from without leaving jit.
+    is ``model.apply(params, **truncated)``) and the ``Truncation``.
 
     ``cutoff`` is the trained maximum cutoff and ``cutoff_width_adaptive`` the
     selection taper width only — the final ``cutoff_bump`` taper inside the
