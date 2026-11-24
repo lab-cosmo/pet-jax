@@ -227,8 +227,8 @@ def _lexsort(keys):
 class Capacity(NamedTuple):
     """Whether a list from ``get_neighbor_list_fn`` fit its slots."""
 
-    overflow: jax.Array  # scalar bool, True iff an atom has more than max_neighbors
-    required_max_neighbors: jax.Array  # scalar int; max_neighbors unless overflow
+    overflow: jax.Array  # scalar bool, True iff an atom has more neighbors than slots
+    max_neighbors: jax.Array  # scalar int, slots per atom needed; the input unless overflow
 
 
 def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):

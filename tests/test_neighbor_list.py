@@ -83,7 +83,7 @@ def test_matches_host(system):
     nl, capacity = _device_list(atoms, host, cutoff)
 
     assert not capacity.overflow
-    assert capacity.required_max_neighbors == _max_neighbors(host)
+    assert capacity.max_neighbors == _max_neighbors(host)
     assert nl["centers"].shape == (len(atoms) * _max_neighbors(host) + 1,)
     assert nl["cell_shifts"].dtype == jnp.asarray(host["positions"]).dtype
     assert _pairs(nl) == _pairs(host)
@@ -114,12 +114,12 @@ def test_overflow(system):
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
     nl, capacity = _device_list(atoms, host, cutoff, max_neighbors=1)
     assert capacity.overflow
-    assert capacity.required_max_neighbors == _max_neighbors(host)
+    assert capacity.max_neighbors == _max_neighbors(host)
     assert not nl["pair_mask"].any()
     _check_layout(nl, dummy=host["positions"].shape[0] - 1)
 
     nl, capacity = _device_list(
-        atoms, host, cutoff, max_neighbors=int(capacity.required_max_neighbors)
+        atoms, host, cutoff, max_neighbors=int(capacity.max_neighbors)
     )
     assert not capacity.overflow
     assert _pairs(nl) == _pairs(host)
