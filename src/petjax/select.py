@@ -40,16 +40,13 @@ CONDITIONING_KEYS = ("charge", "spin_multiplicity")
 
 
 class Truncation(NamedTuple):
-    """What ``truncate_edges`` / ``pack_edges`` selected and whether it fit:
-    ``Selection``'s fields as traced arrays, plus ``overflow``. The raw-pair
-    arrays index the input flat NL, not the packed layout. ``pack_edges`` has
-    no atomic cutoffs, passes its ``pair_cutoffs`` through (``None`` without
-    them) and selects every unmasked pair."""
+    """Result of the in-JIT selection: the fields of ``Selection``, plus
+    ``overflow``. Per-pair arrays are indexed like the input flat NL."""
 
     atomic_cutoffs: jax.Array | None  # [N] adaptive cutoff per atom
     pair_cutoffs: jax.Array | None  # [n_pair_padded] mean of the two endpoint cutoffs
     selected: jax.Array  # [n_pair_padded] bool, r_ij <= pair_cutoff; False on padding
-    counts: jax.Array  # [N] selected pairs per center, unclipped; k_sel must cover its max
+    counts: jax.Array  # [N] selected pairs per center, not clipped to k_sel
     overflow: jax.Array  # scalar bool, True iff counts.max() > k_sel
 
 
@@ -171,7 +168,8 @@ def pack_edges(
     """Fixed-width pack on a flat NL with precomputed displacements — no
     selection: every unmasked pair goes into the rectangular ``[N * k]``
     layout. Returns the truncated dict keyed like ``truncate_edges``'s and a
-    ``Truncation`` whose ``selected`` is ``pair_mask``.
+    ``Truncation`` with no atomic cutoffs, the given ``pair_cutoffs`` and
+    ``selected = pair_mask``.
     ``pair_cutoffs`` (per flat pair, optional) are packed with the pairs and set the
     model's per-pair cutoff bump; without them the model applies its scalar
     cutoff.
