@@ -41,8 +41,8 @@ def _device_list(atoms, host, radius, max_neighbors=None, n_atoms=None):
         max_neighbors = _max_neighbors(host)
     neighbor_list = get_neighbor_list_fn(radius, max_neighbors)
     fn = jax.jit(lambda positions, cell: neighbor_list(positions, cell, atoms.pbc, n_atoms))
-    nl, capacity = fn(jnp.asarray(host["positions"]), jnp.asarray(host["cell"]))
-    return jax.tree.map(np.asarray, nl), capacity
+    nl, overflow = fn(jnp.asarray(host["positions"]), jnp.asarray(host["cell"]))
+    return jax.tree.map(np.asarray, nl), bool(overflow)
 
 
 def _pairs(nl):
@@ -80,10 +80,9 @@ def _check_layout(nl, dummy):
 def test_matches_host(system):
     atoms, cutoff = system
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    nl, capacity = _device_list(atoms, host, cutoff)
+    nl, overflow = _device_list(atoms, host, cutoff)
 
-    assert not capacity.overflow
-    assert capacity.max_neighbors == _max_neighbors(host)
+    assert not overflow
     assert nl["centers"].shape == (len(atoms) * _max_neighbors(host) + 1,)
     assert nl["cell_shifts"].dtype == jnp.asarray(host["positions"]).dtype
     assert _pairs(nl) == _pairs(host)
@@ -101,40 +100,20 @@ def test_padded_atoms():
     N_padded = host["positions"].shape[0]
     assert N_padded > len(atoms) + 1
 
-    nl, capacity = _device_list(atoms, host, 4.0, n_atoms=len(atoms))
-    assert not capacity.overflow
+    nl, overflow = _device_list(atoms, host, 4.0, n_atoms=len(atoms))
+    assert not overflow
     assert _pairs(nl) == _pairs(host)
     _check_layout(nl, dummy=N_padded - 1)
 
 
-def test_spare_slots(system):
-    """With more slots than needed, the capacity still reports the actual
-    largest neighbor count."""
-    atoms, cutoff = system
-    host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    largest = _max_neighbors(host)
-    nl, capacity = _device_list(atoms, host, cutoff, max_neighbors=largest + 5)
-    assert not capacity.overflow
-    assert capacity.max_neighbors == largest
-    assert _pairs(nl) == _pairs(host)
-
-
 def test_overflow(system):
-    """Too few slots give an empty list in the usual layout, and the number of
-    slots that a rebuilt list needs."""
+    """Too few slots give the flag and an empty list in the usual layout."""
     atoms, cutoff = system
     host = jax.tree.map(np.asarray, to_structure(atoms, cutoff=cutoff, skin=0.0))
-    nl, capacity = _device_list(atoms, host, cutoff, max_neighbors=1)
-    assert capacity.overflow
-    assert capacity.max_neighbors == _max_neighbors(host)
+    nl, overflow = _device_list(atoms, host, cutoff, max_neighbors=1)
+    assert overflow
     assert not nl["pair_mask"].any()
     _check_layout(nl, dummy=host["positions"].shape[0] - 1)
-
-    nl, capacity = _device_list(
-        atoms, host, cutoff, max_neighbors=int(capacity.max_neighbors)
-    )
-    assert not capacity.overflow
-    assert _pairs(nl) == _pairs(host)
 
 
 def test_skin_stays_exact():
@@ -155,9 +134,9 @@ def test_skin_stays_exact():
         positions = positions.at[:-1].add(rng.normal(scale=0.05, size=(len(atoms), 3)))
         if step == 5:
             cell = cell * 1.01
-        nl, capacity = cached(positions, cell)
+        nl, overflow = cached(positions, cell)
         expected, _ = exact(positions, cell)
-        assert not capacity.overflow
+        assert not overflow
         nl, expected = jax.tree.map(np.asarray, (nl, expected))
         assert _pairs(nl) == _pairs(expected)
 

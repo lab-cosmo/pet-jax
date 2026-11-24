@@ -13,8 +13,6 @@ import jax.numpy as jnp
 
 from marathon.utils import next_size
 
-from typing import NamedTuple
-
 
 def to_structure(
     atoms,
@@ -224,24 +222,17 @@ def _lexsort(keys):
 # -- device-built raw list: vesin-jax inside the jit --
 
 
-class Capacity(NamedTuple):
-    """Whether a list from ``get_neighbor_list_fn`` fit its slots."""
-
-    overflow: jax.Array  # scalar bool, True iff an atom has more neighbors than slots
-    max_neighbors: jax.Array  # scalar int, the largest number of neighbors of an atom
-
-
 def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
     """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> (nl,
-    Capacity)``: the raw flat NL of ``to_structure`` at cutoff ``radius``,
+    overflow)``: the raw flat NL of ``to_structure`` at cutoff ``radius``,
     computed by ``vesin-jax`` inside the jit, on CPU or GPU.
 
     ``positions`` is padded as in a structure dict, real atoms first: all but
     the last (dummy) atom by default, else the first ``n_atoms``. Each atom
     gets ``max_neighbors`` slots, so the pair axis has length
-    ``n_atoms * max_neighbors + 1``. If an atom has more neighbors, the list
-    is empty, never truncated; either way the ``Capacity`` carries the actual
-    largest neighbor count. ``pbc`` and ``n_atoms`` are static.
+    ``n_atoms * max_neighbors + 1``. If an atom has more neighbors,
+    ``overflow`` is True and the list is empty, never truncated. ``pbc`` and
+    ``n_atoms`` are static.
 
     With ``skin > 0`` the closure keeps a Verlet cache between calls, so build
     it once per driver; the list is exact either way. Needs the ``vesin-jax``
@@ -272,9 +263,6 @@ def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
         # vesin-jax gives each atom max_neighbors slots, the unused ones with
         # j = -1: move them after the real pairs, onto the dummy atom
         pair_mask = j >= 0
-        # n is the needed capacity only on overflow; else count the used slots
-        used = jax.ops.segment_sum(pair_mask.astype(n.dtype), jnp.maximum(i, 0), n_atoms)
-        capacity = Capacity(overflow, jnp.where(overflow, n // n_atoms, used.max()))
         order = center_order(i, pair_mask)
         pair_mask = _append(pair_mask[order], False)
         centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
@@ -287,7 +275,7 @@ def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
             "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
             "pair_mask": pair_mask,
         }
-        return nl, capacity
+        return nl, overflow
 
     return neighbor_list
 
