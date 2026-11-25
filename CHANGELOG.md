@@ -14,6 +14,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
 - `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
+- `UPET` and `Backbone` take `attention_cutoff`, which picks how the cutoff function enters the attention. `"bias"` (the default) is the released rule; `"self_exempt"` stops applying it to a token's attention to itself; `"smooth"` is `metatrain`'s `smooth_attention_cutoff` (PR #1342); `"sigmoid"` and `"sigmoid_mean"` replace the softmax over neighbours by a sigmoid gate per neighbour, offset by `attention_gate_bias`. All modes share one parameter tree. Everything but `"bias"` is experimental and needs a model trained with it.
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
 
 ### Fixed

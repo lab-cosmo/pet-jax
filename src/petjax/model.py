@@ -39,6 +39,8 @@ class UPET(nn.Module):
     adaptive_cutoff_method: str = "grid"
     num_neighbors_adaptive: int = 8
     attention_temperature: float = 1.0
+    attention_cutoff: str = "bias"
+    attention_gate_bias: float = 0.0
     max_atomic_number: int = 118
     system_conditioning: bool = False
     max_charge: int = 10
@@ -71,6 +73,8 @@ class UPET(nn.Module):
             cutoff_width=self.cutoff_width,
             max_atomic_number=self.max_atomic_number,
             attention_temperature=self.attention_temperature,
+            attention_cutoff=self.attention_cutoff,
+            attention_gate_bias=self.attention_gate_bias,
             system_conditioning=self.system_conditioning,
             max_charge=self.max_charge,
             max_spin_multiplicity=self.max_spin_multiplicity,
@@ -142,6 +146,11 @@ class Backbone(nn.Module):
     layer's ``comb_norms_*`` / ``comb_mlps_*``; loading a checkpoint that has
     them leaves those entries silently unused.
 
+    ``attention_cutoff`` picks how the cutoff factors enter the attention and
+    ``attention_gate_bias`` is the score offset of its sigmoid modes, see
+    `Attention`. No mode adds parameters, so one checkpoint loads under all of
+    them. Only "bias" and "smooth" exist in metatrain.
+
     Two hooks let architectures built on the PET backbone (FlashMD) reuse it.
     With ``species_embedding=False`` the backbone owns no species embedding
     table and the caller passes the initial node features ``[N, d_node]`` as
@@ -163,6 +172,8 @@ class Backbone(nn.Module):
     cutoff_width: float = 0.5
     max_atomic_number: int = 118
     attention_temperature: float = 1.0
+    attention_cutoff: str = "bias"
+    attention_gate_bias: float = 0.0
     system_conditioning: bool = False
     max_charge: int = 10
     max_spin_multiplicity: int = 10
@@ -282,6 +293,8 @@ class Backbone(nn.Module):
                     d_ff=self.d_feedforward,
                     num_heads=self.num_heads,
                     temperature=self.attention_temperature,
+                    attention_cutoff=self.attention_cutoff,
+                    gate_bias=self.attention_gate_bias,
                     name=f"gnn_layers_{layer_idx}_trans_layers_{attn_idx}",
                 )(node, edge, cutoffs_tokens, mask)
 
@@ -429,6 +442,8 @@ class TransformerLayer(nn.Module):
     d_ff: int
     num_heads: int
     temperature: float = 1.0
+    attention_cutoff: str = "bias"
+    gate_bias: float = 0.0
 
     @nn.compact
     def __call__(self, node, edge, cutoffs, mask):
@@ -454,9 +469,9 @@ class TransformerLayer(nn.Module):
             return nn.Dense(d_node, name="center_mlp_out")(v * jax.nn.sigmoid(g))
 
         # PreLN transformer
-        attn = Attention(self.num_heads, self.temperature)(
-            rms_norm(tokens, name="norm_attn"), cutoffs, mask
-        )
+        attn = Attention(
+            self.num_heads, self.temperature, self.attention_cutoff, self.gate_bias
+        )(rms_norm(tokens, name="norm_attn"), cutoffs, mask)
         out_node, out_edge = attn[:, :1], attn[:, 1:]
 
         if expanded:
@@ -472,10 +487,38 @@ class TransformerLayer(nn.Module):
 
 
 class Attention(nn.Module):
-    """Multi-head scaled dot-product attention with cutoff weighting."""
+    """Multi-head scaled dot-product attention with cutoff weighting.
+
+    A neighbor's cutoff factor ``f`` in [0, 1] has to remove it from the
+    attention continuously as it leaves the cutoff. ``cutoff`` picks how,
+    for query ``q``, key ``k`` and score ``s_qk``:
+
+    - "bias": softmax weights proportional to ``f_k exp(s_qk)``, i.e. ``log f``
+      added to the scores, for every query including the key's own token.
+      The released models. A key that the scores prefer by a factor ``A``
+      over the others together receives ``f A / (1 + f A)`` of the
+      attention, so it switches on where ``f`` is about ``1 / A``, over a
+      distance set by ``log f``, which diverges at the cutoff.
+    - "self_exempt": as "bias", but a token attends to itself at full weight.
+      The features of a token then no longer depend on its own ``f``; with
+      "bias" they do, and since everything the token feeds is weighted by
+      ``f`` again, the energy picks up powers of ``f``.
+    - "smooth": "self_exempt", plus `smooth_cutoff_weights` for the central
+      token's row. metatrain's ``smooth_attention_cutoff``.
+    - "sigmoid": no normalisation over keys, the weights are
+      ``f_k sigmoid(s_qk + gate_bias)`` with ``f = 1`` on the diagonal. Keys
+      do not compete, so the output is linear in every ``f_k`` with a slope
+      the scores cannot increase. The output grows with the number of keys;
+      ``gate_bias`` near ``-log`` of that number keeps it at the softmax's
+      scale at initialisation.
+    - "sigmoid_mean": "sigmoid" divided by the sum of the ``f_k`` of the row,
+      a normalisation that does not depend on the scores.
+    """
 
     num_heads: int
     temperature: float = 1.0
+    cutoff: str = "bias"
+    gate_bias: float = 0.0
 
     @nn.compact
     def __call__(self, x, cutoffs, mask):
@@ -492,16 +535,111 @@ class Attention(nn.Module):
         k = k.reshape(N, T, H, d)
         v = v.reshape(N, T, H, d)
 
-        # cutoff * exp(qk) = exp(qk + log(cutoff)).
-        bias = jnp.log(jnp.clip(cutoffs, 1e-15, None)).reshape(N, 1, 1, T)
         attn_mask = mask.reshape(N, 1, 1, T)
 
-        # jax.nn hardcodes softmax to fp32 + masks with -0.7 * finfo(fp64).max,
-        # which overflows to -inf in fp32 -> NaN softmax on fully-masked rows
-        out = flax_attention.dot_product_attention(q, k, v, bias=bias, mask=attn_mask)
-        out = out.reshape(N, T, F)
+        if self.cutoff == "bias":
+            factors = cutoffs.reshape(N, 1, 1, T)
+        elif self.cutoff in ("self_exempt", "smooth", "sigmoid", "sigmoid_mean"):
+            # [N, 1, query, key]; padded tokens keep their zero factor
+            is_self = jnp.eye(T, dtype=bool) & (mask[:, :, None] > 0)
+            factors = jnp.where(is_self, 1.0, cutoffs[:, None, :])[:, None]
+        else:
+            raise ValueError(f"unknown attention cutoff {self.cutoff!r}")
 
-        return nn.Dense(F, name="out")(out)
+        if self.cutoff in ("bias", "self_exempt"):
+            out = _softmax_attention(q, k, v, factors, attn_mask)
+        elif self.cutoff == "smooth":
+            central_scores = _scores(q[:, :1], k)
+            weights = smooth_cutoff_weights(central_scores, factors[:, :, :1])
+            central = jnp.einsum("nhqk,nkhd->nqhd", weights, v)
+            others = _softmax_attention(q[:, 1:], k, v, factors[:, :, 1:], attn_mask)
+            out = jnp.concatenate([central, others], axis=1)
+        else:
+            weights = factors * jax.nn.sigmoid(_scores(q, k) + self.gate_bias)
+            if self.cutoff == "sigmoid_mean":
+                # at least 1 for a real query, which counts itself
+                total = jnp.sum(factors, axis=-1, keepdims=True)
+                weights = weights / jnp.maximum(total, 1.0)
+            out = jnp.einsum("nhqk,nkhd->nqhd", weights, v)
+
+        return nn.Dense(F, name="out")(out.reshape(N, T, F))
+
+
+def smooth_cutoff_weights(scores, factors, established_power=8.0, logit_cap=5.0):
+    """Attention weights that grow in proportion to the keys' cutoff factors.
+
+    metatrain's ``smooth_cutoff_attention`` (metatrain #1356). Before
+    normalisation over the keys, a key weighs
+
+        f exp(score) / (1 + (1 - f) exp(score) / others)
+
+    where ``others`` is the sum of ``f**established_power exp(score)`` over the
+    other keys, i.e. those well inside the cutoff. A single key in the cutoff
+    tail then receives exactly ``f`` times the attention it would receive at
+    ``f = 1``. Keys at ``f = 1`` keep their softmax weight. The scores are
+    soft-capped to ``logit_cap tanh(score / logit_cap)``: with several keys in
+    the tail, counting competitors with ``f**established_power`` is only an
+    approximation, and an unbounded preference would let a second key take
+    most of the attention at the edge of the cutoff.
+
+    ``scores`` is ``[..., queries, keys]`` and ``factors`` broadcasts to it;
+    keys with a zero factor are excluded, and a row without keys is zero.
+    """
+    scores = logit_cap * jnp.tanh(scores / logit_cap)
+    factors = jnp.broadcast_to(factors, scores.shape)
+    excluded = factors <= 0.0
+    inside = factors >= 1.0
+
+    log_f = _log_with_bounded_gradient(factors)
+    # keys inside get f = 0 here, so that log(1 - f) keeps a finite gradient
+    log_1mf = jnp.log1p(-jnp.where(inside, 0.0, factors))
+    log_others = _logsumexp_of_others(scores + established_power * log_f, excluded)
+
+    bias = log_f - jax.nn.softplus(log_1mf + scores - log_others)
+    logits = scores + jnp.where(inside | excluded, 0.0, bias)
+    # a finite fill, so that rows without any key (padded atoms) stay finite
+    logits = jnp.where(excluded, jnp.finfo(scores.dtype).min, logits)
+    weights = jax.nn.softmax(logits, axis=-1)
+    return jnp.where(jnp.all(excluded, axis=-1, keepdims=True), 0.0, weights)
+
+
+def _log_with_bounded_gradient(x, threshold=1e-15):
+    """``log(x)``, with the gradient only for ``x > threshold`` (``1/x`` overflows)."""
+    return jnp.where(
+        x > threshold,
+        jnp.log(jnp.maximum(x, threshold)),
+        jax.lax.stop_gradient(jnp.log(jnp.maximum(x, 0.0))),
+    )
+
+
+def _logsumexp_of_others(x, excluded, log_zero=-1e30):
+    """``log(sum_{j != i} exp(x_j))`` over the non-excluded entries, for every ``i``.
+
+    Subtracting ``exp(x_i)`` from the total loses all precision for the largest
+    entry; it gets the log-sum of the rest, every other entry the largest plus
+    the rest minus itself.
+    """
+    x = jnp.where(excluded, log_zero, x)
+    index = jnp.argmax(jax.lax.stop_gradient(x), axis=-1, keepdims=True)
+    is_max = jnp.arange(x.shape[-1]) == index
+    x_max = jnp.take_along_axis(x, index, axis=-1)
+    rest = jnp.where(is_max, log_zero, x)
+    log_rest = jax.nn.logsumexp(rest, axis=-1, keepdims=True)
+    log_others = x_max + jnp.log1p(jnp.exp(log_rest - x_max) - jnp.exp(rest - x_max))
+    return jnp.where(is_max, log_rest, log_others)
+
+
+def _scores(q, k):
+    """Attention scores ``[N, H, queries, keys]`` from ``[N, tokens, H, d]``."""
+    return jnp.einsum("nqhd,nkhd->nhqk", q, k) / jnp.sqrt(q.shape[-1]).astype(q.dtype)
+
+
+def _softmax_attention(q, k, v, factors, attn_mask):
+    # cutoff * exp(qk) = exp(qk + log(cutoff)).
+    bias = jnp.log(jnp.clip(factors, 1e-15, None))
+    # jax.nn hardcodes softmax to fp32 + masks with -0.7 * finfo(fp64).max,
+    # which overflows to -inf in fp32 -> NaN softmax on fully-masked rows
+    return flax_attention.dot_product_attention(q, k, v, bias=bias, mask=attn_mask)
 
 
 # -- building blocks --
