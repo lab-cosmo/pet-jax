@@ -6,25 +6,29 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 ## Unreleased
 
+## [0.1.1] - 2026-11-26
+
 ### Changed
 
-- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag; callers that unpacked the flag read `.overflow`. It also carries the cutoffs, the selected mask and the count per center, so a driver can size `k_sel` without leaving jit.
+- `truncate`, `truncate_edges` and `pack_edges` return a `Truncation` named tuple in place of the bare `overflow` flag; read `.overflow` where you unpacked the flag. It also carries the cutoffs, the selected mask and the count per center, so a driver can size `k_sel` without leaving jit.
 
 ### Added
 
-- `petjax.structure.get_neighbor_list_fn` builds the raw neighbour list of `to_structure` inside the jit with `vesin-jax`, for drivers that never leave it. Needs the new `vesin-jax` extra.
-- `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
-- `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
-- `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
+- `petjax.structure.get_neighbor_list_fn` builds the neighbour list inside jit with `vesin-jax`, for drivers that never leave it. Needs the new `vesin-jax` extra.
+- `petjax.structure.center_order` and `corresponding_edges`: jit-safe versions of the sort by center and the reverse-edge map, for neighbour lists built on the device.
+- `pack_edges` takes optional per-pair `pair_cutoffs`. Without them the model's scalar cutoff applies, as before.
+- `Backbone` takes `final_message_passing` (default `True`); switching it off skips the reverse-edge message passing after the last GNN layer. `metatrain`'s PET has no such option, so this is only for models trained in JAX.
+- Two `Backbone` hooks for architectures built on it, such as FlashMD: `species_embedding=False` replaces the species embedding table with a `node_features` input, and `cutoff_function` picks the cutoff (default `cutoff_bump`; `cutoff_cosine` is new).
+- `petjax-convert --force` overwrites existing output.
 
 ### Fixed
 
-- `cutoff_bump` no longer rounds to zero in fp32 near the cutoff, which made the attention bias jump there; it is now evaluated as `sigmoid(2 cot(πx))`, as in `metatrain`.
+- `cutoff_bump` no longer rounds to zero in fp32 near the cutoff, which made the attention bias jump there. It is now evaluated as `sigmoid(2 cot(πx))`, as in `metatrain`.
 - A float32 model no longer runs in float64 when JAX's 64-bit mode is on (as with i-PI's jax backend).
-- The package metadata now requires Python ≥ 3.11. It claimed 3.10, but `jax>=0.10` needs 3.11, so installing on 3.10 failed with a resolver error instead of a clear message.
-- The RMSNorm and LayerNorm epsilons now match `torch`'s defaults (`finfo(dtype).eps` and `1e-5`) instead of `flax`'s (`1e-6`). Predictions move by ~1e-7 relative; in fp64, agreement with `metatrain` improves by an order of magnitude.
 - The `solver` adaptive cutoff finds the root by plain bisection, as `metatrain` does since metatensor/metatrain#1331. The previous Newton-bisection hybrid could return a cutoff that is not a root (lab-cosmo/pet-jax#48). Predictions of `solver` checkpoints such as PET-MAD v1.6 move by up to ~1e-5 eV/Å; `grid` checkpoints are unchanged.
-- `petjax-convert` keeps the energy, force and stress scales in fp64 instead of rounding them to fp32. Checkpoints converted before this carry the rounded scales; reconvert with the new `--force` flag (the converter otherwise leaves existing output alone) to get fp64 predictions that match `metatrain` to ~1e-14 eV/atom instead of ~1e-7. fp32 inference is unchanged.
+- The RMSNorm and LayerNorm epsilons match `torch`'s defaults (`finfo(dtype).eps` and `1e-5`) instead of `flax`'s (`1e-6`). Predictions move by ~1e-7 relative; in fp64, agreement with `metatrain` improves by an order of magnitude.
+- `petjax-convert` keeps the energy, force and stress scales in fp64 instead of rounding them to fp32. Reconvert older checkpoints with `--force` to get fp64 predictions that match `metatrain` to ~1e-14 eV/atom instead of ~1e-7. fp32 inference is unchanged.
+- The package metadata requires Python ≥ 3.11, as `jax>=0.10` does. It claimed 3.10, so installing there failed with a resolver error.
 
 ## [0.1.0] - 2026-10-01
 
