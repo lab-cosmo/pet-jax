@@ -13,7 +13,7 @@ src/petjax/
   calculator.py   # UPETCalculator (ASE)
   convert.py      # metatrain .ckpt → Flax msgpack
   cli.py          # petjax-convert entrypoint
-  structure.py    # host-side neighborlist build
+  structure.py    # neighborlist build (host-side, or in-JIT with vesin-jax)
   select.py       # in-JIT adaptive selection
   predict.py      # in-JIT forward + autodiff
   utils.py        # shared helpers
@@ -214,9 +214,10 @@ Core (`pyproject.toml`):
 - `vesin` — fast neighbourlist construction
 - `marathon-train` — checkpoint I/O (msgpack/yaml) and bucket-size helpers
 
-Optional (the `convert` extra — see [Installation](#installation)):
+Optional (extras — see [Installation](#installation)):
 
-- `torch`, `metatomic-torch`, `metatrain` — only needed when converting `metatrain` `.ckpt` files. Inference itself runs on the JAX stack alone.
+- `convert`: `torch`, `metatomic-torch`, `metatrain` — only needed when converting `metatrain` `.ckpt` files. Inference itself runs on the JAX stack alone.
+- `vesin-jax`: `vesin-jax` — neighbourlist construction inside `jax.jit`, for `petjax.structure.get_neighbor_list_fn`.
 
 ## Contributing
 

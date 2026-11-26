@@ -219,6 +219,72 @@ def _lexsort(keys):
     return jax.lax.sort((*keys, position), num_keys=len(keys), is_stable=True)[-1]
 
 
+# -- device-built raw list: vesin-jax inside the jit --
+
+
+def get_neighbor_list_fn(radius, max_neighbors, skin=0.0):
+    """Build ``neighbor_list(positions, cell, pbc, n_atoms=None) -> (nl,
+    overflow)``: the raw flat NL of ``to_structure`` at cutoff ``radius``,
+    computed by ``vesin-jax`` inside the jit, on CPU or GPU.
+
+    ``positions`` is padded as in a structure dict, real atoms first: all but
+    the last (dummy) atom by default, else the first ``n_atoms``. Each atom
+    gets ``max_neighbors`` slots, so the pair axis has length
+    ``n_atoms * max_neighbors + 1``. If an atom has more neighbors,
+    ``overflow`` is True and the list is empty, never truncated. ``pbc`` and
+    ``n_atoms`` are static.
+
+    With ``skin > 0`` the closure keeps a Verlet cache between calls, so build
+    it once per driver; the list is exact either way. Needs the ``vesin-jax``
+    extra."""
+    try:
+        from vesin_jax import NeighborList
+    except ImportError as e:
+        raise ImportError(
+            'get_neighbor_list_fn needs vesin-jax: pip install "pet-jax[vesin-jax]"'
+        ) from e
+
+    calculator = NeighborList(
+        cutoff=radius, full_list=True, sorted=True, padded_to=max_neighbors, skin=skin
+    )
+
+    def neighbor_list(positions, cell, pbc, n_atoms=None):
+        dummy = positions.shape[0] - 1
+        if n_atoms is None:
+            n_atoms = dummy
+
+        periodic = tuple(bool(p) for p in pbc)
+        # Asking for "n" makes vesin-jax report the capacity it needs instead
+        # of failing the computation when the slots do not suffice.
+        i, j, S, n = calculator.compute(
+            positions[:n_atoms], cell.astype(positions.dtype), periodic, quantities="ijSn"
+        )
+        overflow = n > n_atoms * max_neighbors
+        # vesin-jax gives each atom max_neighbors slots, the unused ones with
+        # j = -1: move them after the real pairs, onto the dummy atom
+        pair_mask = j >= 0
+        order = center_order(i, pair_mask)
+        pair_mask = _append(pair_mask[order], False)
+        centers = jnp.where(pair_mask, _append(i[order], dummy), dummy)
+        others = jnp.where(pair_mask, _append(j[order], dummy), dummy)
+        cell_shifts = _append(S[order].astype(positions.dtype), 0)
+        nl = {
+            "centers": centers,
+            "others": others,
+            "cell_shifts": cell_shifts,
+            "reverse": corresponding_edges(centers, others, cell_shifts, pair_mask),
+            "pair_mask": pair_mask,
+        }
+        return nl, overflow
+
+    return neighbor_list
+
+
+def _append(x, value):
+    """``x`` with one more row filled with ``value``."""
+    return jnp.concatenate([x, jnp.full((1, *x.shape[1:]), value, x.dtype)])
+
+
 # -- helpers --
 
 
