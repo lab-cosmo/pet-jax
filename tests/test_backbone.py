@@ -83,3 +83,35 @@ def test_cutoff_cosine():
     np.testing.assert_allclose(
         cutoff_cosine(r, 3.0, 1.0), [1.0, 1.0, 0.5, 0.0, 0.0], atol=1e-7
     )
+
+
+def test_no_edge_features_unchanged():
+    inputs = _inputs()
+    model = Backbone(**CONFIG)
+    params = model.init(jax.random.key(0), **inputs)
+    reference = model.apply(params, **inputs)
+    for a, b in zip(reference, model.apply(params, **inputs, edge_features=None)):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_edge_features_widen_edge_embed_only():
+    inputs = _inputs()
+    model = Backbone(**CONFIG)
+    features = jax.random.normal(jax.random.key(1), (6, 3))
+    params = model.init(jax.random.key(0), **inputs)
+    widened = model.init(jax.random.key(0), **inputs, edge_features=features)
+
+    # the features reach the output
+    node_a, edge_a, _ = model.apply(widened, **inputs, edge_features=features)
+    node_b, edge_b, _ = model.apply(widened, **inputs, edge_features=2 * features)
+    assert not np.allclose(node_a, node_b)
+    assert not np.allclose(edge_a, edge_b)
+
+    # only the edge_embed kernels change shape: 4 + F input rows
+    shapes = jax.tree.map(jnp.shape, params["params"])
+    widened_shapes = jax.tree.map(jnp.shape, widened["params"])
+    for layer_idx in range(CONFIG["num_gnn_layers"]):
+        name = f"gnn_layers_{layer_idx}_edge_embed"
+        assert widened_shapes[name]["kernel"] == (4 + 3, CONFIG["d_pet"])
+        shapes.pop(name), widened_shapes.pop(name)
+    assert shapes == widened_shapes

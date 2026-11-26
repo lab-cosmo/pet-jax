@@ -14,7 +14,7 @@ Every PR that changes something a user can see adds a line under **Unreleased**,
 
 - `petjax.structure.get_neighbor_list_fn` builds the raw neighbour list of `to_structure` inside the jit with `vesin-jax`, for drivers that never leave it. Needs the new `vesin-jax` extra.
 - `Backbone` takes `final_message_passing` (default `True`). With it off, the reverse-edge message passing after the last GNN layer is skipped. `metatrain` has no equivalent, so such a model is not exportable.
-- `Backbone` gains two hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. Both default to the current behaviour.
+- `Backbone` gains three hooks for architectures built on the PET backbone, such as FlashMD: `species_embedding=False` drops the species embedding table and takes the initial node features as a `node_features` input instead, an optional `edge_features` input is appended to the geometric edge input of every GNN layer, and the `cutoff_function` attribute (default `cutoff_bump`; `cutoff_cosine` is new in `petjax.utils`) picks the cutoff. All default to the current behaviour. With `edge_features`, `metatrain` has no equivalent, so such a model is not exportable.
 - `pack_edges` takes optional per-pair `pair_cutoffs` and packs them with the pairs. Without them the model's scalar cutoff applies, as before.
 
 ### Fixed
